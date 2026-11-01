@@ -107,7 +107,7 @@ for current instructions, evidence and pending work. Read the current sections
 before acting; dated historical notes do not override newer verified state.
 
 1. `docs/PROGRESS.md`: verified state, blockers, exact next steps and commands.
-2. `README.md`: build and analysis workflow.
+2. `README.md`: short overview; `docs/BUILDING.md`: build and analysis workflow.
 3. `docs/ARCHITECTURE.md`: execution model and staged roadmap.
 4. `docs/SOURCES.md`: specification sources and provenance rules.
 5. `docs/WORLD_EDITOR.md`: standalone world editor plan and room/texture/geometry format evidence.
