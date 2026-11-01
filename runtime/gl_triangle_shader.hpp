@@ -63,6 +63,7 @@ int native_ratio(uint p,vec3 w,float q){
     float n=native_coefficient(p)*w.x+native_coefficient(p+2)*w.y+native_coefficient(p+4)*w.z;
     return int(floor(n/q));
 }
+uint texture_function(uint texel,uint fragment);
 uint texture_color(int x,int y,uint fragment){
     uint texel;
     if((d(15)&2u)==0)texel=sample_texel(x,y);
@@ -76,6 +77,9 @@ uint texture_color(int x,int y,uint fragment){
         uint ga=((c0>>8)&0x00ff00ffu)*w0+((c1>>8)&0x00ff00ffu)*w1+((c2>>8)&0x00ff00ffu)*w2+((c3>>8)&0x00ff00ffu)*w3;
         texel=((rb>>8)&0x00ff00ffu)|(ga&0xff00ff00u);
     }
+    return texture_function(texel,fragment);
+}
+uint texture_function(uint texel,uint fragment){
     uint fa=fragment>>24,ta=texel>>24,f=d(28),result=0;
     for(uint s=0;s<24;s+=8){
         uint product=min((byte_at(texel,s)*byte_at(fragment,s))>>7,255u);
@@ -102,7 +106,10 @@ void main(){
         uint src=fragment;
         // Job flag512: TME is off, so no texture state or texture memory is read.
         if((d(15)&512u)==0){
-            if((d(15)&1024u)!=0){
+            if((d(15)&2048u)!=0){
+                // HG-PERF-120: own-pixel PSMT8H feedback; earlier jobs for this pixel already ran.
+                src=texture_function(data[d(56)+(mem[address32(d(10),d(11),pixel.x,pixel.y)]>>24)],fragment);
+            }else if((d(15)&1024u)!=0){
                 vec3 wf=vec3(float(w.x),float(w.y),float(w.z));
                 float q=native_coefficient(50)*wf.x+native_coefficient(52)*wf.y+native_coefficient(54)*wf.z;
                 src=texture_color(native_ratio(38,wf,q),native_ratio(44,wf,q),fragment);
@@ -111,7 +118,12 @@ void main(){
                 src=texture_color(ratio(38,w,q),ratio(44,w,q),fragment);
             }
         }
-        if((d(15)&256u)!=0&&(src>>24)==d(17))continue;
+        // HG-PERF-116: all eight GS ATST comparisons, AFAIL=KEEP (host-checked).
+        if((d(15)&256u)!=0){
+            uint a=src>>24,r=d(17),m=d(27);
+            bool pass=m==1u||(m==2u&&a<r)||(m==3u&&a<=r)||(m==4u&&a==r)||(m==5u&&a>=r)||(m==6u&&a>r)||(m==7u&&a!=r);
+            if(!pass)continue;
+        }
         uint z=uint((uint64_t(w.x)*d(33)+uint64_t(w.y)*d(34)+uint64_t(w.z)*d(35))/area);
         uint za=address32(d(12),d(11),pixel.x,pixel.y)^1536u;
         uint oldz=mem[za];uint storedz=oldz&d(13);

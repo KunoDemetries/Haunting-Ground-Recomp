@@ -1,3 +1,127 @@
+## World editor formats - 2026-10-19
+
+Room PAC, `.TEX` bank and slot-3 geometry layouts (`docs/WORLD_EDITOR.md`) were derived
+only from the user's own disc data (whole-disc parse counts) and this project's
+disassembly of the original executable (loader 0x120720, activation 0x11FFB0). The CSM1
+palette order follows the GS User's Manual CLUT storage description and was confirmed
+statistically on the decoded images. No external tool, format document or editor code was
+used or copied; `editor/src/disc.hpp` reimplements this project's own `volume.py` rules.
+
+## Door-section object family 0x46df00 - 2026-10-11
+
+Live stop at unconfigured `0x002abf60` from the generic JALR `0x00209574`
+(slot `+0x0c`, receiver `a0=0x017f3550`, return `0x0020957c`). Own scan of the
+pinned ELF finds the word `0x002abf60` exactly once, at `0x0046df0c`, making the
+64-byte table `0x0046df00` (null prefix at `0x46df00/04`, next null prefix at
+`0x46df40`) the receiver class. Its literal is materialized by installers
+`0x20a6c8..cc` and by destructor `0x2abf18..1c`. Slots `+08..+3c`:
+`2abf00, 2abf60, 2abf80, 2abf90, 2abfa0, 2097f0, 2abfb0, 2abfc0, 2a8950,
+2ac010, 2abf70, 2abff0, 2abfe0, 128080`. Every uncompiled body was decoded
+independently: constant getters (`LUI v0,0x3f; JR ra; ADDIU`), indexed getters,
+a return-0 stub, a tail jump to the known member helper `0x100b40`, and a
+destructor freeing through `0x100490`. The layout mirrors the stairs table
+`0x46dfc0` used at the same sites. Additive AOT roots only; runtime dispatch
+still uses the guest register, and unknown targets still fault.
+
+## Installer-proven 0x2631d0 interface family - 2026-10-08
+
+Original `0x002631c4..d4` loads an object vptr, reads slot `+0x2c`, and calls it
+at `0x002631d0`.  The live 156.5M stop has receiver `0x0180f690`, vptr
+`0x0046d410`, and exact original/live slot target `0x0025fd00`.  Fourteen
+initialized tables share the same null-bounded 15-slot ABI: `0x0046d370`,
+`0x0046d3c0`, `0x0046d410`, `0x0046d460`, `0x0046d4b0`, `0x0046d500`,
+`0x0046d550`, `0x0046d5a0`, `0x0046d5f0`, `0x0046d640`, `0x0046f610`,
+`0x0046f660`, `0x00476450`, and `0x00476b60`.
+
+Own decoding independently ties every table to original constructor block
+`0x00263224..0x002634cc`, which materializes each literal vptr before its store.
+The exact union contains 54 executable original methods.  Configuring that union
+at the existing `jalr` is additive AOT discovery only: runtime target selection
+still comes from the guest register and targets outside the proved set still
+fault.  No external implementation or renderer material is used.
+
+## Post-portrait VU1 scene14 composite - 2026-10-08
+
+The exact corrected route stops first on unconfigured VU1 entry zero with
+MicroMem SHA-256 `be37654bb1ee41665dcc29043dc88492079b39c063c6360b99cae55bd0d5ed3f`.
+Threaded publication is at original VIF1 status read `0x0010ca44`; synchronous
+publication is immediate at original VIF activation `0x001b795c`.  Both retain
+byte-identical MicroMem and preview, independently excluding device-thread
+ordering as the source of the identity.
+
+Every byte through micro `0x1318` matches the pinned USA ELF in six contiguous
+ranges: `0x0000 <- 0x003a9548` x256 pairs, `0x0800 <- 0x003a9d50` x96,
+`0x0b00 <- 0x003a4ec0` x16, `0x0b80 <- 0x003a2ba0` x106,
+`0x0ed0 <- 0x003aaf50` x38, and `0x1000 <- 0x003ab088` x99.  The assembled
+611-pair range has SHA-256 `29d60202f07f5148ce6b72a14840b2b9e1748c113b160ca84365b9e04cad1e33`.
+The project's independent VU structural decoder reports no unsupported pair,
+external direct branch, or missing delay slot.  Original END pairs at
+`0x0048/0x0ad8/0x0b60/0x0eb0/0x12f0` prove resume entries
+`0x0058/0x0ae8/0x0b70/0x0ec0/0x1300`; entry zero is directly observed.  This
+is build-time AOT input provenance only—no runtime decoding or external
+renderer/emulator implementation is used.
+
+## Bounded post-door descriptor family - 2026-10-07
+
+The latest live stop is original target `0x002f39e0`, selected with receiver
+`0x00fc6fe0` and return `0x002f609c` through the already proved member helper.
+Rather than infer nearby functions, the batch follows only original descriptor
+records and the original stores that install them into object offset `0x110`.
+The complete relevant record block is `0x0041a1d0..0x0041a2b0`; every 16-byte
+record begins `{0, 0xffffffff, target, 0}`.  Its targets in order are
+`2f5c80, 2f4330, 2f59a0, 2f55c0, 2f5280, 2f55c0, 2f4e40, 2f4a30,
+2f46b0, 2f59a0, 2f59a0, 2f4090, 2f39e0, 2f3d30, 2f3d30`.
+
+Own decoding proves the install graph from the routines themselves.  Original
+`2f60b0` loads records `41a1d0/41a1e0`; `2f5c80` loads `41a1f0`;
+`2f59a0` loads `41a200/210/220`; `2f5280` loads `41a230/240`;
+`2f4a30` loads `41a250/260/270`; `2f4330` loads `41a280`; and
+`2f4090` loads `41a290/2a0/2b0`.  These loads are followed by the original
+three-word stores to object `+0x110/+0x114/+0x118`.  The only not-yet-compiled
+members are `2f39e0`, `2f3d30`, `2f46b0`, `2f4a30`, `2f4e40`, and `2f5280`.
+Their decoded return/delay boundaries are respectively `2f3d24/28`,
+`2f4084/88`, `2f4a20/24`, `2f4e30/34`, `2f5278/7c`, and `2f55b0/b4`;
+distinct successor prologues follow after padding where present.  This is a
+closed original-data/original-code graph tied to the dynamically observed
+descriptor.  It is not a proximity scan, wholesale object-table rooting,
+external implementation, runtime decoder, or relaxed unsupported-address rule.
+
+The exact original body byte lengths/SHA-256 values are: `2f39e0..2f3d28`,
+840, `abab5adbe0fa3ce4f4b833abe2fbaf39167f89ccc31146bbbf51571949c4091d`;
+`2f3d30..2f4088`, 856,
+`c7e53f6f8411e94ee0ebdb54af49a3b7b74006799fd772ec8e6ee438a9a45725`;
+`2f46b0..2f4a28`, 888,
+`e3ac780d7598d3bc5ddf16578a0ff6a512e25abe8c26317a44941bbc0668fb2e`;
+`2f4a30..2f4e38`, 1,032,
+`b7ce96f49de287350bc7f89fb754614993a168c0ca32fd8d866409c6888df3b1`;
+`2f4e40..2f527c`, 1,084,
+`60a6dd7cbe5a857a812268bce3f55970e7f23123d5b23644ade1c278747d4877`;
+and `2f5280..2f55b8`, 824,
+`16a34de5250446377952eaf017d2680d03e7cbb4badfeecf6d18bdc9c47fd078`.
+
+## Original post-door direct-member callback 2f4090 - 2026-10-07
+
+The interactive run stopped explicitly at EE `0x002f4090`, with receiver
+`0x00fc6fe0` and return `0x002f609c`, through the already independently decoded
+negative-descriptor member helper at `0x00100b6c`.  Own decoding bounds the
+original function to `[0x002f4090,0x002f4328)`: `JR ra` is at `0x002f4320`, its
+delay instruction is at `0x002f4324`, padding follows, and the distinct already
+rooted `0x002f4330` prologue begins afterward.  All 664 file-backed original
+bytes equal the retained live EE RAM range, SHA-256
+`abe671bbfa2f52c5f30185425e2879ce995f6beac4fac96beca0238a7fb3146d`.
+Only this observed target was added to the existing helper target set.  No
+adjacent routine was inferred, no original instruction was replaced, and no
+runtime decoder, emulator backend, external implementation, renderer material,
+or guest-clock change was introduced.
+
+## Post-door VU1 composite identity - 2026-10-07
+
+The recovered 1,321-event route and authentic 2,064-byte TOC record are external diagnostic inputs under `%TEMP%/haunting-toc-probe/`; neither contains repository source data. Independent synchronous and ordinary threaded-device executions stop on entry zero with the same 16 KiB VU1 MicroMem SHA-256 `757b4fb550785f5d1119eed3b9dac8ab6aa299a7f5f4b1dd6a946ce168f0027c` and identical retained GS counts. This establishes the identity as guest-produced state rather than host queue timing.
+
+Every byte in the active `0x0000..0x1318` MicroMem range maps to one of six unique file-backed ranges in the pinned original `SLUS_210.75`: micro/source/pairs are `0000/003a6118/256`, `0800/003a6920/94`, `0af0/003a4eb0/18`, `0b80/003a2ba0/106`, `0ed0/003aaf50/38`, and `1000/003ab088/99`. Their individual SHA-256 values are `5f21d91a2076c5c7fa62d7d0990b1deb6b3b4019b8c15e175314a218c780a324`, `da3780e15a00ec8858e4cfecb4748dcd2e06b3107c397a4ad349cf55620d3173`, `4f59ccd1d260a7826b58605c3bf12157a8ea0ec6fc8ff6c576b1ef2a45c739c6`, `c0b868260971959a4fbf5ed8783285c2a01852a09cda054c895f847427c53ce5`, `26f122ab4e6efddbd60811db179d1e663095c9252c825ebd2e5343adf2efe22c`, and `2f430d6c777f29023c52fcfc5b350ed86d3de437784c08d9b2b203a4fbee7372`. Concatenation yields the exact captured range SHA-256 `795330eb080f8283a906feb169f16046e021db2e64fe7c2dfcd6f38afb2aa34e`.
+
+Own VU decoder inspection finds no unsupported pair, missing delay slot, or external direct branch. END pairs are `0x0000`, `0x0ad0`, `0x0b60`, `0x0eb0`, and `0x12f0`; their architectural next-pair resume entries are `0x0010`, `0x0ae0`, `0x0b70`, `0x0ec0`, and `0x1300`, with entry zero retained for MSCAL. Dynamic replay first confirms resume `0x0ae0`; the remaining END successors are compiled in the same batch from the exact decoded image rather than rediscovered one freeze at a time. The AOT config names only those exact original ranges and entries. No PCSX2/shared-project VU implementation, runtime microinstruction decoder, guessed instruction, renderer material, or emulator dependency was used.
+
 ## Original bounded staircase object46dfc0: complete remaining static method coverage - 2026-09-22
 
 Latest manual c277ea1723404267b5f23dd71725f966, evidence project-link-visible/20260922T071804Z-4497884a223e48d5bd53d7c9ce48f0ca/native.log:1204, stops at2ac570/a017f355c/RA20962c. Saved receiver holds46dfc0. Original inspector5f0db0dfd3b2484aa0ed1231130a6745 decodes209390's selector<6 and same-receiver calls2095dc(+10),209600(+14),209624(+18), selecting2ac550/560/570. The live hit is only2ac570. These getters return3f93a0,3f9530,3f95f0 using original LUI/JR/delay ADDIU, not host replacements.
@@ -63,6 +187,8 @@ Evidence project-link-visible/20260922T052458Z-71c5108ac15b4b9a80b5a56e4112e3fc 
 ## Build freshness and rejected GL error-notification trial - 2026-09-21
 
 Primary documentation consulted: CMake add_custom_command POST_BUILD (https://cmake.org/cmake/help/latest/command/add_custom_command.html), GLFW context sharing (https://www.glfw.org/docs/latest/context_guide.html#context_sharing), and Khronos KHR_debug specification (https://registry.khronos.org/OpenGL/extensions/KHR/KHR_debug.txt). The retained post-link/preflight hash code is independently written project infrastructure, outside native execution timing. The rejected GL trial derived its callback guarantee from KHR_debug sections2.5,5.5 and5.5.7: an ordinary context may emit no messages, whereas the selected debug-context synchronous mode supplies API-error notifications before the offending call returns. The trial preserved polling fallback and original fault points and passed an actual-driver expected INVALID_ENUM startup test, but regressed qualified throughput and was removed. No emulator/shared-renderer code, algorithms or comments were used. See HG-DIAG-028/030, HG-FAIL-028 and PERFORMANCE for the measured scope; documentation alone is not proof of physical-console fidelity or improved performance.
+
+HG-PERF-111 reset-notification provenance (2026-10-10): GLFW Window Guide/header documentation defines `GLFW_CONTEXT_ROBUSTNESS` as the strategy actually used by a context and `GLFW_NO_RESET_NOTIFICATION` as `0x00031001` (decimal 200705): https://www.glfw.org/docs/latest/window and https://www.glfw.org/docs/latest/glfw3_8h.html. Khronos `KHR_robustness` section 2.3.1rob states that `NO_RESET_NOTIFICATION` never delivers reset-event notification and `GetGraphicsResetStatus` always returns `NO_ERROR`; it separately warns that preserving context state under such resets is recommended but not guaranteed: https://registry.khronos.org/OpenGL/extensions/KHR/KHR_robustness.txt. `WGL_ARB_create_context_robustness` defines `WGL_NO_RESET_NOTIFICATION_ARB` as the default reset strategy when the WGL robustness facility is used: https://registry.khronos.org/OpenGL/extensions/ARB/WGL_ARB_create_context_robustness.txt. A temporary current-driver query on the project's ordinary 4.3 core GLFW test context returned `context_robustness=200705` on NVIDIA GeForce RTX 5070 / 617.42. `runtime/game_host.cpp` requests the same relevant 4.3 core context with no robustness override when GPU rendering is enabled. Therefore a post-`glFlush()` `glGetError()` is not a specified reset-notification mechanism for this configured strategy; do not infer that context state can never be lost, only that moving the ordinary error poll across `glFlush()` does not forfeit a guaranteed reset notification that this context was configured to deliver.
 
 ## Original Start direct-member callback2f5c80 - 2026-09-20
 
@@ -3438,3 +3564,155 @@ IOP/EE/GS/VU/display state. This proves the recorded prefix can reproduce and
 clear the door route through that boundary; it does not claim correctness for
 unrecorded movement after the final neutral state or complete-game playability.
 
+## Authentic TOC DVD CAV read profile - 2026-10-06
+
+A bounded PCSX2 guest-state observation recorded in `docs/ORACLE.md` supplies
+the exact external GetToc DMA payload for the current local disc. With that
+payload, the original compiled CDVDMAN path issues ReadDvd packet
+`[16,0,0,0,1,0,0,0,16,131,0]` for ISO LBA 16. This independently proves the
+game uses spindle byte `0x83` on the single-layer directory path. The existing
+native model rejected that byte before touching disc data.
+
+As a semantics cross-check only, official PCSX2 source commit
+`9fffbdbd59b962d63a2259b150f419ad3773e7b4` treats the low six spindle bits as
+the DVD speed selector and the high bit as CAV; `0x83` therefore selects the
+documented maximum DVD speed class rather than an invalid read mode. The native
+local-image path now accepts only its two observed successful profiles, `0x02`
+and `0x83`; all other mode bytes, nonzero final bytes, unsupported retry values,
+physical seek timing and retry behavior remain explicit/unsupported. No PCSX2
+implementation was copied.
+
+## Exact wide perspective-STQ fallback - 2026-10-06
+
+The post-door retained GS state selected an ordinary textured Gouraud triangle
+whose finite S/T/Q inputs and edge weights produced a valid signed texel
+coordinate but required more than 64 bits while aligning the three floating
+mantissas. The renderer change is independently derived from the existing GS
+equation: accumulate signed weighted mantissas at a common binary scale in a
+two-limb unsigned magnitude, cancel signs exactly, then divide the S or T sum by
+the Q sum with the existing dimension shift. A right shift retains a sticky bit
+for the established negative floor rule. Native `_udiv128` or compiler
+`unsigned __int128` is used only for exact 128-by-64 division; a restoring
+division supplies the portable equivalent. A bounded exact quotient search is
+used when the denominator itself occupies both limbs. Inputs whose aligned sum
+does not fit 128 bits retain the explicit validation fault.
+
+Read-only inspection of official PCSX2 source at pinned commit
+`9fffbdbd59b962d63a2259b150f419ad3773e7b4` was used only to corroborate that
+finite varying-Q triangle STQ is handled as ordinary perspective interpolation,
+not as an invalid packet class. No external implementation, algorithm, comment,
+configuration, mapping, or rendering code was copied. Synthetic tests contain
+only constructed bit patterns; the faulting game packet and replay remain
+external under `%TEMP%`.
+## EE PREF instruction semantics (2026-10-06)
+
+- Sony Computer Entertainment Inc., *EE Core Instruction Set Manual*, version
+  6.0, April 2002, `PREF : Prefetch`, page 96. The primary opcode is `110011`;
+  the fields are base, five-bit hint and signed 16-bit offset. Hint zero requests
+  a load prefetch, while reserved hints 1..31 behave the same as zero. The manual
+  states that addressing-related exceptions are ignored, lists no architectural
+  exception, and defines only advisory address translation/prefetch activity.
+  Source consulted as the independently published Sony manual at
+  `https://docs.alexrp.com/mips/ee_insns.pdf`; the searchable transcription at
+  `https://studylib.net/doc/28989088/ee-insns` was used to locate and verify the
+  exact page text. This supports the cache-neutral static AOT implementation;
+  it is not emulator-derived behavior.
+
+## EE CACHE DXIN instruction semantics (2026-10-07)
+
+- Sony Computer Entertainment Inc., *EE Core Instruction Set Manual*, version
+  6.0, April 2002, `CACHE DXIN : Cache Operation (Index Invalidate)`, page 301.
+  The instruction uses the `CACHE` primary opcode `101111` with operation field
+  `10110` (`0x16`) and format `CACHE 0x16, offset(base)`. The signed base-plus-
+  offset virtual address supplies data-cache index bits `[11:6]` and way bit
+  `[0]`. DXIN clears Lock, Valid and Dirty while preserving LRF, and the manual
+  requires the applicable cache-operation sequence to be directly preceded by
+  `SYNC.L`; the listed instruction exception is Coprocessor Unusable. The source
+  is the same independently published Sony manual and searchable transcription
+  cited above for PREF. This establishes the decoder and cache-state semantics
+  independently of emulator code. In the native runtime's coherent-cache model,
+  every represented data-cache line is already invalid, clean and unlocked, so
+  this exact indexed invalidation changes no modeled cache state and performs no
+  guest RAM transfer.
+## Live direct-member target `0x002f4330` (2026-10-07)
+
+The corrected native-renderer manual run recorded an explicit EE static-translation
+fault at `0x002f4330`, with `a0=0x00fc6fe0`, `ra=0x002f609c`, near slice 64M.
+The external raw log is `%TEMP%/haunting-toc-probe/manual-authentic.err.txt` and
+is not stored in the repository.  The return address and object agree with the
+already independently decoded `0x002f6094 -> 0x00100b40` member-descriptor call
+and direct `JR t9` path at `0x00100b6c` documented below.  This proves only that
+`0x002f4330` was the next live direct target.
+
+Independent decoding now bounds that target to `[0x002f4330,0x002f46a4)`: its
+own return is `JR ra` at `0x002f469c`, with stack restoration in the delay slot
+at `0x002f46a0`; three padding words follow and a distinct stack prologue begins
+at `0x002f46b0`.  The complete 884 original file-backed bytes exactly match the
+same range in the retained live EE RAM capture
+`%TEMP%/haunting-toc-probe/edge-adjacent-control-w0-20261007.iop.bin.ee-ram.bin`,
+SHA-256 `9c9030c522e3483e83e29451db17e359a481b12e9721ca90e7b3dac8f4f6fee3`.
+This proves only this callback and body; it does not root the neighboring
+`0x002f46b0` function or resolve the callback's remaining dynamic transfers.
+
+## VU MADD exception envelope (2026-10-08)
+
+Sony Computer Entertainment Inc., *VU User's Manual*, version 6.0, April 2002,
+sections 2.1--2.4 and 3.3.1--3.3.6, especially pages 26--29 and 39--43.
+Unlike IEEE 754, every exponent-255 mantissa is a finite VU value `1.F * 2^128`;
+exponent zero is signed zero.  The MADD exception table states that canonical
+`+MAX/-MAX` ACC remains saturated for a nonexceptional or underflowed product,
+while an overflowing product supplies its own saturated sign.  Other finite ACC
+encodings use the same 24-bit truncating add, including exponent-255 operands
+and final addition overflow/underflow.  Final-add flags populate current and
+sticky fields; multiplication zero, sign, underflow and overflow contribute to
+sticky fields only.
+The temporary source PDF is `%TEMP%/hg-vu-users-manual.pdf`, SHA-256
+`a858ef55cd2638accdfca612d5359eb6e48a48c7fd6792b18080d866e610fde5`,
+retrieved from `https://docs.alexrp.com/mips/ee_vu.pdf`.  This supports only the
+documented VU arithmetic envelope.  It does not establish physical-hardware
+least-bit behavior beyond the manual's stated truncation allowance.
+
+## SPU2 voice synthesis (2026-10-13)
+
+- Sony SPU2 Overview Manual v6.0 (<https://github.com/ninjadynamics/PS2Docs/blob/main/SPU2_Overview_Manual.pdf>): voice pipeline (ADPCM decode, pitch transformation, PMON P'=P(1+OUTX), envelope, volume, mixing switches), PITCH (0x1000 = original pitch), ADSR1/ADSR2 field layout, VOLL/VOLR direct/sweep modes, ENVX/VOLX/ENDX/NAX/LSAX (4 Ts rewrite rule) semantics, KON/KOF, VMIX/MMIX bit assignments, sound-data input areas.
+- psx-spx (nocash) SPU chapter (<https://psx-spx.consoledev.net/soundprocessingunitspu/>) and CDROM format chapter (XA/SPU-ADPCM decode, filter tables pos 0,60,115,98,122 / neg 0,0,-52,-55,-60, reserved shifts 13..15 = 9): ADPCM block/flag format, pitch counter and clamp, 4-point Gaussian table (512 hardware constants; groups sum 0x7F7F..0x7F81, verified on import), envelope step algorithm, noise generator, sweep fields, SPUCNT enable/unmute bits (used for SPU2 ATTR bits 15/14, matching the game's 0xC000/0xC081 writes). The counter reset after a step is inferred from the documented step-period semantics. SPU2 runs this voice hardware at 48 kHz.
+- EE Core User's Manual v6.0 Table 8-4 p162 (<https://docs.alexrp.com/mips/ee.pdf>): SQRT.S of a negative operand returns sqrt(|x|) with I=1.
+- No emulator implementation was consulted.
+
+## 2026-10-23 Hardware-captured EE FPU results (ps2autotests)
+
+`unknownbrackets/ps2autotests` (ISC license): test programs run on a PS2 with their captured outputs. Only the `.expected` result files of `tests/cpu/ee_fpu/` (arithmetic, muldiv, sqrt) are used, as data: downloaded by user approval to `%TEMP%\hg-fpu-vectors\` (not in the repository); the named operand values (CF_*) were read from the suite's `shared.h`. No code was copied. `tools/fpu_vector_check.cpp` (target `fpu_vector_check <dir>`) evaluates `hg::Fpu` on every vector. Findings: add/sub match all 36 each; sqrt matches after giving +0 for exponent-zero inputs (hardware sqrt(-0) = +0; changed); MUL/MADD/MSUB differ on 3 vectors each (1.0 x 3FFFFFFFh = 3FFFFFFEh on hardware while 3FFFFFFFh x 1.0 is exact: the multiplier is inexact and operand-order dependent); DIV differs on 1 (1.0 / 3FFFFFFFh = 3F000001h). A truncated-column radix-4 Booth model (ft recoded, partial-product columns below T not computed) fits all 36 MUL vectors for every T in 1..22, so the vectors do not determine the hardware rule; the exact-chop product stays until more hardware data exists. VU arithmetic is not covered by these vectors.
+
+## 2026-10-24 Real-PS2 EE FPU / VU0 capture (user's console)
+
+`tools/hwtest/fpu_capture.c` (our program, ps2sdk `ps2dev/ps2dev:v2.0.0`) run by the user on their own PS2; result `RESULTS.BIN` (786,432 bytes, 16,384 cases x 12 words; kept out of version control, copy in `%TEMP%\hg-fpu-vectors\RESULTS-hw.BIN`). Findings (`tools/hwtest/analyze.py`, `fpu_vector_check <vectors> RESULTS.BIN`):
+- ADD.S/SUB.S: the aligned smaller operand keeps exactly one guard bit, then the result is chopped: 16,384/16,384 adds and subtracts reproduced (0 or 2+ guard bits fail). Implemented as `Fpu::add_cop1` for COP1 ADD/SUB/ADDA and the MADD/MSUB add step.
+- MADD.S = the hardware MUL product then that add: 16,384/16,384.
+- MUL.S: exact chop or one unit lower (1,721 of 16,384 lower; operand order changes the result in 3,413). VU0 VMULx.x equals the FPU MUL on all cases. Searched truncated Booth radix-4 designs (per-row column truncation, one's/two's-complement rows, correction row) and carry-save trees (linear, Wallace) with a dropped low-part carry: best leaves 265/32,768 mismatches; the exact rule is still open.
+- DIV.S: exact chop or one unit higher (6,560 higher); not a clean remainder threshold (SRT-like). SQRT.S: our nearest result or one lower (2,443). Rules still open.
+- PCSX2 (default settings) matches the hardware on ADD/SUB exactly but uses exact-chop MUL and nearest SQRT.
+
+## 2026-10-25 Real-PS2 VU0 capture (user's console)
+
+`tools/hwtest/vu0_capture.c` run by the user; `VU0.BIN` (1,048,576 bytes, 16,384 cases x 16 words; not in version control, copy `%TEMP%\hg-fpu-vectors\VU0-hw.BIN`). VU0 macro VADD/VSUB follow the same one-guard-bit add as the FPU (16,384/16,384 each); VMADD = VU0 product + that add (16,384/16,384); VU0 VMUL equals the FPU MUL bit for bit; VU0 Q after VDIV equals FPU DIV.S and Q after VRSQRT equals FPU RSQRT.S on every case. So the EE FPU and VU0 share one arithmetic; `Fpu::add` (used by both, and by VU1, whose FMAC is the same design - inferred, not measured) now implements the measured add, including the AVX2 packed path. The AVX-512 embedded-rounding MADD experiment (host IEEE adds) is retired. Divider: exact chop or +1; corrected non-restoring division reproduces exact chop and the uncorrected variant does not match (7,434/16,384 off); an SRT-style digit-selection model is the next candidate.
+
+Divider structure (2026-10-25, both files, 32,768 DIV results): the unit forms an inner quotient of the *unnormalized* significands, Q25 ~ ma*2^24/mb (last digit weight 2^-24), equal to floor or floor+1, and the result is Q25 truncated: when ma >= mb one bit is dropped, when ma < mb none. Evidence: with ma >= mb a +1 appears only when the dropped bit is 1 (0 of 11,000+ cases otherwise); with ma < mb it appears at any remainder; exact quotients and power-of-two divisors are always exact. So the inner unit's final remainder (in units of 2^-24, divisor scaled to [1/2,1)) lies roughly in [-max(1/2, D-1/4), D-1/8]. SQRT follows the same pattern: +1 over chop only when the next root bit is 1 (one extra bit, then truncate). The digit rule is still open. Not matching: radix-2 SRT with constant or per-divisor thresholds (exact remainder or carry-save estimate, 1-6 fraction bits, restoring first digit, extra leading steps, overlapped stages, dropped carry-in), estimate-based final correction, radix-4 {-3..3} with exact remainder, and reciprocal-times-dividend (per-divisor violations 0.2-0.5 unit). Best radix-2 carry-save fit: ~90% of observable cases; failures are always hardware +1 on dividends with random low bits. A structured capture (fixed divisors, consecutive dividends) is the planned way to pin it down. PCSX2 oracle rounding, measured with our capture programs run in it (dry runs, `%TEMP%\hg-fpu-vectors\*-pcsx2.BIN`): COP1 DIV.S rounds to nearest (16,384/16,384 and 26,624/26,624 structured), COP1 SQRT.S to nearest, MUL.S chops; VU0 Q after VDIV and VSQRT chop (16,384/16,384 each). PCSX2's VU0 VADD/VSUB/VMADD take the exact sum and chop (16,384/16,384 each), unlike the console's one-guard-bit adder (they differ in ~27% of adds); PCSX2's COP1 add does match the console. This is the remaining slot-07 drift source: Hewie's path spline input (PC 0x1a92e8 region, frame 85) comes from VU0 vector code. Opt-in HG-DIAG-126 reproduces PCSX2's VU0 add for oracle comparisons only. On the console FPU and VU0 give identical results, so PCSX2's FPU/VU split is an emulator setting, not hardware. Against the 32,768 hardware DIV results, nearest matches 85% (4,865 off) and chop 60% (13,227 off); COP1 DIV.S therefore now rounds to nearest (closest available model, equal to the oracle), VU DIV/SQRT keep chop (equal to the oracle), until the exact rule is fitted.
+
+RSQRT (VU0.BIN): the hardware result equals chop(a / hardware-SQRT(b)) or one above it on all 16,384 cases (+1 on 6,169), i.e. the divider applied to the root unit's output; it needs no separate rule once DIV and SQRT are fitted.
+
+Third capture (planned, needs the user's console): `tools/hwtest/struct_capture.c` writes `mc0:/HGFPU/STRUCT.BIN` (1 MB, 58,794 records of op/a/b/result): DIV with 8 fixed divisors x 2,560 consecutive dividends and 3 fixed dividends x 2,048 consecutive divisors; SQRT over 12,288 consecutive radicands (both exponent parities); MUL with all-ones x sparse patterns, consecutive mantissas x all-ones, near-all-ones pairs and single-bit x consecutive; RSQRT over 4,096 consecutive inputs; then the SPU2 envelope probe (1,476 records, see "SPU2 sustain rate 0x7F" below; about 25 s, silent). Dry run in PCSX2 completes (user's slot-1 card backed up as `Mcd001.ps2.before-struct-capture-20261025.bak` and restored byte for byte).
+
+
+## 2026-10-25 SPU2 sustain rate 0x7F (open)
+
+Haunting Ground's SNDDRV voices use ADSR2 0x5FEF/0x5FCF/0x5FC0 (sustain: linear, decrease, shift 0x1F, step 3 = rate 0x7F). psx-spx "Envelope Operation" (PS1 SPU, hardware tests): a step value of all ones (rate 0x7F) never steps. `spu2_voices.hpp` follows that; the PCSX2 oracle instead lets the level fall slowly (SNDDRV ENVX copies 0x7FE1/0x7FD2 where ours stay 0x7FFF). Whether the PS2 SPU2 matches the PS1 here is unmeasured. Probe added to the third capture (user's choice: one trip): `tools/hwtest/spu2probe/spu2probe.c`, our IOP module run with the console ROM's LIBSD, keys a silent looping voice (core 0 voice 0, volume 0) with ADSR1 0x80FF and nine ADSR2 values (the game's 0x5FEF/0x5FCF/0x5FC0, rates 0x7E/0x7D/0x7B/0x77, exponential 0x7F, increase 0x7F) and records ENVX every ~20 ms for 2 s, then every ~2 ms for 128 ms after key-off; results come back by SIF DMA into STRUCT.BIN (ops 5/6). PCSX2 dry run: rate 0x7F decreasing goes 0x7FFF -> 0x7FFA (1 s) -> 0x7FF5 (2 s), rates 0x7B/0x77 identical to 0x7F; psx-spx predicts no change at 0x7F. Release at the game's linear/exponential shift 0x0F: 0x7FF0 -> 0x73C8 after 129 ms.
+
+## 2026-10-25 Third real-PS2 capture (STRUCT.BIN, user's console)
+
+`tools/hwtest/struct_capture.c` + `spu2probe/` run by the user; `STRUCT.BIN` (1 MB; not in version control, copy `%TEMP%\hg-fpu-vectors\STRUCT-hw.BIN`); summary via `analyze_struct.py`.
+
+SPU2 envelope (op 5/6, ADSR1 0x80FF): (1) shift 1Fh never steps for steps 1..3: rates 7Dh/7Eh/7Fh, linear or exponential decrease, held 7FF7h for 2 s (psx-spx's rule extended to all of shift 1Fh; PCSX2's slow decay is wrong). (2) Shifts 1Dh/1Eh with step 3 decrease by 5 every 683 ms = 8000h Ts (increment 1), as modelled. (3) The level after attack + decay with sustain level Fh is 7FF7h, not 7FFFh: decay takes one step (-8 at decay shift Fh) before the sustain check, so the check follows an applied step. (4) A linear release at shift 0 reads 3FF7h, then FFF7h (negative) for one sample, then 0 (voice off). (5) Exponential release at shift Fh: 7FF7h -> 7FC7h -> 7F8Fh -> 7F5Fh at ~2 ms spacing, matching the model. `spu2_voices.hpp` now implements (1), (3), (4); `spu2_voice_tests` covers them.
+
+MUL (15,786 structured + 81,920 random results): 1.0 x all-ones is one low while all-ones x 1.0 is exact; (1+2^j) x (0xFFFF80+k) errs only for j >= 17 at k multiples of 2^(24-j). Best structure so far: radix-4 Booth rows of the second operand with ones'-complement negatives and their +1s, reduced by a carry-save tree, high part added from column 17 up with the low columns' carry discarded: separate correction row with 4:2 compressor groups (or hot ones in the next row) = 692 of 97,706 off (99.3%; all 15,786 structured cases exact); Wallace 3:2 grouping 758 off; plain truncated-array models >11,000 off. The remaining misses depend on the tree wiring: moving the correction row, hot ones in the next row, reversed row order and pre-tree column truncation all plateau at ~0.7%. 649 of the 692 are model -1 / hardware exact, e.g. 0x800000 x 0x802000 (exact product): the console keeps the carry out of a negative row's low run of ones plus its +1, which this model drops, so the low end of the real tree is arranged differently. Not adopted (chop stays, = PCSX2). Scripts: `%TEMP%`-side scratch `mulmodel.py` (self-contained loader/model).
+
+DIV (26,624 structured): fixed-divisor sweeps over consecutive dividends confirm path dependence: for 0xA00000 near dividend 0x800000 only remainder fraction 0.8 rounds up (period 5), near 0xC66000 fractions 0.2..0.8 vary; for one divisor a 0.4 can round up while a 0.6 does not. Consistent with the 25-bit inner quotient and an SRT-like digit rule still unfitted. SQRT sweeps (12,288 consecutive radicands) show the same shape: a 25-bit inner root rounded up or not, then truncated (+1 only when the extra bit is 1; near radicand 1.0 with even exponent every such case rounds up, with odd exponents it varies), so DIV and SQRT likely share one digit-recurrence unit and one rule.

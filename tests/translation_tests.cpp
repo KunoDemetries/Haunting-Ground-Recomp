@@ -230,6 +230,23 @@ int main() {
     CHECK(s.load(0x100,8,false)==0x1122334455667788ull && s.load(0x108,8,false)==0x99aabbccddeeff00ull);
     s.pc=0xf720;s.vu0.vf[17]={};hg::run(s,1);
     CHECK(s.vu0.vf[17].lo==0x1122334455667788ull && s.vu0.vf[17].hi==0x99aabbccddeeff00ull);
+    s.pc=0xf760;s.gpr[1]={0xffffffffffffffffull,0x0123456789abcdefull};
+    const auto pref_gpr=s.gpr;const auto pref_hi=s.hi;const auto pref_lo=s.lo;
+    const auto pref_hi1=s.hi1;const auto pref_lo1=s.lo1;
+    const auto pref_cache_epoch=s.boot.data_cache_epoch;
+    s.store(0x180,4,0x5aa55aa5);hg::run(s,4);
+    CHECK(s.pc==0xf770 && s.boot.data_cache_epoch==pref_cache_epoch);
+    CHECK(s.hi==pref_hi && s.lo==pref_lo && s.hi1==pref_hi1 && s.lo1==pref_lo1);
+    for(unsigned n=0;n<32;++n)CHECK(s.gpr[n].lo==pref_gpr[n].lo && s.gpr[n].hi==pref_gpr[n].hi);
+    CHECK(s.load(0x180,4,false)==0x5aa55aa5);
+    s.pc=0xf770;s.gpr[1]={0xffffffffffffffffull,0x0123456789abcdefull};s.cp0_tag_lo=0xa5a55a5a;
+    const auto dxin_gpr=s.gpr;const auto dxin_hi=s.hi;const auto dxin_lo=s.lo;
+    const auto dxin_hi1=s.hi1;const auto dxin_lo1=s.lo1;const auto dxin_cache_epoch=s.boot.data_cache_epoch;
+    s.store(0x184,4,0xa55aa55a);hg::run(s,2);
+    CHECK(s.pc==0xf778 && s.cp0_tag_lo==0xa5a55a5a && s.boot.data_cache_epoch==dxin_cache_epoch);
+    CHECK(s.hi==dxin_hi && s.lo==dxin_lo && s.hi1==dxin_hi1 && s.lo1==dxin_lo1);
+    for(unsigned n=0;n<32;++n)CHECK(s.gpr[n].lo==dxin_gpr[n].lo && s.gpr[n].hi==dxin_gpr[n].hi);
+    CHECK(s.load(0x184,4,false)==0xa55aa55a);
     s.pc=0xf800;s.fpr[1]=0x40600000;s.fpr[2]=0x3fa00000;hg::run(s,1);CHECK(s.fpr[3]==0x40100000);
     s.pc=0xf804;s.fpr[2]=0x42a00000;s.fpr[3]=0xbf000000;s.fpu.acc=0xc1800000;hg::run(s,1);CHECK(s.fpr[7]==0xc2600000);
     s.pc=0xf808;s.fpr[1]=0x42a00000;s.fpr[2]=0xbf000000;hg::run(s,1);CHECK(s.fpr[4]==0xc2200000);
@@ -284,13 +301,13 @@ int main() {
     const auto supported_acc=s.vu0.acc;
     hg::run(s,1);CHECK(s.pc==0x4000 && s.vu0.acc==supported_acc);
     CHECK(std::uint32_t(s.vu0.vf[2].lo>>32)==supported_acc[1]);
-    CHECK(s.vu0.mac==0 && s.vu0.status==0x130); // Sticky US only; normal final sums.
-    // Keep exact delay-slot PC and atomic fault coverage for unsupported zero ACC.
+    CHECK(s.vu0.mac==0 && s.vu0.status==0x170); // Product Z/U are sticky; final sums are normal.
+    // The same translated delay slot supports documented product underflow
+    // with zero ACC: the final sum is +0 and supplies current Z.
     s.pc=0x2100c;s.vu0.acc[1]=0;s.vu0.vf[2].hi=0x3f00000040800000ull;
-    const auto vu_before=s.vu0;
-    faulted=false;try{hg::run(s,1);}catch(const hg::Fault& e){faulted=e.pc==0x21010;}
-    CHECK(faulted && s.vu0.acc==vu_before.acc && s.vu0.mac==vu_before.mac && s.vu0.status==vu_before.status);
-    CHECK(s.vu0.vf[2].lo==vu_before.vf[2].lo && s.vu0.vf[2].hi==vu_before.vf[2].hi);
+    hg::run(s,1);CHECK(s.pc==0x4000);
+    CHECK(std::uint32_t(s.vu0.vf[2].lo>>32)==0);
+    CHECK(s.vu0.mac==4 && s.vu0.status==0x171);
     s.pc=0x22000;s.gpr[0]={0xabcdef1234567890ull,0xfedcba0987654321ull};s.w(4,0x4000);
     s.gpr[1]={0x2222222211111111ull,0x4444444433333333ull};
     s.gpr[2]={0x6666666655555555ull,0x8888888877777777ull};

@@ -36,4 +36,25 @@ private:
     Clock::time_point origin_;
     std::uint64_t next_check_us_=interval_us,last_elapsed_us_=0,rebases_=0;
 };
+
+// UI presentation cadence only. No guest clock, input, event or rendering work
+// is changed; the existing latest-frame UI handoff coalesces until due.
+class HostFrameLimiter30 {
+public:
+    using Clock=std::chrono::steady_clock;
+    static constexpr auto period=std::chrono::nanoseconds(1000000000ll/30);
+    static constexpr auto max_lag=std::chrono::milliseconds(100);
+    bool due(Clock::time_point now) const noexcept {return !primed_||now>=next_;}
+    void presented(Clock::time_point now) noexcept {
+        if(!primed_) {next_=now+period;primed_=true;return;}
+        if(now>next_+max_lag) {next_=now+period;++rebases_;return;}
+        next_+=period;
+    }
+    void reset() noexcept {primed_=false;}
+    std::uint64_t rebases() const noexcept {return rebases_;}
+private:
+    Clock::time_point next_{};
+    bool primed_=false;
+    std::uint64_t rebases_=0;
+};
 }

@@ -24,6 +24,10 @@ struct NativeHost {
     // Optional: make the GS OpenGL context current on (true) / release it from
     // (false) the calling thread, so a host device thread can own GS work.
     std::function<void(bool)> gs_context;
+    // Optional, host-only: true once per user checkpoint request (F5), and a
+    // short status notice for the window title. Neither touches guest state.
+    std::function<bool()> checkpoint_requested;
+    std::function<void(const std::string&)> notice;
 };
 int run_native_game(int argc,char** argv,NativeHost* host=nullptr);
 }

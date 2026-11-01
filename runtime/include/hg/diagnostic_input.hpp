@@ -1,5 +1,6 @@
 #pragma once
 #include "hg/native_host.hpp"
+#include <string>
 #include <string_view>
 
 namespace hg {
@@ -28,5 +29,11 @@ inline bool parse_diagnostic_pad(std::string_view text,HostInput& output) {
         else {if(end==std::string_view::npos)return false;text.remove_prefix(end+1);}
     }
     output=candidate;return true;
+}
+inline std::string format_diagnostic_pad(const HostInput& input) {
+    std::string text="pad:"+std::to_string(input.buttons);
+    for(const auto value:input.axes)text+=","+std::to_string(unsigned(value));
+    for(const auto value:input.pressures)text+=","+std::to_string(unsigned(value));
+    return text;
 }
 }

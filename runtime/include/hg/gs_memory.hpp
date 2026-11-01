@@ -29,6 +29,9 @@ struct GsMemoryObserver {
     virtual bool scoped_access(std::uint32_t*,const std::bitset<512>&,const std::bitset<512>&){return false;}
     // Optional exact masked stores. False retains the ordinary CPU path.
     virtual bool masked_write(std::uint32_t*,const std::uint32_t*,const std::uint32_t*,std::size_t,std::uint32_t){return false;}
+    // Complete-page replacement may discard old GPU contents after ordering
+    // earlier users. False retains ordinary materialize-before-write behavior.
+    virtual bool discard_write(std::uint32_t*,std::size_t,std::size_t){return false;}
     virtual void forget(std::uint32_t* words) noexcept=0;
 };
 class GsCpuMemoryScope;
@@ -71,6 +74,11 @@ public:
     std::uint32_t* write_span(std::size_t first,std::size_t count){
         if(first>size()||count>size()-first)throw std::out_of_range("GS writable span outside VRAM");
         access(first,count,true);
+        return first?words_.data()+first:words_.data();
+    }
+    std::uint32_t* write_discard_span(std::size_t first,std::size_t count) {
+        if(first>size()||count>size()-first)throw std::out_of_range("GS discard span outside VRAM");
+        if(observer_&&count&&!observer_->discard_write(words_.data(),first,count))access(first,count,true);
         return first?words_.data()+first:words_.data();
     }
     bool try_masked_write(const std::uint32_t* indices,const std::uint32_t* values,std::size_t count,std::uint32_t mask) {

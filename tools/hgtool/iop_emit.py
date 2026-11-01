@@ -132,7 +132,7 @@ def emit(code,blocked=None,linked=None,native=None,hooks=None):
             elif handler=='exit_thread':
                 lines.append('s.exit_thread();s.finish_instruction();break;}')
             elif handler=='authenticate_card':
-                lines.append('throw IopFault(s.pc,"SECRMAN card authentication requires a real memory-card endpoint");}')
+                lines.append('const auto target=s.r(31);const auto result=s.authenticate_card(s.r(4),s.r(5),s.r(6));s.finish_instruction();s.w(2,result);s.pc=target;break;}')
             elif handler in ('delay_thread','change_thread_priority','refer_thread_status','refer_event_status','irefer_event_status','create_semaphore','signal_semaphore','print_console','get_thread_id','sleep_thread','wakeup_thread','create_thread','delete_thread','start_thread','get_system_status_flag','create_event_flag','set_event_flag','clear_event_flag','query_interrupt_context','suspend_interrupts','resume_interrupts','register_interrupt','release_interrupt','enable_interrupt','wait_vblank_end'):
                 args='s.r(4),s.r(5),s.r(6),s.r(7)' if handler=='register_interrupt' else 's.r(4)'
                 if handler in ('get_thread_id','sleep_thread','get_system_status_flag','query_interrupt_context','wait_vblank_end'):args=''

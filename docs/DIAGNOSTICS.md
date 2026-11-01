@@ -1,3 +1,353 @@
+## HG-DIAG-132 — `HG_EE_PC_LOG=1` live EE PC-watch log (trace build), OPT-IN
+
+Source: `runtime/system_diagnostic.cpp` (slice loop, HG-DIAG-124 block). With a build configured `-DHG_EE_INSTRUCTION_TRACE=ON` (`build-trace/`, gitignored) and `--watch-ee-pc ADDR` (repeatable), prints each new watch hit once per slice with ra/a0-a3/t0/s0-s2 and the {ptr,len} pair at a2. Purpose: per-channel CRI chunk-queue call order for the right-ear static. Default off; normal builds have no instruction history. Remove after the static fix.
+
+## HG-DIAG-131 — `HG_EE_WRITE_WATCH=hexaddr` live EE store log, OPT-IN
+
+Source: `runtime/system_diagnostic.cpp` (slice loop, inside the HG-DIAG-124 block, so run with `--stop-at-ee-word ADDR VALUE`, e.g. an unreachable value). Uses EE write-trace slot 1 and prints every store covering the word (slice, pc, ra, before/after, size, thread, SPU2 input frames). Purpose: right-channel music static (SOURCES.md 2026-10-25). Default off. Guest effect: none. Remove after the static fix.
+
+## HG-DIAG-130 — `HG_SIF1_WATCH=lo-hi` SIF1 destination log + SPU2 input fill log, OPT-IN
+
+Source: `runtime/include/hg/iop_dmac.hpp` `receive_sif1`, `runtime/include/hg/iop.hpp` `pump_spu2_input`. Prints SIF1 packets whose IOP destination overlaps the range and each SPU2 input half fill. Default off. Guest effect: none. Remove after the static fix.
+
+## HG-DIAG-129 — `HG_SPU2_INPUT_RACE=1` SPU2 input source-change check, OPT-IN
+
+Source: `runtime/include/hg/iop.hpp` `pump_spu2_input`. Reports bytes of the previous input DMA source that changed after it was copied. Showed only that CRI rewrites its two 1 KB DMA buffers every half (not informative). Default off. Remove after the static fix.
+
+## HG-DIAG-128 — `HG_SPEAKER_DUMP=prefix` exact speaker buffer dump, OPT-IN
+
+Source: `runtime/include/hg/host_audio.hpp` `dump_submit`. Writes every buffer handed to waveOut (post-gain PCM) to prefix.pcm and a CSV of submit times (QPC µs) and queue depth to prefix.csv. Purpose: user hears loud crackle live while the offline mix is clean and no underruns are logged; this shows whether the stream we submit is corrupt or gapped. Default off (one static check per submitted buffer). Guest effect: none. Remove once the crackle is resolved.
+
+## HG-DIAG-127 — host speaker underrun log, ALWAYS ON (speaker output only)
+
+Source: `runtime/system_diagnostic.cpp` (speaker append in the SPU2 frame callback). Prints `Host audio underrun total=N at guest_seconds=T slice=S` to the log whenever the Windows waveOut queue ran empty (counted by `HostAudioOutput::observe_queue`). Purpose: user hears loud crackling in play sessions; the exit-time speaker report is skipped when the window is closed, so underruns were invisible. Guest effect: none (host counter read). Cost: one integer compare per 48 kHz frame; a line per underrun. Retain until playback crackle is resolved.
+
+## HG-DIAG-126 — `HG_PCSX2_VU0_ADD=1` PCSX2-oracle VU0 adder profile, OPT-IN
+
+Source: `runtime/include/hg/fpu.hpp` `Fpu::add_exact_chop`, `runtime/include/hg/runtime.hpp` `pcsx2_vu0_add_profile`/`vu0_add` (VU0 macro add/sub, MADD-family and OPMSUB adds). Purpose: the PCSX2 oracle's VU0 add takes the exact sum and truncates (16,384/16,384 of its VU0 results), while the console keeps one guard bit (16,384/16,384 hardware results, `Fpu::add`); the two differ in ~27% of adds, which makes oracle comparisons drift (slot 07 Hewie path spline, frame 85). With the variable set, section checks against PCSX2 can look past that known emulator difference for real divergences. Default off: guest state is the console's. Guest effect when on: VU0 macro add results follow PCSX2 instead of hardware (never use for play or hardware claims). Host cost off: one cached static-bool test per VU0 add. Validated by `fpu_vector_check <dir> RESULTS.BIN VU0.BIN` (exact-chop rows) and fpu_tests. Retain while PCSX2 is the long-run oracle; remove if a hardware-exact oracle replaces it.
+
+## HG-DIAG-122 — `HG_IOP_TIMER_TRACE=1` IOP timer configuration trace, OPT-IN
+
+Source: `runtime/include/hg/iop.hpp` (`store_timer`). Prints each timer mode/target write with pc and IOP time. Default off (static flag). Guest effect: none. Used 2026-10-13 to find SNDDRV's 240 Hz timer-4 sequencer clock. Retain while IOP timing is qualified.
+
+## HG-DIAG-121 — `HG_SPU2_VOICE_STATS=1` per-voice activity report, OPT-IN
+
+Source: `runtime/include/hg/spu2_voices.hpp`. Once per guest second, prints each started voice's phase, ENVX level, output peak, address, loop address, ENDX, volumes and ADSR1/ADSR2 registers (added 2026-10-25 for the sustain-level comparison against PCSX2). Default off (static flag check per voice step). Guest effect: none. Retain while SPU2 synthesis is qualified.
+
+## HG-DIAG-120 — `--spu2-mix-wav` final SPU2 mix capture, OPT-IN
+
+Source: `runtime/system_diagnostic.cpp` (`spu2_mix_wav`, `spu2_mix_writer`, mix callback of `advance_spu2`). Purpose: write the final 48 kHz core-1 mix (voices + sound-data input via core 0) to an external WAV for headless audio checks. Default off; path must be outside the repository. Guest effect: none (host-only copy of frames already produced). Cost: one WAV append per Ts when enabled; zero when off. Retain while SPU2 synthesis is being qualified.
+
+## HG-DIAG-125 — controller input at an EE word value (`--input-on-ee-word ADDR VALUE pad:...`), OPT-IN
+
+Source: `runtime/system_diagnostic.cpp` (run loop, checked every slice; repeatable option). Applies a controller snapshot (same format and path as recorded input events, also recorded for checkpoints) the first time the EE word equals VALUE. Used by `tools/oracle/section_check.py` (`HG_CHECK_WALK=1`) with the frame counter 0xFC7280 so a scripted walk starts and stops on the same game frames as in PCSX2 (where the key is posted while the DebugServer holds the EE at that frame's counter write). Default off (empty list). Guest effect: controller input only. Retain with the section checks.
+
+## HG-DIAG-124 — stop at an EE RAM word value (`--stop-at-ee-word ADDR VALUE`), OPT-IN
+
+Source: `runtime/system_diagnostic.cpp` (run loop, checked every slice; the stop message reports the EE PC). Ends the run with its normal dumps/preview when the 32-bit EE word at ADDR equals VALUE (exact, because the address may hold unrelated data before the counter starts). Used by `tools/oracle/section_check.py` with the game-frame counter 0xFC7280 (frames since gameplay began; same address and rate in PCSX2) so our state and the oracle's are read at the same game frame. Default off (one bool test per slice). `HG_STOP_SPU2=1` also prints both cores' voice ENVX at the stop. `HG_WATCH_WORDS=addr,addr,...` with `HG_WATCH_EVERY=K` prints those EE words each time the watched counter reaches a multiple of K (matching `tools/oracle/watch_trace.py` on PCSX2, which samples mid-frame and is only good for coarse ranges); `HG_STOP_WORD_TRACE=1` prints the watched word every 32,768 slices. Both are read once into static flags. Guest effect: none (ends the run). Retain with the section checks.
+
+## HG-DIAG-123 — autopilot synthetic controller input (`--autopilot script`), OPT-IN
+
+Source: `runtime/include/hg/autopilot.hpp`, hook in `runtime/system_diagnostic.cpp` (every 1024 slices once replayed events are exhausted); route lines from `python editor/hgworld path ROOM X Z --door N`. Purpose: unattended play of scripted routes (user request 2026-10-21). Reads Fiona (`*(0x44F818)`: +0x10 position, +0x30 room, +0x54 yaw) and the camera (`*(0x44E4B8)` +0x70 forward) from EE RAM and writes the virtual controller like a recorded input event; every snapshot it applies is recorded, so checkpoints/input logs replay it. `HG_AUTOPILOT_TRACE=1` prints its state every 16384 slices. Default off (one null pointer test per slice). Guest effect when on: controller input only, which is the point; a timed-out command stops the script, not the game. Paused 2026-10-21 in favour of save-based section checks; keep while route automation is useful.
+
+## HG-DIAG-119 — SPU2 sound-data output areas not synthesized, ACTIVE SUBSTITUTE (reverb implemented 2026-10-13)
+
+Source: `runtime/include/hg/spu2_voices.hpp` (`step_core`: wet_l/wet_r discarded). The game configures core-1 reverb (ATTR bit 7, ESA/reverb registers 0x2E0..0x33C, VMIXEL/ER subsets, occasional nonzero EVOL). Effect return is silent and the reverb work area / MEMOUT sound-data output areas in SPU2 local memory are not written. Guest-visible risk: only if the program reads those SPU2 RAM areas back (not observed). Audio difference: drier mix than hardware. Removal: implement the Sony reverb network (SPU2 Overview effect chapter) and output-area writes. 2026-10-13 evidence: the 180M trace shows core-1 reverb configured with the PS1 "Hall" coefficients (vIIR 70F0, vCOMB 4FA8/BCE0/4510/BEF0, vWALL B4C0, vAPF 5280/4EC0, vLIN/vRIN 8000; ESA 0FDBE0, EEA 0F) but every EVOL write is 0, so reverb is inaudible on hardware in that span; the user confirmed gameplay sound is fine. `spu2_voices.hpp` prints a one-time `HG-DIAG-119` stderr line if any core's EVOL becomes nonzero (in the next game build; spu2_voice_tests pass), marking the first scene where reverb would be audible. Address-register order follows the PS1 layout (22 pairs at 0x2E4..0x33A, coefficients at 0x774/0x79C), confirmed by the preset match.
+
+## HG-DIAG-118 — `HG_SPU2_TRACE` SPU2 register write trace, OPT-IN
+
+Source: `runtime/include/hg/iop.hpp` (`spu2_trace_file`, store path for supported SPU2 registers). Purpose: log `virtual_time_us offset value` for every guest SPU2 register write to an external file; used 2026-10-13 to confirm the voice/KON/VMIX/MMIX/volume register offsets from the original game (pinned 180M replay: 81,068 writes; core 1 carries ~5,100 voice setups). Default off (static FILE* null check per SPU2 register write). Guest effect: none. Retain while SPU2 behavior is being qualified.
+
+## HG-DIAG-115 — host-thread stack sampler (`HG_SAMPLE_FILE`) and optional PDBs (`HG_HOST_SYMBOLS`), OPT-IN
+
+Source: `runtime/host_sampler.{hpp,cpp}` (Windows x64; no-ops elsewhere); registration in `runtime/device_thread.cpp` (C, B, VU workers) and `runtime/system_diagnostic.cpp` (EE, plus the `HG_SAMPLE_FROM`/`HG_SAMPLE_TO` checkpoint window and the write at budget). The CMake option `HG_HOST_SYMBOLS` (default OFF) adds `/Zi` to first-party runtime libraries only and `/DEBUG /OPT:REF /OPT:ICF /INCREMENTAL:NO` to `hg_game`; optimization flags are unchanged. Purpose: rank host costs per thread in normal threaded runs. Mechanism: a sampler thread at about 1 kHz suspends each registered thread, copies its registers and up to 128 KiB of stack, resumes it, then unwinds the copy with `RtlVirtualUnwind` (no allocation or locks while a target is suspended). Output is aggregated stacks plus a module table. Offline resolution uses `resolve_pdb.py`-style DbgHelp with inline frames; public map symbols alone mis-attribute inlined/static code. Activation: only when `HG_SAMPLE_FILE` is set. Guest effects: none; captures were byte-identical in sampled runs. Host cost: measured as small to about 15% in one run (noisy); keep inactive by default. Disabled cost: an environment check plus no-op registration. Retention: keep as the attribution tool. Production builds keep `HG_HOST_SYMBOLS=OFF`.
+
+## HG-DIAG-114 — `--frame-rate-probe` original-writer rate without synchronous devices, OPT-IN
+
+Source: `runtime/system_diagnostic.cpp` (`frame_rate_probe`, the existing `frame_probe` enable condition). Purpose: emit the existing `Original frame candidate … interval_hz` lines (0x1BEF84 writer count/timing, unexpected writers, lost trace, caller mismatches) in normal threaded runs. Previously the probe was tied to `--profile`, which also forces synchronous VIF/GIF/GS (HG-DIAG-110). Activation: explicit flag only; default off. Guest effects: none. It uses the existing EE RAM write-trace slot 3 (host-side observation) and posts one ordered stage-C closure per writer to read GS counters. In threaded mode the GS columns (raster/retired deltas, DISPFB/DISPLAY changes) are written on stage C and read on the EE thread, so treat them as approximate. Writer count and timing are measured on the EE thread at the guest store. Host cost: about one closure per guest frame plus the existing trace check. Retention: keep as the threaded benchmark metric (HG-PERF-114).
+
+## HG-DIAG-113 — opt-in resident native page-epoch observation, INACTIVE BY DEFAULT
+
+**2026-10-11 HG-ARCH-009 update — live GL qualification passed.** `gs_gpu_tests --native-epochs` (and every `--resident` run) now drives the hooks through real resident GL queues, `glFlush`, partial/full readback, masked and discard writes, CPU raster scopes, triangles, owner swap/destruction, a deliberate GL error and teardown: 14/14 pass with VRAM equal to the scalar reference. The discard path now also calls `gpu_superseded_pages`, so discarded pages are no longer left pending. Mutation checks (no discard fix; completion at `glFlush`) fail as intended. Production activation is still null, so the retained disabled cost is unchanged: null-pointer branches only. Retention criterion is now met for the scaffold. Any native GPU output still needs separate pixel/alpha/Z parity evidence.
+
+Source: `runtime/gl_gs.cpp`, `runtime/gl_gs.hpp`, `runtime/include/hg/native_psmt8_cache.hpp`. Purpose: HG-ARCH-008 host-side, renderer-private source-generation observation for a future native indexed texture backend, **not** a guest graphics substitute and not a currently activated profiler. Default activation: null fourth `make_gl_sprite_accelerator` argument in all production callers; opt-in only by supplying a `std::shared_ptr<NativeVramPageEpochs>` to a resident accelerator. Mutates no guest memory, program clocks, drawing, result, CPU/GPU synchronization or explicit fault; native private epoch state changes on existing CPU mutable/scoped/discard access and GPU sprite/triangle/masked enqueue; release pending counts only upon successful synchronized GPU `get_data` readback, never submission-only `glFlush`. Forgetting memory, destruction or GL error invalidates tracking. Preserves original `GsMemoryObserver` ownership rather than replacing it. Disabled cost: null-pointer branch checks on observer hooks/accepted draws; full host cost unknown until real resident opt-in testing. Validation as of 2026-10-11: original-linked game builds with production hooks null, separate synthetic overlapping-producer/visible-readback unit tests pass. **No live resident GL test available through the currently configured Project Link runner**, so this option remains unqualified and is not authorized for native GPU output. Retain only as a bounded off-by-default scaffold until a configured resident synthetic integration gate proves it matches real readback/queue behavior; remove/restore on failure. Frozen `v1/` untouched.
+
+## HG-DIAG-112 — resolved indexed-alpha/hazard screening COMPLETE AND REMOVED
+
+Temporary opt-in-by-build `runtime/gs.cpp` aggregate-only original draw classification (active SHA `51ac972696e61be081498b4e45cd8d09d83a7d01818ec164580e7f7f8f1b8282`) made no GS pixel/guest clock, fault or queue decisions and emitted no per-draw payloads. Build/runtime/translation/VU gates passed. `gameplay33m` task rejected prelaunch because pinned TOC differs; fallback known-good authentic 180M job `5a2e4d71d47946ddb66731ae5bc5b07f` completed all 5,270 expected original writers with exact retained frame/EE/GS/VU/console/input vs a clean control (raw IOP RTC varies). Over all 68,497,028 textured original GS triangles, preliminary no-blend/DATE/fog/frame-mask CT32-target candidates: **49,160,981 PSMT8** (of 52,473,068), **11,643,740 PSMT8H** (of 15,961,608). Total 60,804,721 ~88.8% is a screening upper bound, not native-renderable proof. PSMT8 51,114,452 draws used ATST NOTEQUAL and 1,358,616 GEQUAL; alpha test was *always enabled*, AFAIL=KEEP, DATE disabled. Nontrivial compatible-key runs: 46,236 PSMT8 no-equal-page key runs, max 5,769; CLUT reloads outside TEX0 state changes mean these runs cannot directly become safe GPU batches. PSMT8H has 1,459,426 same-base-page candidates requiring feedback analysis. The census's host time is invalid as FPS evidence. Source byte-restored to original `88777a23f5254f8ed7a9dde129b8f0ffc844b0aaf91db45b79a68b26d3a3cf9d` via backup `2969fdcb4991422f928914d4f1dc08d0`, all counter overhead removed. Next: independently validate native PSMT8 texture/CLUT epoch and ATST in a *shadow* draw contract without changing the actual pixel backend.
+
+## HG-DIAG-111 textured draw-class census — COMPLETE, RESTORED
+
+`runtime/gs.cpp` per-draw read-only resolved register classification, source SHA `905c7a0baf69776f6463d1040e5ba7e9383375084a6ad7f99cc01530ac5a6a4c`, fixed authentic 180M replay `f1e657b298744c76825bc54e639fb9f3`. All native gate suites passed and all 5,270 original writer boundaries matched; final image/EE RAM/GS VRAM/state/VU1/console/input match clean control, raw IOP RTC differs as on previous controls. 68,565,026 triangle records out of 70,435,512 draws, 68,497,028 textured: 52,473,068 PSMT8, 15,978,284 PSMT8H, 64,470 PSMT4, 48,604 CT32. All triangle framebuffer PSMCT32. ABE/fog/AA absent for 62,464,426, FRAME mask clear for 66,897,929, but alpha-test-off & destination-alpha-test-off together only 1,473,952; strict opaque/no-ATST candidate screen yielded **zero** textured candidates. This does not disprove native indexed rendering; an indexed fragment shader must respect the actual alpha-test mode. Equal base-page count 1,487,018 is not a full feedback-hazard proof. Instrumented host time is **not FPS**. Observed impact limited to profiling overhead; external result and final captures preserved; original source restored byte exact `88777a23f5254f8ed7a9dde129b8f0ffc844b0aaf91db45b79a68b26d3a3cf9d` via backup `a75cb8cc48d64fd7926bdc8271305a6c`. Do not reintroduce this aggregate counter unchanged; next classification should capture alpha modes and contiguous indexed state runs with a smaller, separately justified probe.
+
+## HG-DIAG-111 temporary resolved-draw native textured eligibility classification — ACTIVE ONLY DURING PROBE
+
+Location: `runtime/gs.cpp` inside the existing ordered `GsRegisterState::rasterize_pending_draws` dispatch immediately after each GS draw's effective environment is resolved. One temporary aggregate-only host counter records primitive and PSM format distributions, frame format, blend/fog/AA and test/mask gates, obvious source/dest base-page equality, preliminary direct CT32/indexed opaque eligibility and consecutive identical-state CT32 candidate runs. Counts are *screening upper bounds*, not proofs of PS2-identical native coverage, texture non-aliasing or actual graphics speed. No game data, packet bytes, vertices, textures, screenshots, pointers or guest clocks are recorded; no draw is dropped/reordered and unchanged original rasterizer executes. The probe is intentionally compiled into `gs.cpp` only for one fixed authentic 180M replay, incurs unknown per-original-draw host cost and MUST NOT be used for FPS claims; teardown prints cumulative counts. Initial `gs.cpp` SHA `88777a23f5254f8ed7a9dde129b8f0ffc844b0aaf91db45b79a68b26d3a3cf9d`; restore exact Project Link byte backup after collecting evidence and rebuilding the clean production executable. Validate native tests, 5,270 qualified original writer events and retained frame/EE/GS/VU/console/input parity. Frozen `v1/` unchanged.
+
+## HG-DIAG-110 host-stage wait counter attempt - CANCELLED, ZERO RETAINED COST
+
+The fixed `gameplay180m_authentic` recorded-input runner invokes `--profile` with unlimited playback, which deliberately selects synchronous VIF/GIF/GS instead of creating `DeviceThread` (guard at `system_diagnostic.cpp:1187`). The temporary `device_thread.cpp` host-only counter activation therefore could not measure ring wait/idle counters for this task; the job was cancelled early at ~94M slices once nonactivation was established. No qualification or GPU-thread timing inference is made. Original source was byte-restored (SHA `c9fee0ab2ca9f99be5927d0e5da4d50cd2589ccb052db2d897437b7a9259a20f`) and game rebuilt (EXE `796b4b7a...`). The retained 175M to 180M `DiagnosticProfile` main-thread samples attribute 81.8% to synchronous `pump_vif1`/`pump_gif`, not evidence of stage B/C bottleneck. For true threaded benchmark, require a separately pinned fixed replay contract, not an ad hoc switch of original state semantics.
+
+## HG-DIAG-109 authentic triangle-flush reason census - COMPLETED AND REMOVED
+
+Temporary only in `runtime/gl_gs.cpp`, SHA `38cec721e8d1d57909b8409450ec03de61172989b7a66e9997d97968a9d56477` while active. Counted 16 mutually exclusive reasons for flushing queued GPU triangles and recorded job-count min/max; no drawing, GL state, guest clocks, or error behavior modified. Exactly 5,270 qualified original writer events, zero writer/caller/fault violations, byte-identical final frame, EE, GS VRAM/state and VU1 vs native clean control. Fixed authentic 180M job `093861948b744a3bba8e3c28242d08f7` captured 36,047 batches: 16,833 payload-capacity, 10,985 sprite transition, 4,863 external/unclassified, and 3,366 CPU discard; no mapping, texture, depth, tile-cap, or other internal flush reasons counted. The probe's host timing was diagnostic-only and did not establish gameplay FPS. The experiment HG-PERF-112 then reduced batches ~29% and did not improve the authentic tail, disproving simple capacity expansion as the throughput solution. Probe restored byte-exact to original runtime `gl_gs.cpp` hash `5354e22bdfeed8932a6b856c7b6386d3c195bfc198ba19e60f9f59013a2bbc99` via backup `932104e9833640bb9eeb67a67cc6afc5`. Runtime overhead now zero. See HG-FAIL-068.
+
+## HG-DIAG-108 current-driver flush synchronization attribution - TEMPORARY
+
+Temporary synthetic-only instrumentation in `runtime/gl_gs.cpp`. It preserves every
+existing GL call and order, adding cumulative host clocks around resident `glFlush()`
+and the existing final `glGetError()` inside `Accelerator::flush()`. Totals are printed
+with the existing GPU summary. It is exercised only by the 1,159-case resident
+`gs_gpu_tests` workload; instrumented elapsed/flush timing is not gameplay qualification
+evidence. No guest/game payload is stored and no renderer decision changes. Pre-edit
+source is frozen under `%TEMP%/haunting-toc-probe/hg-diag108-current-driver-flush-sync-20261010/preedit/`.
+Result: the first no-argument run was nonresident and was discarded for resident
+attribution. The corrected `--resident --triangles` run completed a 984-flush resident
+prefix before the existing wide-STQ combined-mode fixture stopped the test. That prefix
+reports 116,716,000 ns total flush time, 102,626,800 ns in the final `glGetError`
+(**87.9%**) and 2,981,500 ns in `glFlush` (**2.6%**), with 808 accepted GPU sprites and
+1,568 GPU triangles / 224 triangle batches. This independently re-establishes the old
+HG-DIAG-029 synchronization locus on current RTX 5070 / NVIDIA 617.42 code. The probe and
+CMake hook are byte-restored; active source cost after removal is zero. A follow-up
+performance candidate must preserve explicit GL error detection and prove resident
+activation; do not infer anything from the nonresident 1,058-flush workload.
+
+## HG-DIAG-106 retained triangle-dispatch synthesis - READ-ONLY COMPLETE
+
+No runtime probe or renderer change was added. Re-reading the persisted HG-DIAG-105
+175M--180M aggregates isolates 2,703 disjoint outer triangle samples and +2,108,700 ns
+of complete `rasterize_triangle()` dispatch time. Measured inner stages account for
++1,863,900 ns (~88.4%): setup +242,500 ns, first-covered search +250,400 ns,
+admission/packing +254,100 ns, dependency +106,600 ns, ordered backend flush
++821,400 ns, job/native conversion +77,500 ns, palette +61,600 ns, and tile insertion
++49,800 ns. The residual outside those measured stages is only ~244,800 ns (~11.6%).
+
+Ordered backend flush work is therefore the largest remaining measured substage at
+~39.0% of sampled dispatch. HG-PERF-106/107 and HG-FAIL-042 already show that STQ
+fallback, coverage arithmetic, and payload/batch-count micro-optimizations do not
+individually clear the retention gate. Whole-route counters (58,247 flushes,
+33,689 dirty CPU scopes, ~8.33 s readback) are context only and are not attributed to
+the final 5M interval. Earlier nonblocking GL timing also showed substantial GPU
+headroom, so host flush time must not be treated as shader occupancy.
+
+The next bounded diagnostic, once the exact authentic 180M route is callable through
+a sanctioned Project Link task again, is aggregate-only flush-reason attribution.
+Count triangle flush causes separately: sprite/masked crossover, mapping change,
+queued read/write hazards, frame/depth ordering, payload/tile capacity, and VRAM
+selection; separately count CPU-scope queued conflicts versus GPU-dirty downloads.
+Record only cumulative counts/times at existing checkpoints, then derive the
+175M--180M delta. Do not implement another renderer candidate before this
+classification. Active runtime cost of HG-DIAG-106 is zero.
+
+## HG-DIAG-105 sampled accepted-triangle stage census - COMPLETED AND REMOVED
+
+Temporary aggregate-only observer in `gs_triangle_acceleration.hpp`, `gs.cpp`,
+`gl_gs.cpp` and `system_diagnostic.cpp`, activated only by the internal
+`--profile-triangle-stages` switch. One in every 4,096 triangle calls records
+steady-clock durations for producer setup/STQ preparation, first-covered search,
+job admission/packing, and backend dependency/flush, job copy/native conversion,
+palette copy and tile insertion. Atomic cumulative counters are reported at the
+existing checkpoints so the 175M--180M delta can be isolated while retaining the
+normal threaded pipeline. The observer stores no packet, vertex, texture, VRAM or
+pixel payload and makes no guest-state decision; disabled cost is one relaxed
+boolean load per triangle. Active timer/counter overhead is unknown, so measured
+FPS is not qualification evidence. Remove the probe after selecting the next
+bounded production target. External preimage:
+`%TEMP%/hg-backups/renderer-triangle-stage-census-20261008/preedit/`.
+
+The bounded outer-loop extension also samples draw-environment event replay, the
+complete triangle dispatch, and post-draw snapshot/accounting at a disjoint
+1/4096 phase from the inner sample. It is
+intended to distinguish time inside triangle construction/backend insertion from
+the retained full 128-register raster snapshot copy. Extension preimage:
+`%TEMP%/hg-backups/renderer-triangle-stage-census-20261008/pre-outer-extension/`.
+The final extension counted first producer-side rejection guards (bounds, frame,
+tests, texture state, clamp/blend, coordinate proofs and palette validity) only
+while active, because the later 175M--180M scene sends about half its covered
+sampled triangles to scalar rasterization before the backend. The source probe and
+its replay plumbing are now removed; persisted aggregate evidence remains in the
+Project Link job logs and external backups. Active runtime cost is zero.
+
+## HG-DIAG-104 producer-prepacked native STQ - REJECTED AND REMOVED
+
+Bounded renderer-private candidate in `gs_triangle_acceleration.hpp`, `gs.cpp`
+and `gl_gs.cpp`. An internal capability let the native-relaxed GL backend request
+its existing float STQ wire representation during producer validation. Each
+already-validated signed coefficient was cast in the existing per-vertex loop;
+the consumer retained its original conversion fallback. Strict/headless callers,
+validation, admission, shader inputs, ordering and faults were unchanged.
+
+Runtime tests pass, GIF reaches only its known overlap assertion after 1,285
+equivalence cases, and 1,351 native-relaxed GPU cases compare the prepacked route
+directly against the former consumer-conversion route. The exact 180M replay
+reached 5,270 original writers with no unexpected writer/caller/fault and
+byte-identical display, EE, GS, VU and console artifacts. Its old backend
+conversion counter fell from 15,671,454 to zero, proving activation, but the
+175M--180M tail regressed from 20.1939/20.1994 to **19.1972 FPS**. Moving the
+conversion into the producer's register-heavy validation loop is counterproductive
+on this compiler/CPU. Source/tests are restored byte-exactly and active cost is
+zero. Evidence: `%TEMP%/hg-prepacked-stq1-20261008`; external preimage:
+`%TEMP%/hg-backups/renderer-prepacked-stq-20261008/preedit/`.
+
+## HG-DIAG-103 cross-row PSMT8 page-pointer cache - REJECTED AND REMOVED
+
+Bounded renderer-only candidate in `runtime/gs.cpp`, with a counting observer
+fixture in `tests/gif_tests.cpp`. A qualifying `write_image_transfers` call cached
+the first checked host pointer for each physical GS page and invalidated all
+pointers before any scalar fallback; the existing full-page discard proof,
+ordered lane writes, transfer progress and faults were unchanged. The fixture
+proved one observer access per distinct page when a synthetic call revisited
+pages, and runtime plus all 1,367 resident GPU/CPU cases passed (`gif_tests`
+reached only its known overlap assertion after 1,285 equivalence cases).
+
+The exact 180M replay reached 5,270 original writers with no unexpected
+writer/caller/fault and byte-identical display, EE, GS, VU and console artifacts.
+The production backend's 4,164,551 `bulk_cpu_scopes` count remained unchanged;
+source audit confirms that counter belongs to `GsCpuMemoryScope` raster
+coherence, not `GsLocalMemory::write_span`, so it never measured IMAGE mappings.
+Production IMAGE calls have no material same-call revisit reuse. Initializing the
+unused 512-pointer table reduced the 175M--180M tail from
+20.1939/20.1994 to **19.1746 FPS**. Source and fixture are removed; active cost is
+zero. Evidence prefix: `%TEMP%/hg-psmt8-page-cache2-20261008`; external preimage:
+`%TEMP%/hg-backups/renderer-psmt8-page-cache-20261008/preedit/`.
+
+## HG-DIAG-102 native-wide STQ product proof - RETAINED PRODUCTION
+
+Bounded renderer-only change in `runtime/include/hg/gs_math.hpp` and
+`runtime/gs.cpp`. Prepared S/T/Q coefficients must prove `magnitude * area` fits
+the positive signed-64 range. The candidate computes that identical predicate
+with a native 128-bit product on MSVC x64/GCC/Clang instead of up to nine variable
+64-bit divisions per textured triangle; unsupported hosts retain the original
+division definition. No coefficient, readiness, coverage, admission, pixel, VRAM,
+packet, clock, synchronization or fault rule changes. The helper passed 200,004
+direct boundary/random comparisons against the division definition, runtime tests,
+and all 1,367 resident GPU/CPU cases; GIF reached only its pre-existing overlap
+assertion after 1,285 equivalence cases. Two exact 180M qualifications reached
+5,270 writers with no unexpected writer/caller/fault result and byte-identical
+display, EE, GS, VU and console artifacts. Their final intervals are **20.1939**
+and **20.1994** FPS versus the retained 18.8598--18.9329 baseline (+6.66% to
++7.10%). Draw/batch counts remain 15,722,424 / 27,266, confirming no work was
+dropped. Production executable SHA-256 is
+`2c13feb1bae48706b1b479a6cf7f1642d4d92f34d0024b1eca1a05d1f4e30f93` with
+156-input provenance. Retain while the exact predicate and differential coverage
+pass. External preimage/candidate backup is under
+`%TEMP%/hg-backups/renderer-stq-product-proof-20261008/`; evidence prefixes are
+`%TEMP%/hg-stq-product-proof1-20261008` and `hg-stq-product-proof2-20261008`.
+
+## HG-DIAG-101 lazy scalar triangle quotient - REJECTED AND REMOVED
+
+Bounded renderer-only change in `runtime/gs.cpp`. `GsTriangleQuotient` prepares
+the exact reciprocal used by scalar per-pixel interpolation. Its construction is
+now deferred until after coverage rejection and GPU admission, immediately before
+the unchanged scalar fallback consumes it. A nondegenerate triangle made from
+16-bit GS coordinates always has area in the constructor's accepted range, so the
+move could not suppress or reorder a possible explicit fault. Runtime tests and all
+1,367 resident GPU/CPU cases passed; GIF reached only its pre-existing overlap
+assertion after 1,285 equivalence cases. Exact replay matched display, EE, GS, VU
+and console artifacts, with 5,270 writers and no unexpected writer/caller/fault,
+but the tail measured 18.1571 FPS versus the retained 18.8598--18.9329. The change
+is removed and its active cost is zero. External preimage/evidence:
+`%TEMP%/hg-backups/renderer-lazy-triangle-quotient-20261008/` and
+`%TEMP%/hg-lazy-triangle-quotient1-20261008*`.
+
+## HG-DIAG-100 page-bulk resident PSMT8 IMAGE application - RETAINED PRODUCTION
+
+Renderer-private transfer path in `runtime/include/hg/gs.hpp` and `runtime/gs.cpp`.
+Complete consecutive PSMT8 IMAGE runs of at least 256 qwords are partitioned by
+physical GS page, each page is materialized once through the existing coherence
+observer, and ordered byte-lane updates are applied directly. Short, partial,
+misaligned, unsupported and faulting transfers retain the original per-qword path.
+No guest clock, transfer progress, surplus behavior, register, draw or fault rule
+changes. Default active for qualifying large runs on every backend; nonresident
+execution is the same scalar memory mutation with fewer observer scopes.
+
+Focused differential coverage crosses rows/pages/VRAM wrap and compares every
+VRAM word and completion field against serial qwords. The resident GPU suite also
+starts with GPU-owned pages and exercises ordering/materialization; all 1,367 cases
+pass. Runtime tests pass and `gif_tests` reaches only its pre-existing overlap
+assertion after 1,285 equivalence cases. Exact 180M candidates reach 5,270 writers,
+zero unexpected writer/caller/fault result, and match display, EE, GS VRAM/state,
+VU and console bytes. Final 175M--180M rate is 18.3149 and 18.4098 versus retained
+17.4105/17.3488 controls (+5.2% to +6.1%). Masked word jobs fall 2,552,930,784 -> 0
+and triangle batches 46,227 -> 27,266. Retain while differential/output/fault
+checks pass. A strict full-page proof additionally discards old resident contents
+only when one supplied aligned IMAGE run replaces every byte; two repeats measure
+18.9329/18.8598 updates/s with the same exact artifacts and reduce downloads from
+~11.0 GB to 7.90--7.95 GB. The twice-qualified executable SHA-256 is
+`6db42239eee9f6a5d2e7747f01d0b89bd81e80b53c77a4baec57ee90561caec2`.
+The subsequent retained HG-DIAG-102 executable is recorded above.
+External preimage/candidate backups are under
+`%TEMP%/hg-backups/renderer-bulk-psmt8-20261008/`.
+
+## HG-DIAG-099 versioned triangle palettes - REJECTED AND REMOVED
+
+Bounded renderer-private candidate in `gs_triangle_acceleration.hpp`, `gs.hpp`,
+`gs.cpp` and `gl_gs.cpp`. It replaced each triangle's inline 256-word palette
+with a lazy per-CLUT-generation expansion and a borrowed pointer/base/count; the
+ordered GL batch copied each version/bank once. Direct-color and untextured jobs
+carried no palette. CLUT validity was still checked in original entry order on
+every indexed draw, and batch/VRAM-owner changes cleared lookup state.
+
+`runtime_tests` and all 1,367 resident GPU/CPU cases passed; `gif_tests` reached
+only its existing overlap assertion after 1,285 qword-equivalence cases. The
+exact 180M replay reached 5,270 writers with zero unexpected writer/caller/fault
+result and matched retained display, EE RAM, GS VRAM/state, VU and console bytes.
+Triangle batches fell 46,227 -> 39,848 and GL flush time fell 10.263 -> 9.142 s,
+but 175M--180M improved only 17.3488 -> 17.5313 updates/s (~1.05%), below the 5%
+gate. Source/test changes were removed; active cost is zero. External evidence:
+`%TEMP%/hg-versioned-palettes-candidate1-20261008*`.
+
+## HG-DIAG-098 ordered draw-environment delta qualification - RETAINED PRODUCTION
+
+Renderer-private representation candidate in `runtime/include/hg/gs.hpp`,
+`runtime/gs.cpp` and external GS serialization in `runtime/system_diagnostic.cpp`.
+Runtime draw records carry an ordered register-event cursor instead of copying
+all 128 GS register slots.  A persistent raster snapshot consumes each delta once;
+explicit synthetic draws retain owned snapshots.  This changes no guest register,
+clock, packet, draw, VRAM/coherence, pixel, observation or fault behavior.  It is
+always active because two exact candidate qualifications preserve all retained
+captures and improve the decisive 175M--180M interval from 16.1883 to 17.4105 /
+17.3488 updates/s (+7.55% / +7.17%).  Runtime and 1,367 GPU/CPU cases pass;
+`gif_tests` has only its pre-existing overlap assertion.  An earlier quadratic
+prefix-replay attempt was stopped before completion and is not benchmark evidence.
+Source removal criterion: any later differential mismatch, explicit-fault/order
+change, or adjacent reversal disproving the measured gain.  External preimage and
+candidate backups are under
+`%TEMP%/hg-backups/renderer-environment-deltas-20261008/`; no game-derived data is
+stored in the repository.
+
+## HG-DIAG-097 scene-interval renderer attribution - COMPLETED AND REMOVED
+
+Temporary aggregate-only renderer timing for the exact 180M automated route.
+Activation is restricted to realtime `--profile` GPU-host runs; default and normal
+gameplay paths remain inactive.  Existing 5M-slice checkpoints report deltas for
+GL flush/upload/readback, sampled complete GIF packet application, sampled raster
+application, and display publication.  The probe stores no packet, texture,
+palette, VRAM or framebuffer payload.  Guest-state effects are intended to be none:
+it does not change clocks, packet/draw order, synchronization, GS state, pixels,
+faults or input.  Active host cost is unknown, so instrumented update rate is
+attribution evidence only.  Remove it before candidate/control qualification.
+The exact 180M route retained 5,270 original writer events, 29.8906 Hz guest
+cadence, no explicit fault and byte-identical final display/EE/GS/VU artifacts.
+The 175M--180M interval measured 117.9 ms inclusive display publication and
+404.3/278.0 ms GL flush/readback, while sampled raster application dominated.
+Exact primitive counts in that interval were p3=600, p4=1,997,115 and p6=61,089,
+with p0/p1/p2/p5 all zero.  The full route accepted 15,722,424 GPU triangles and
+1,785,769 GPU sprites across 61,992,917 rasterized draws.  This rejects scanout,
+readback-only and CPU point/line fallback work as the scene-drop cause and points
+to per-triangle strip preparation/coverage/tile insertion.
+
+A bounded selected-register state-swap candidate was exact on all compared
+artifacts but changed the 120M--125M interval only 17.4134 -> 17.7601 updates/s
+and regressed the worst tail 15.4990 -> 15.2262; it was removed.  All probe code
+was restored byte-exact to the preimages at
+`%TEMP%/hg-backups/renderer-interval-097-20261008/`; active runtime cost is zero.
+Aggregate evidence is external under `%TEMP%/hg-diag097-*`.
+
+## HG-DIAG-096 recovered-route freeze watchdog - REMOVED, 2026-10-07
+
+Former locations: `runtime/device_thread.cpp` and `runtime/system_diagnostic.cpp`, activated only by `HG_DEVICE_WATCHDOG=1` / `HG_FREEZE_WATCHDOG=1`. The probe bounded EE->B, B->C and synchronous-call waits and sampled coarse loop phases without changing guest state before a diagnostic abort. The exact 1,321-event route continued through the reported 353M point and produced a normal explicit VU1 AOT identity fault plus complete dumps; synchronous execution produced the same MicroMem identity. Therefore there was no device deadlock to fix. The watchdogs, stage-C work counters, environment checks, phase marks, automatic post-build replay, and alternate diagnostic executable name are removed. Clean executable `5f86c145689872a5adc2ed9f7b1353581b731f8e7c0b707694b22bb372b7522f` then completed the full 354M route without a fault and matched every preceding non-RTC capture byte-for-byte; raw IOP differences were only verified RTC bytes `0x0bfcd1..2`. External captures remain under `%TEMP%/haunting-toc-probe/`; instrumented throughput is invalid and no game-derived packet data is stored in the repository.
+
 ## HG-DIAG-028 single-config provenance layouts - 2026-09-29
 
 `tools/hg_build_provenance.py` also validates single-config Release trees (`build/<dir>/hg_game.build.json`, e.g. the Linux Ninja build) by selecting the manifest whose recorded executable matches the isolated binary. `build.ninja` joins the recorded inputs. Still outside native timing and fail-closed on any stale input, missing manifest or mismatched executable.
@@ -57,9 +407,9 @@ The authorized successor used one persistent consumer, fixed32MiB byte ring, fix
 ## HG-DIAG-081 external native CPU sampling - captured, no runtime probe retained
 
 Location: external Visual Studio VSDiagnostics CPUUsageHigh sampling session and external map symbolizer under %TEMP%; no project source probe, no generated-code change, default inactive. Purpose: rank native host PCs during the original gameplay33m replay after WPR policy rejected sampling. Guest-state, clocks, output and fault effects: none intended; high-rate host sampling overhead unknown, so sampled replay throughput is invalid for FPS qualification. Capture: Project Link job38c616eb, PID16112, %TEMP%/hg-vu-native-full-high-20260927.diagsession and hg-vu-native-full-high-dump.txt. Last ETL12.0M..16.5167M us holds18,803 target samples, approximately the slow final interval but without an exact original-slice alignment marker. Top exclusive symbols: VIF process_pending848, XYZ prepare<false>741, exact AVX2 fused transform638, VU arithmetic_q517, multiply_vector429, GIF decode304, GL masked_write283, CPU triangle raster240. The ETL lacked a target loader image; module base was cross-matched to exact instruction PCs from an earlier same-executable trace with an explicit loader event. Do not interpret exclusive samples as inclusive caller cost or calibrated wall seconds. Retention criterion: keep only external evidence and this summary; no profiler running and no source instrumentation retained. Next use only for a broad architecture decision with exact fault/order/readback proof.
-## HG-DIAG-093 speculative VU1 scheduler event trace - ACTIVE (temporary)
+## HG-DIAG-093 speculative VU1 scheduler event trace - completed; removed
 
-`runtime/device_thread.cpp` (`DeviceThread::note`/`dump_trace`): a 64-entry ring of dispatch (D), MSCNT prediction (M), in-order (S) and commit (C) events with entry, TPC, MicroMem generation and flags, dumped to stderr only when a VU1 activation faults under `HG_VU_WORKERS`. Located the MSCNT committed-TPC bug (prediction visible to commits made inside dispatch). Guest state, ordering and faults unaffected; cost: one small struct store per scheduler event while speculation is enabled (not measured separately). Remove once speculative VU1 is accepted and stable.
+Formerly `runtime/device_thread.cpp` (`DeviceThread::note`/`dump_trace`): a 64-entry ring of dispatch (D), MSCNT prediction (M), in-order (S) and commit (C) events with entry, TPC, MicroMem generation and flags, dumped to stderr only when a VU1 activation faulted under `HG_VU_WORKERS`. It located the MSCNT committed-TPC bug (prediction visible to commits made inside dispatch). Guest state, ordering and faults were unaffected; cost was one small struct store per scheduler event while speculation was enabled. Removed 2026-10-06 after repeated exact Linux replays and the MSVC speculative/fault-order differential suite passed; normal explicit fault summaries remain.
 
 ## HG-DIAG-092 VU1 speculation feasibility probe - completed; wrapper removed, hooks productized
 
@@ -621,7 +971,19 @@ pad:buttons,axis0,axis1,axis2,axis3,pressure0,...,pressure11. Strict decimal val
 16-bit buttons and byte axes/pressures, exactly17 fields. Applies the same complete
 controller state logged by --profile at the specified slice. Default off; guest
 input intentionally changes only when selected. Legacy input commands unchanged.
-Retain for deterministic user-fault reproduction; parse only at startup/events.
+`--input-events-file` reads the same ordered `slice command` records once at
+startup for routes too large for the Windows process command line: nonempty,
+strictly increasing, at most2,048 records, no blank/comment/extra fields, and
+mutually exclusive with other diagnostic input sources. The file remains external;
+no game-derived controller data is stored in the repository. In a visible native
+host, scheduled snapshots exclusively own the pad until the final record; ordinary
+live keyboard/gamepad polling resumes on the following input poll so a recorded
+route can hand control back without restarting. Optional
+`--input-replay-wait-live` instead holds guest execution at the final recorded
+slice until the first changed live controller state; it is accepted only with a
+scheduled replay and native host. This opt-in pause changes no guest clocks or
+state while waiting. Retain for deterministic
+user-fault reproduction; disabled mode has no runtime-loop work.
 
 HG-DIAG-014: with --profile and --spu2-output-core, report existing speaker frame,
 underrun and peak counters at checkpoints and fault exit without flushing the queue.
@@ -644,7 +1006,7 @@ runtime behavior, not debug code to delete for speed.
 | HG-DIAG-003 | `runtime.hpp::store`: fixed EE write watch at0198cbc8 | Always checks overlap; records writes to the startup semaphore word. No substituted value. | Cost not isolated; scalar/quad RAM paths preserve watch behavior. Replace with an explicit diagnostic option after startup regressions no longer require its history. |
 | HG-DIAG-004 | `system_diagnostic.cpp`: SIF/RPC/worker histories, `iop_dmac.hpp` histories | Automatic startup provenance; several host scans occur each quantum. Reads original state, records host history. | Dense profile35 isolates `diagnostic_history`; native profile39 is available. Candidate54 gates unchanged completed rings after auditing insertion/return/reset sites. All24 tests pass after explicitly building the newly generated test target. OPENING34.6978s versus36.1589s53 (4.04% less elapsed);1066 guest times, EE/GS/machine state,1315 shared images and49 retained SIFMAN/SNDDRV report lines agree. Cache affects observation work only; retain report equivalence checks. |
 | HG-DIAG-005 | `diagnostic_profile.hpp`, system diagnostic phase marks and CSC/disc event output | `--profile`, default off. Host timestamps, sampled PC costs and event logs; no guest time substitution. | Sampling1/256,11phases. Needed for current evidence; compare runs with identical options. Disable for final presentation measurements and report that setting. |
-| HG-DIAG-006 | `system_diagnostic.cpp` preview/dumps and external replay helpers | Explicit `--preview-file`, `--dump-iop`, input file, ordered `--input-at slice command`, and checkpoint options. Preview copies committed scanout; dumps are diagnostic artifacts. `--dump-iop` also writes exact EE RAM, GS state/VRAM, the current 16KiB VU1 MicroMem image, VU1 data memory/defined masks, and compact VU1 register state for AOT identity and packet-source analysis. Input scripts intentionally change button/pressure state. Optional --capture-vu1 external-prefix with --capture-vu1-tex0 selects the first64 matching AOT VU1 calls, saving before/after memory/registers and entry metadata. The existing AOT executor runs unchanged; the observer detaches after64 calls. Default has no scheduled events or VU observer. | Filesystem/image sampling adds host cost; no renderer flush allowed. VU1 captures are host-only reads at dump time and do not alter VIF/VU state. Candidate62 cache/counters rejected and removed:394 unchanged writes avoided, but35.3766s vs34.9217s58 shows no playback gain. Exact guest times, EE/GS/machine state,1315 shared images in order and49 retained reports agree. Exploratory post-opening helper adds normal Start at27M/none27.1M to the fixed schedule; this intentionally skips OPENING and cannot establish full-movie behavior or timing. Host-timed pulses caused different end states in repeats42fresh/43fresh. Exact input-at events replay recorded guest slices; seven malformed/conflicting argument cases are rejected. Scheduled-event host cost has not been isolated. VU call capture writes bounded external files.32M capture on/off checks preserve EE RAM, GS memory/draws, VU memory/state and image exactly; two IOP RTC bytes differ consistently with launch time. Enabled cost is not isolated; disabled mode keeps the original executor pointer and adds no VU call overhead. Retain only while resolving character geometry provenance. Retain for repeatable validation and compare identical schedules/capture settings. |
+| HG-DIAG-006 | `system_diagnostic.cpp` preview/dumps and external replay helpers | Explicit `--preview-file`, `--dump-iop`, input file, ordered `--input-at slice command` / startup-only `--input-events-file`, narrow manual `--input-log external.txt`, and checkpoint options. Preview copies committed scanout; dumps are diagnostic artifacts. `--input-log` writes only controller changes already delivered to this game window as strict replayable guest-slice `pad:` records; it does not install a global key hook and is default-off. `--dump-iop` also writes exact EE RAM, GS state/VRAM, the current 16KiB VU1 MicroMem image, VU1 data memory/defined masks, and compact VU1 register state for AOT identity and packet-source analysis. Input scripts intentionally change button/pressure state. Ordered replay is bounded to 2,048 events; the cap was raised from 1,024 only after a retained live route produced 1,321 exact analog transitions. Optional --capture-vu1 external-prefix with --capture-vu1-tex0 selects the first64 matching AOT VU1 calls, saving before/after memory/registers and entry metadata. The existing AOT executor runs unchanged; the observer detaches after64 calls. Default has no scheduled events, input logging or VU observer. | Filesystem/image sampling adds host cost; no renderer flush allowed. Input logging flushes one short external line per delivered controller change so an explicit fault retains the route; its enabled host cost is unmeasured and logged runs are not qualified FPS evidence. VU1 captures are host-only reads at dump time and do not alter VIF/VU state. Candidate62 cache/counters rejected and removed:394 unchanged writes avoided, but35.3766s vs34.9217s58 shows no playback gain. Exact guest times, EE/GS/machine state,1315 shared images in order and49 retained reports agree. Exploratory post-opening helper adds normal Start at27M/none27.1M to the fixed schedule; this intentionally skips OPENING and cannot establish full-movie behavior or timing. Host-timed pulses caused different end states in repeats42fresh/43fresh. Exact input-at/events-file events replay recorded guest slices; malformed, conflicting, duplicate/out-of-order and over-limit inputs are rejected. Scheduled-event host cost has not been isolated. VU call capture writes bounded external files.32M capture on/off checks preserve EE RAM, GS memory/draws, VU memory/state and image exactly; two IOP RTC bytes differ consistently with launch time. Enabled cost is not isolated; disabled mode keeps the original executor pointer and adds no VU call overhead. Retain only while resolving character geometry provenance. Retain for repeatable validation and compare identical schedules/capture settings. |
 | HG-DIAG-007 | `system_diagnostic.cpp --toc-record`, IOP TOC input | Explicit external TOC record. Current replay helpers supply a synthetic index-pattern record. **Guest-visible experimental input.** | Quarantined startup probe, not physical-drive correctness. Never promote this input to a normal production default; replace only with independently verified disc behavior. |
 | HG-DIAG-008 | `execution_clock.hpp`, `--clock-profile issue-slots`, worker budgets | Explicit experimental clock profile; legacy is default. **Changes guest work/time allocation**, including bounded polling yields and DMA pacing. | Not a PS2 cycle/cache model. Preserve and disclose exact profile in comparisons; retire the approximation only with independent timing evidence. |
 | HG-DIAG-009 | `iop.hpp` event/CDVD/RAM traces; kernel semaphore/SIF histories | Event-driven bounded history, some default-on, optional address/PC watches. Host records of native services. | Aggregate cost not isolated. Keep until consumers audited; new instrumentation must state its activation and cleanup criterion. |
@@ -722,6 +1084,13 @@ enabled. No guest writes, draw flushes or clock changes. Disabled path does not
 compare/retain images or write rate logs. Comparison and logging cost unisolated;
 use same option for matched instrumented runs. Changes include any pixel change,
 not proof of original simulation-frame boundaries. Retain for 30-update/s evidence.
+On the 2026-10-07 manual run, normal gameplay emitted one interval per second, but
+after the terminal EE AOT fault the still-running host refresh loop emitted
+zero-production intervals at sub-second cadence and rapidly enlarged stderr.
+That post-fault output is host-only diagnostic behavior, not continued guest
+execution or a renderer stall; stop/capture a terminal run rather than using its
+zero-rate tail as performance evidence. Enabled cost in that terminal state is
+unbounded by the ordinary once-per-second estimate.
 
 | HG-DIAG-018 | gs.cpp, gs_triangle_acceleration.hpp, gl_gs.cpp, gl_triangle_shader.hpp, game_host --gpu-triangles | Explicit opt-in OpenGL integer triangle tile batches. CT32 frame, Z32/Z24, CT32/PSMT8/PSMT8H with CT32 palette, bounded positive-Q coefficients, checked tests. Per-pixel lists retain draw order; feedback and mapping hazards flush or use CPU. No guest clocks changed. |345 GPU/CPU cases pass resident; revised original replay and four matched comparisons preserve state/images (RTC excepted). Scene mean22.45325 ->17.62155s,21.52% reduction. Profile962triangle batches/1683totalflushes. Default off. Retain checked bounds/fallback; whole-console fidelity remains unproved. |
 
@@ -893,4 +1262,3 @@ No extra input polling or guest writes beyond existing assignment; disabled cost
 is one flag check per delivered change, not per instruction. Enabled stream cost
 is unmeasured; live sessions excluded from deterministic speed measurements. Retain
 while capturing reproducible interactive faults; no system-wide keyboard capture.
-

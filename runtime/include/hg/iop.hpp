@@ -1,12 +1,16 @@
 #pragma once
+#include "hg/memory_card.hpp"
 #include "hg/controller.hpp"
 #include "hg/iop_dmac.hpp"
 #include "hg/sif_link.hpp"
 #include "hg/spu2_input.hpp"
+#include "hg/spu2_voices.hpp"
 #include <array>
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -30,6 +34,7 @@ struct IopState {
     std::uint32_t expansion_delay_1=0,spu2_delay=0;
     std::array<std::uint16_t,0x400> spu2_registers{};
     std::vector<std::uint8_t> spu2_ram=std::vector<std::uint8_t>(2*1024*1024);
+    Spu2Voices spu2_voices; // Voice synthesis/mixing; owns ENVX/VOLX/NAX/LSAX/ENDX updates.
     std::uint64_t spu2_dma_count=0,spu2_dma_bytes=0;
     std::uint32_t last_spu2_dma_source=0,last_spu2_dma_destination=0;
     unsigned last_spu2_dma_core=0;
@@ -43,6 +48,13 @@ struct IopState {
     // as a complete audio capture or mixed SPU2 output.
     std::array<Spu2InputFrame,512> spu2_input_history{};
     std::uint64_t spu2_input_frames=0;
+    static std::FILE* spu2_trace_file() {
+        static std::FILE* const file=[]()->std::FILE* {
+            const char* path=std::getenv("HG_SPU2_TRACE");
+            return path&&*path?std::fopen(path,"w"):nullptr;
+        }();
+        return file;
+    }
     static bool supported_spu2_register(std::uint32_t physical) {
         // The SPU2 exposes a halfword register file across both cores and its
         // shared digital block. DMA/sample transfer uses a separate checked
@@ -336,6 +348,16 @@ struct IopState {
     std::array<std::uint16_t,2> sio2_buttons{{0xffff,0xffff}};
     std::array<bool,2> sio2_connected{{true,false}}; // Native one-controller launch profile.
     bool sio2_irq_pending=false;
+    // Optional virtual memory card in slot 1 (SIO2 port 2); null/absent keeps
+    // the original disconnected-card behaviour byte for byte.
+    std::shared_ptr<VirtualMemoryCard> memory_card;
+    bool memory_card_present() const noexcept {return memory_card&&memory_card->present;}
+    // Native SECRMAN service: the BIOS module is not available, so a present
+    // virtual card authenticates (no MagicGate crypto is modelled); absent fails.
+    std::uint32_t authenticate_card(std::uint32_t port,std::uint32_t slot,std::uint32_t) const noexcept {
+        return memory_card_present()&&slot==0&&(port==0||port==2)?1u:0u;
+    }
+    void complete_sio2_card_dma();
     void complete_sio2_card_probe();
     void complete_sio2_poll();
     bool sio2_contains(std::uint32_t address) const {return address>=0x1f808200 && address<=0x1f808280;}
@@ -403,6 +425,9 @@ struct IopState {
     struct ThreadStackRange {std::uint32_t address,size;};
     std::vector<ThreadStackRange> free_thread_stacks;
     std::size_t thread_cursor=0;
+    // THREADMAN owner: the last dispatched worker keeps the CPU against equal-priority
+    // ready workers until it blocks, yields (reschedule) or exits; 0 = no owner.
+    std::uint32_t owner_thread=0;
     // Host-only provenance for THREADMAN's BIOS selector-32 context-transfer
     // boundary. Guest thread contexts are owned by the native scheduler.
     std::uint32_t last_thread_reschedule_pc=0,last_thread_reschedule_mode=0;
@@ -426,10 +451,12 @@ struct IopState {
         // Original CDVDMAN at 0xba9e8..0xbaa14 builds all eleven bytes:
         // LBA, count, retry count, converted spindle mode, and zero.
         // Startup uses retry16 for ISO discovery and retry0 for archive reads.
-        // Both use the same successful local-image transfer; error retries remain unsupported.
+        // The original program selects either x2 CLV (2) or x4 CAV (0x83),
+        // depending on the DVD directory profile. Both use the same successful
+        // local-image transfer; physical seek/speed and error retries remain unsupported.
         if(command!=8 || cdvd_n_parameters.size()!=11 ||
            (cdvd_n_parameters[8]!=16 && cdvd_n_parameters[8]!=0) ||
-           cdvd_n_parameters[9]!=2 || cdvd_n_parameters[10]!=0) {
+           (cdvd_n_parameters[9]!=2 && cdvd_n_parameters[9]!=0x83) || cdvd_n_parameters[10]!=0) {
             std::string detail="unsupported CDVD N-command "+std::to_string(command)+" with "+std::to_string(cdvd_n_parameters.size())+" parameters";
             for(const auto value:cdvd_n_parameters)detail+=" "+std::to_string(value);
             throw IopFault(pc,detail);
@@ -522,6 +549,11 @@ struct IopState {
         else if(field==2)item.target=merge(item.target);
         else {item.count=0;item.clock_phase=0;item.mode=(value&0x61ffu)|0x0400u;}
         if(timer<3) {item.count&=0xffff;item.target&=0xffff;}
+        // HG-DIAG-122: optional host-only trace of timer configuration writes.
+        static const bool trace=[]{const char* e=std::getenv("HG_IOP_TIMER_TRACE");return e&&*e=='1';}();
+        if(trace && field)std::fprintf(stderr,"HG-DIAG-122 timer%u %s=0x%x mode=0x%x target=0x%x pc=0x%x t=%lluus\n",timer,
+            field==1?"mode":"target",unsigned(value),unsigned(item.mode),unsigned(item.target),unsigned(pc),
+            static_cast<unsigned long long>(virtual_time_us));
     }
     void advance_timers(std::uint32_t microseconds) {
         constexpr std::uint64_t iop_clock=36864000,per_second=1000000;
@@ -535,9 +567,18 @@ struct IopState {
             const std::uint64_t width=index<3?0x10000ull:0x100000000ull;
             const std::uint64_t old=item.count,next=old+ticks;
             bool fire=false;
-            if((item.mode&0x10) && old<item.target && next>=item.target) {item.mode|=0x800;fire=true;}
-            if((item.mode&0x20) && next>=width) {item.mode|=0x1000;fire=true;}
-            item.count=std::uint32_t(next%width);
+            if((item.mode&0x08) && item.target && old<=item.target) {
+                // Mode bit 3: the counter resets to 0 after reaching the target
+                // (psx-spx root counters; IOP timers share the layout), so a
+                // repeating target IRQ fires every target+1 ticks.
+                const std::uint64_t target=item.target,period=target+1;
+                if(old<target?next>=target:next>=target+period) {item.mode|=0x800;if(item.mode&0x10)fire=true;}
+                item.count=std::uint32_t(next<=target?next:(next-target-1)%period);
+            } else {
+                if((item.mode&0x10) && old<item.target && next>=item.target) {item.mode|=0x800;fire=true;}
+                if((item.mode&0x20) && next>=width) {item.mode|=0x1000;fire=true;}
+                item.count=std::uint32_t(next%width);
+            }
             if(fire) {timer_irq_pending|=std::uint8_t(1u<<index);if(!(item.mode&0x40))item.mode&=~0x400u;}
         }
     }
@@ -674,7 +715,7 @@ struct IopState {
         auto& t=threads[current_thread-1];
         if(!t.ready || t.sleeping || t.delayed || t.wait_semaphore || t.granted_semaphore || t.wait_event)
             throw IopFault(pc,"ExitThread from non-running IOP worker");
-        t.ready=false;t.wakeups=0;locked_thread=0;
+        t.ready=false;t.wakeups=0;locked_thread=0;owner_thread=0;
         // Same dormant state as a returned worker: retain its ID and stack for
         // a subsequent StartThread or DeleteThread, never resume the caller.
         pc=0x1f0020;
@@ -685,7 +726,7 @@ struct IopState {
         last_thread_reschedule_pc=pc;last_thread_reschedule_mode=interrupt_mode?1u:0u;
         if(thread_reschedule_count==~std::uint64_t{0})throw IopFault(pc,"IOP reschedule counter overflow");
         ++thread_reschedule_count;
-        locked_thread=0;
+        locked_thread=0;owner_thread=0;
         // service_iop_thread starts at this cursor on the next complete AOT
         // boundary. Advancing past the current owner models the callback's
         // selection of another equal-priority runnable context.
@@ -1206,6 +1247,22 @@ struct IopState {
                dmac.read(dma_base+8,4)!=0x01000201u)
                 throw IopFault(pc,"SPU2 active input DMA registers changed");
             const auto destination=Spu2Input::sample_address(core,0,spu2_input.cores[core].write_half*256);
+            // HG-DIAG-129 (HG_SPU2_INPUT_RACE=1): report source bytes that changed after the
+            // previous half was copied (the copy is instantaneous; hardware DMA is not).
+            {
+                static const bool race=std::getenv("HG_SPU2_INPUT_RACE")!=nullptr;
+                static std::array<std::array<std::uint8_t,1024>,2> copied{};static std::array<std::uint32_t,2> copied_from{};
+                if(race) {
+                    if(copied_from[core]) {
+                        unsigned first=1024,last=0,count=0;
+                        for(unsigned n=0;n<1024;++n)if(ram[copied_from[core]+n]!=copied[core][n]){if(first==1024)first=n;last=n;++count;}
+                        if(count)std::fprintf(stderr,"HG-DIAG-129 core%u source 0x%x changed after copy: %u bytes in [%u,%u]\n",core,copied_from[core],count,first,last);
+                    }
+                    for(unsigned n=0;n<1024;++n)copied[core][n]=ram[source+n];
+                    copied_from[core]=source;
+                }
+                if(std::getenv("HG_SIF1_WATCH"))std::fprintf(stderr,"HG-DIAG-130 SPU2 input fill core%u source=0x%x half=%u\n",core,source,spu2_input.cores[core].write_half);
+            }
             spu2_input.fill(core,[&](unsigned offset){return ram[source+offset];},
                                 [&](std::uint32_t address,std::uint8_t byte){spu2_ram[address]=byte;});
             transfer.remaining-=Spu2Input::bytes_per_half;
@@ -1219,12 +1276,18 @@ struct IopState {
             }
         }
     }
-    template<class Emit> void advance_spu2(std::uint32_t microseconds,Emit emit) {
+    template<class Emit,class Mix> void advance_spu2(std::uint32_t microseconds,Emit emit,Mix mix) {
         try {
             spu2_input.advance(microseconds,[&](std::uint32_t address) {
                 return std::uint16_t(spu2_ram[address]|(std::uint16_t(spu2_ram[address+1])<<8));
-            },emit,[&](unsigned core){pump_spu2_input(core);});
+            },[&](unsigned core,std::uint16_t left,std::uint16_t right) {
+                spu2_voices.input_sample(core,left,right);emit(core,left,right);
+            },[&](unsigned core){pump_spu2_input(core);});
+            spu2_voices.advance(microseconds,spu2_registers,spu2_ram,mix);
         }catch(const IopFault&){throw;}catch(const std::runtime_error& e){throw IopFault(pc,e.what());}
+    }
+    template<class Emit> void advance_spu2(std::uint32_t microseconds,Emit emit) {
+        advance_spu2(microseconds,emit,[](Spu2Voices::Frame){});
     }
     void advance_spu2(std::uint32_t microseconds) {
         advance_spu2(microseconds,[&](unsigned core,std::uint16_t left,std::uint16_t right) {
@@ -1302,6 +1365,9 @@ struct IopState {
         if(size==2 && (physical==0x1f900344u || physical==0x1f900744u))
             throw IopFault(pc,"SPU2 transfer status is read-only");
         if(size==2 && supported_spu2_register(physical)) {
+            // HG-DIAG-118: optional host-only SPU2 register write trace.
+            if(spu2_trace_file())std::fprintf(spu2_trace_file(),"%llu %03x %04x\n",
+                static_cast<unsigned long long>(virtual_time_us),unsigned(physical-0x1f900000),unsigned(value&0xffffu));
             if(physical==0x1f90019au || physical==0x1f90059au) {
                 const unsigned core=physical==0x1f90019au?0:1;
                 if((value&0x30u)!=(spu2_registers[(physical-0x1f900000)/2]&0x30u))
@@ -1311,8 +1377,10 @@ struct IopState {
                 const unsigned core=physical==0x1f9001b0u?0:1;
                 if(value && value!=(1u<<core))throw IopFault(pc,"unsupported SPU2 AutoDMA control");
                 if(spu2_input_dma[core].active && !value)throw IopFault(pc,"stop SPU2 input DMA before disabling input");
+                if(spu2_registers[(physical-0x1f900000)/2]!=std::uint16_t(value))spu2_voices.input_reset(core);
                 spu2_input.enable(core,value!=0);
             }
+            spu2_voices.register_written(physical-0x1f900000,std::uint16_t(value));
             spu2_registers[(physical-0x1f900000)/2]=std::uint16_t(value);return;
         }
         if(size==4 && physical==0x1d000010){sif->sub_address=value;return;}
@@ -1353,7 +1421,20 @@ struct IopState {
                     }
                 }
                 return;
-            }catch(const std::exception& e){throw IopFault(pc,e.what());}
+            }catch(const std::exception& e){
+                std::string message=e.what();
+                if(message.find("SIF configuration")!=std::string::npos) {
+                    // Detail for active-channel mutation stops: who armed SIF0 and the
+                    // interrupt/thread context of the mutating store.
+                    char detail[256];
+                    std::snprintf(detail,sizeof detail,"; register=0x%08x value=0x%x size=%u ch9_chcr=0x%08x armed_by_pc=0x%x ra=0x%x"
+                        " interrupts_enabled=%d in_interrupt=%d thread=%u",unsigned(physical),unsigned(value),size,
+                        unsigned(dmac.channel[1][2]),unsigned(last_sif0_arm_pc),unsigned(last_sif0_arm_return_pc),
+                        int(interrupts_enabled),int(in_interrupt),unsigned(current_thread));
+                    message+=detail;
+                }
+                throw IopFault(pc,message);
+            }
         }
         if(sio2_contains(physical)){store_sio2(physical,size,value);return;}
         const std::uint32_t traced_word=ram_write_trace_address;

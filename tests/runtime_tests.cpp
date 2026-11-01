@@ -1,4 +1,8 @@
 #include "hg/runtime.hpp"
+#include "hg/native_indexed_draw.hpp"
+#include "hg/native_psmt8_pages.hpp"
+#include "hg/native_psmt8_texture.hpp"
+#include "hg/native_psmt8_cache.hpp"
 #include "hg/diagnostic_input.hpp"
 #include "hg/keyboard_input.hpp"
 #include "controls_panel_regression.hpp"
@@ -84,7 +88,7 @@ static int vu_broadcast_product_tests() {
         s.vu0={};s.vu0.vf[1]=a;s.vu0.vf[2]=b;s.vu0.vf[3]=sentinel;
         s.vu0.acc=original_acc;s.vu0.mac=0xffff;s.vu0.status=0xc30;
         s.vu_broadcast_product(3,1,2,mask,bc,operation);
-        unsigned expected_mac=0,expected_flags=0;
+        unsigned expected_mac=0,expected_flags=0,expected_product_flags=0;
         for(unsigned n=0;n<4;++n) {
             const bool active=(mask&(8u>>n))!=0;
             // Small integral operands have exact products/sums, independently
@@ -95,8 +99,13 @@ static int vu_broadcast_product_tests() {
             CHECK(lane(s.vu0.vf[3],n)==(active && operation==Op::add_vector?expected:lane(sentinel,n)));
             if(active && result<0){expected_mac|=1u<<(7-n);expected_flags|=2;}
             if(active && result==0){expected_mac|=1u<<(3-n);expected_flags|=1;}
+            const float product=source[n]*scalar[bc];
+            if(active && product<0)expected_product_flags|=2;
+            if(active && product==0)expected_product_flags|=1;
         }
-        CHECK(s.vu0.mac==expected_mac && s.vu0.status==(0xc30|expected_flags|(expected_flags<<6)));
+        const unsigned expected_sticky=expected_flags|
+            (operation==Op::multiply_accumulator?0u:expected_product_flags);
+        CHECK(s.vu0.mac==expected_mac && s.vu0.status==(0xc30|expected_flags|(expected_sticky<<6)));
     }
     for(unsigned destination:{1u,2u}) {
         s.vu0={};s.vu0.vf[1]=a;s.vu0.vf[2]=b;s.vu0.acc=original_acc;
@@ -116,7 +125,7 @@ static int vu_broadcast_product_tests() {
     s.vu0={};s.vu0.vf[1]=pack({bits(-1),0,0,0});s.vu0.vf[2]=pack({bits(1),0,0,0});
     s.vu0.acc=original_acc;s.vu0.status=0xc30;
     s.vu_broadcast_product(3,1,2,12,0,Op::add_vector);
-    CHECK(s.vu0.mac==0 && s.vu0.status==0xc30);
+    CHECK(s.vu0.mac==0 && s.vu0.status==0xcf0); // Product sign/zero are sticky-only.
     CHECK(lane(s.vu0.vf[3],0)==bits(9) && lane(s.vu0.vf[3],1)==bits(10));
     s.vu0={};s.vu0.vf[1]=pack({0x80000001,0x80000000,bits(-2),0});
     s.vu0.vf[2]=pack({bits(1),0,0,0});s.vu0.status=0xc30;
@@ -155,7 +164,7 @@ static int vu_broadcast_product_tests() {
         }
         CHECK(s.vu0.acc==before.acc && s.vu0.mac==expected_mac);
         CHECK(s.vu0.status==((old_status&~15u)|expected_current|
-              ((expected_current|(mask?4u:0u))<<6)));
+              ((expected_current|(mask?5u:0u))<<6)));
         for(unsigned reg=0;reg<32;++reg)for(unsigned n=0;n<4;++n) {
             const bool written=operation==Op::add_vector && destination && reg==destination && (mask&(8u>>n));
             CHECK(lane(s.vu0.vf[reg],n)==(written?underflow_acc[n]:lane(before.vf[reg],n)));
@@ -163,41 +172,118 @@ static int vu_broadcast_product_tests() {
         CHECK(s.vu0.q==before.q && s.vu0.pending_q==before.pending_q && s.vu0.q_pending);
         CHECK(s.fpu.acc==fpu_before.acc && s.fpu.control==fpu_before.control);
     }
-    // Unsupported exceptional accumulation fails in the fourth lane, after earlier
-    // lanes have computed, so the snapshot checks exercise atomic rejection.
-    const std::array<std::array<std::uint32_t,3>,5> exceptions={{
-        {0x7fffffff,0x40000000,0x3f800000}, // Product overflow.
-        {0x00800000,0x3f000000,0x00000000}, // Product underflow with zero ACC remains unverified.
-        {0x3f800000,0x3f800000,0x7f800000}, // Exceptional ACC exponent.
-        {0x7f7fffff,0x40000000,0x7f7fffff}, // Sum overflow.
-        {0x80800001,0x3f800000,0x00800000}, // Sum underflow.
+    // Sony VU6.0 p42 canonical +/-MAX ACC rows.  A normal product retains
+    // ACC, an overflowing product supplies its saturated sign, and an
+    // underflowed product retains ACC.  Product flags are sticky-only; the
+    // final saturated result supplies current O/S.  Exercise both MADD forms,
+    // destination zero/aliasing, masks and all product exception classes.
+    const std::array<std::array<std::uint32_t,2>,6> max_products={{
+        {bits(2),bits(3)}, {bits(-2),bits(3)}, {0,bits(3)},
+        {0x7fffffffu,bits(2)}, {0xffffffffu,bits(2)},
+        {0x00800000u,bits(0.5f)},
     }};
-    for(const auto operation:{Op::add_accumulator,Op::add_vector})for(const auto& example:exceptions) {
-        s.vu0={};s.vu0.vf[1]=pack({bits(1),bits(2),bits(4),example[0]});
-        s.vu0.vf[2]=pack({example[1],0,0,0});s.vu0.vf[3]=sentinel;
-        s.vu0.acc=original_acc;s.vu0.acc[3]=example[2];s.vu0.mac=0x1234;s.vu0.status=0xc30;
-        s.vu0.q=0x43210000;s.vu0.pending_q=0x45670000;s.vu0.q_pending=true;
-        const auto before=s.vu0;const auto fpu_before=s.fpu;
-        bool faulted=false;
-        try{s.vu_broadcast_product(3,1,2,15,0,operation);}catch(const hg::Fault&){faulted=true;}
-        CHECK(faulted && s.vu0.acc==before.acc && s.vu0.mac==before.mac && s.vu0.status==before.status);
-        CHECK(s.vu0.q==before.q && s.vu0.pending_q==before.pending_q && s.vu0.q_pending);
-        CHECK(s.fpu.acc==fpu_before.acc && s.fpu.control==fpu_before.control);
-        for(unsigned n=0;n<32;++n)CHECK(s.vu0.vf[n].lo==before.vf[n].lo && s.vu0.vf[n].hi==before.vf[n].hi);
-        s.vu_broadcast_product(3,1,2,14,0,operation); // Masked exceptional lane is not evaluated.
-        CHECK(s.vu0.acc[3]==before.acc[3] && lane(s.vu0.vf[3],3)==lane(before.vf[3],3));
-    }
-    // A later unsupported lane must not publish an earlier newly supported US.
     for(const auto operation:{Op::add_accumulator,Op::add_vector})
-    for(unsigned last_acc:{0u,0x80000000u,1u,0x80000001u,0x7f800000u,0xff800000u}) {
-        s.vu0={};s.vu0.vf[1]=pack({0x00800000,0x00800000,0x00800000,0x00800000});
-        s.vu0.vf[2]=pack({bits(0.5f),0,0,0});s.vu0.vf[3]=sentinel;
-        s.vu0.acc=underflow_acc;s.vu0.acc[3]=last_acc;s.vu0.status=0x30;s.vu0.mac=0x1234;
-        const auto before=s.vu0;bool faulted=false;
-        try{s.vu_broadcast_product(3,1,2,15,0,operation);}catch(const hg::Fault&){faulted=true;}
-        CHECK(faulted && s.vu0.acc==before.acc && s.vu0.mac==before.mac && s.vu0.status==before.status);
-        for(unsigned reg=0;reg<32;++reg)
-            CHECK(s.vu0.vf[reg].lo==before.vf[reg].lo && s.vu0.vf[reg].hi==before.vf[reg].hi);
+    for(unsigned acc_sign=0;acc_sign<2;++acc_sign)for(unsigned mask=0;mask<16;++mask)
+    for(unsigned destination:{0u,1u,3u})for(const auto& operands:max_products) {
+        s.vu0={};s.vu0.vf[1]=pack({operands[0],operands[0],operands[0],operands[0]});
+        s.vu0.vf[2]=pack({operands[1],bits(1),bits(1),bits(1)});
+        s.vu0.vf[3]=sentinel;s.vu0.acc.fill(acc_sign?0xffffffffu:0x7fffffffu);
+        s.vu0.status=0x30;s.vu0.mac=0x1234;
+        const auto before=s.vu0;
+        s.vu_broadcast_product(destination,1,2,mask,0,operation);
+        const auto product=hg::Fpu::product(operands[0],operands[1]);
+        auto expected_bits=product.overflow?product.bits:before.acc[0];
+        unsigned product_flags=unsigned(!(product.bits&0x7fffffffu))
+            |((product.bits&0x80000000u)&&(product.bits&0x7fffffffu)?2u:0u)
+            |(product.underflow?4u:0u)|(product.overflow?8u:0u);
+        unsigned expected_mac=0,expected_current=0;
+        for(unsigned n=0;n<4;++n)if(mask&(8u>>n)) {
+            const unsigned flags=8u|((expected_bits&0x80000000u)?2u:0u);
+            expected_current|=flags;
+            for(unsigned group=0;group<4;++group)
+                if(flags&(1u<<group))expected_mac|=1u<<(group*4+3-n);
+            CHECK(s.vu0.acc[n]==(operation==Op::add_accumulator?expected_bits:before.acc[n]));
+            if(operation==Op::add_vector && destination)
+                CHECK(lane(s.vu0.vf[destination],n)==expected_bits);
+        }
+        CHECK(s.vu0.mac==expected_mac);
+        CHECK(s.vu0.status==((before.status&~15u)|expected_current|
+              ((expected_current|(mask?product_flags:0u))<<6)));
+        for(unsigned n=0;n<4;++n)if(!(mask&(8u>>n))) {
+            CHECK(s.vu0.acc[n]==before.acc[n]);
+            for(unsigned reg=0;reg<32;++reg)
+                CHECK(lane(s.vu0.vf[reg],n)==lane(before.vf[reg],n));
+        }
+    }
+    // VU6.0 pp26,29,42: exponent 255 is finite 1.F*2^128. Exercise its
+    // complete useful MADD envelope rather than treating IEEE NaN/Inf bit
+    // patterns specially: zero/tiny products retain it, opposite signs can
+    // cancel, and a same-sign carry clamps with final-add overflow.
+    const std::array<std::uint32_t,6> exponent_255={
+        0x7f800000u,0x7f800001u,0x7f9b3defu,
+        0xff800000u,0xff800001u,0xff9b3defu,
+    };
+    for(const auto operation:{Op::add_accumulator,Op::add_vector})
+    for(const auto acc:exponent_255)for(unsigned mask=0;mask<16;++mask)
+    for(unsigned destination:{0u,1u,3u}) {
+        s.vu0={};s.vu0.vf[1]=pack({0,0,0,0});
+        s.vu0.vf[2]=pack({bits(1),0,0,0});s.vu0.vf[3]=sentinel;
+        s.vu0.acc.fill(acc);s.vu0.status=0x30;s.vu0.mac=0x1234;
+        const auto before=s.vu0;
+        s.vu_broadcast_product(destination,1,2,mask,0,operation);
+        unsigned expected_mac=0,expected_current=0;
+        for(unsigned n=0;n<4;++n)if(mask&(8u>>n)) {
+            if(acc&0x80000000u){expected_mac|=1u<<(7-n);expected_current|=2;}
+            CHECK(s.vu0.acc[n]==(operation==Op::add_accumulator?acc:before.acc[n]));
+            if(operation==Op::add_vector && destination)CHECK(lane(s.vu0.vf[destination],n)==acc);
+        }
+        CHECK(s.vu0.mac==expected_mac);
+        CHECK(s.vu0.status==((before.status&~15u)|expected_current|
+              ((expected_current|(mask?1u:0u))<<6)));
+        for(unsigned n=0;n<4;++n)if(!(mask&(8u>>n))) {
+            CHECK(s.vu0.acc[n]==before.acc[n]);
+            for(unsigned reg=0;reg<32;++reg)CHECK(lane(s.vu0.vf[reg],n)==lane(before.vf[reg],n));
+        }
+    }
+    struct MaddExceptionalCase {
+        std::uint32_t acc,source,scalar,result;
+        unsigned current,product_sticky;
+    };
+    const std::array<MaddExceptionalCase,6> exceptional_cases={{
+        {0x7f800000u,0xff800000u,bits(1),0u,1u,2u},       // Exact cancellation.
+        {0xff800000u,0x7f800000u,bits(1),0u,1u,0u},       // Exact cancellation, reversed.
+        {0x7f800000u,0x7f800000u,bits(1),0x7fffffffu,8u,0u}, // Final add overflow.
+        {0xff800000u,0xff800000u,bits(1),0xffffffffu,10u,2u},// Negative add overflow.
+        {bits(1),0x7fffffffu,bits(2),0x7fffffffu,8u,8u},  // Product overflow.
+        {0x00800000u,0x80800001u,bits(1),0x80000000u,5u,2u},// Final add underflow.
+    }};
+    for(const auto operation:{Op::add_accumulator,Op::add_vector})
+    for(const auto& example:exceptional_cases)for(unsigned destination:{0u,1u,3u}) {
+        s.vu0={};s.vu0.vf[1]=pack({example.source,example.source,example.source,example.source});
+        s.vu0.vf[2]=pack({example.scalar,0,0,0});s.vu0.vf[3]=sentinel;
+        s.vu0.acc.fill(example.acc);s.vu0.status=0x30;
+        const auto before=s.vu0;
+        s.vu_broadcast_product(destination,1,2,15,0,operation);
+        unsigned expected_mac=0;
+        for(unsigned n=0;n<4;++n)for(unsigned group=0;group<4;++group)
+            if(example.current&(1u<<group))expected_mac|=1u<<(group*4+3-n);
+        CHECK(s.vu0.mac==expected_mac);
+        CHECK(s.vu0.status==((before.status&~15u)|example.current|
+              ((example.current|example.product_sticky)<<6)));
+        for(unsigned n=0;n<4;++n) {
+            CHECK(s.vu0.acc[n]==(operation==Op::add_accumulator?example.result:before.acc[n]));
+            if(operation==Op::add_vector && destination)CHECK(lane(s.vu0.vf[destination],n)==example.result);
+        }
+    }
+    // Product underflow contributes US/ZS but final current flags come from
+    // adding signed zero to ACC, including zero ACC and destination aliasing.
+    for(const auto operation:{Op::add_accumulator,Op::add_vector})
+    for(unsigned acc:{0u,0x80000000u,bits(1),bits(-1)}) {
+        s.vu0={};s.vu0.vf[1]=pack({0x00800000u,0x00800000u,0x00800000u,0x00800000u});
+        s.vu0.vf[2]=pack({bits(0.5f),0,0,0});s.vu0.acc.fill(acc);
+        s.vu_broadcast_product(1,1,2,15,0,operation);
+        const unsigned current=!(acc&0x7fffffffu)?1u:(acc&0x80000000u?2u:0u);
+        CHECK(s.vu0.status==(current|((current|5u)<<6)));
     }
     return 0;
 }
@@ -494,7 +580,439 @@ static int vif_checked_word_tests() {
     std::cout<<"VIF word reads: "<<cases<<" value/fault comparisons including all offsets, extra capacity and SIZE_MAX passed\n";
     return 0;
 }
+static int native_indexed_draw_contract_tests() {
+    hg::GsRegisterState gs;
+    gs.clut_load_count=19;
+    for(unsigned i=0;i<256;++i){
+        gs.clut[i]=std::uint16_t(0x2000u+i);
+        gs.clut[i+256]=std::uint16_t(0xa000u+i);
+        gs.clut_valid[i]=gs.clut_valid[i+256]=true;
+    }
+    const auto before_palette=gs.clut;
+    const auto palette=hg::native_psmt8_palette_snapshot(gs);
+    CHECK(palette && palette->generation==19);
+    CHECK(palette->rgba[0]==0xa0002000u);
+    CHECK(palette->rgba[255]==0xa0ff20ffu);
+    gs.clut[0]=0;gs.clut_load_count=20;
+    CHECK(palette->rgba[0]==0xa0002000u && palette->generation==19);
+    const auto palette_next=hg::native_psmt8_palette_snapshot(gs);
+    CHECK(palette_next && palette_next->generation==20);
+    CHECK(palette_next->rgba[0]==0xa0000000u);
+    gs.clut_valid[260]=false;
+    CHECK(!hg::native_psmt8_palette_snapshot(gs));
+    gs.clut_valid[260]=true;
+    gs.clut=before_palette;gs.clut_load_count=19;
+
+    hg::GsDraw draw;
+    draw.primitive=3;draw.count=3;draw.prim_state=16u;
+    draw.xyoffset=0x1200000034ull;
+    draw.vertices[0].x=11;draw.vertices[0].rgba=0x11335577u;
+    draw.vertices[1].y=22;draw.vertices[1].q=0x3f400000u;
+    draw.vertices[2].st=0x123456789abcdef0ull;
+    auto& regs=gs.value;
+    regs[6]=(std::uint64_t(0x13)<<20)|(std::uint64_t(1)<<14);
+    regs[0x4c]=std::uint64_t(1)<<16;
+    regs[0x4e]=0;
+    regs[0x47]=1u|(7u<<1)|(1u<<16)|(2u<<17);
+    regs[8]=0x1122334455667788ull;
+    regs[0x42]=0x778899;
+    regs[0x40]=0x200000002ull;
+    regs[0x3b]=0x667788;
+    regs[0x46]=1u;
+    regs[0x49]=0;
+    const auto saved_reg=regs;
+    const auto saved_draw=draw;
+    const auto record=hg::prepare_native_psmt8_draw(draw,regs,palette,987654);
+    CHECK(record.has_value());
+    CHECK(record->original_order==987654 && record->palette_generation==19);
+    CHECK(record->primitive==3 && record->prim_state==16u);
+    CHECK(record->vertex[0].x==11 && record->vertex[1].y==22);
+    CHECK(record->vertex[2].st==0x123456789abcdef0ull);
+    CHECK(record->test==regs[0x47] && record->clamp==regs[8]);
+    CHECK(record->requires_vram_hazard_proof && record->requires_native_pixel_parity_proof);
+    CHECK(record->palette==palette);
+    CHECK(gs.value==saved_reg && draw.vertices[0].x==saved_draw.vertices[0].x);
+    draw.vertices[0].x=600;regs[8]=9;
+    CHECK(record->vertex[0].x==11 && record->clamp==0x1122334455667788ull);
+    draw=saved_draw;regs=saved_reg;
+
+    CHECK(!hg::prepare_native_psmt8_draw(draw,regs,{},1));
+    const auto reject=[&](std::uint16_t flags,std::uint64_t tex0,std::uint64_t test,std::uint64_t frame){
+        const auto old_tex0=regs[6],old_test=regs[0x47],old_frame=regs[0x4c];
+        const auto old_flags=draw.prim_state;
+        draw.prim_state=flags;regs[6]=tex0;regs[0x47]=test;regs[0x4c]=frame;
+        const bool denied=!hg::prepare_native_psmt8_draw(draw,regs,palette,99);
+        draw.prim_state=old_flags;regs[6]=old_tex0;regs[0x47]=old_test;regs[0x4c]=old_frame;
+        return denied;
+    };
+    const auto tex0=regs[6],test=regs[0x47],frame=regs[0x4c];
+    CHECK(reject(16u|64u,tex0,test,frame)); // ABE
+    CHECK(reject(16u|32u,tex0,test,frame)); // fog
+    CHECK(reject(16u|128u,tex0,test,frame)); // antialias
+    CHECK(reject(0,tex0,test,frame)); // no texture
+    CHECK(reject(16u,(tex0&~(std::uint64_t(63)<<20))|(std::uint64_t(0x1b)<<20),test,frame)); // PSMT8H feedback
+    CHECK(reject(16u,tex0|(std::uint64_t(1)<<51),test,frame)); // unsupported CLUT CPSM
+    CHECK(reject(16u,tex0,test|0x4000u,frame)); // destination-alpha test
+    CHECK(reject(16u,tex0,test|(1u<<12),frame)); // AFAIL!=KEEP
+    CHECK(reject(16u,tex0,test,frame|(std::uint64_t(1)<<32))); // masked frame
+    CHECK(reject(16u,tex0,test&~1u,frame)); // alpha compare disabled
+    CHECK(reject(16u,tex0,(test&~0xeu)|(1u<<1),frame)); // unproven ALWAYS alpha
+    CHECK(reject(16u,tex0,test&~0x10000u,frame)); // ZTE off
+    CHECK(reject(16u,tex0,test,frame|(std::uint64_t(1)<<24))); // non-CT32 target
+    regs[0x47]=(test&~0xeu)|(5u<<1); // GS GEQUAL alpha also occurs in authentic scene.
+    CHECK(hg::prepare_native_psmt8_draw(draw,regs,palette,51).has_value());
+    CHECK(regs[0x47]==((test&~0xeu)|(5u<<1)));
+    // The real GS draw queue has a *disabled-by-default* post-raster shadow seam.
+    struct Shadow final : hg::NativeIndexedDrawObserver {
+        unsigned calls=0;
+        std::optional<hg::NativeIndexedDraw> last;
+        void observe_completed_draw(const hg::GsDraw& d,
+            const hg::GsDraw::Environment& regs,const hg::GsRegisterState& gs) noexcept override {
+            ++calls;
+            const auto palette=hg::native_psmt8_palette_snapshot(gs);
+            last=hg::prepare_native_psmt8_draw(d,regs,palette,gs.rasterized_draw_count);
+        }
+    } shadow;
+    auto degenerate=draw;
+    degenerate.vertices={}; // Identically positioned triangle: original raster returns without writing.
+    gs.draws.push_back(degenerate);
+    CHECK(!hg::native_indexed_draw_observer);
+    hg::native_indexed_draw_observer=&shadow;
+    const auto completed=gs.rasterize_pending_draws();
+    hg::native_indexed_draw_observer=nullptr;
+    CHECK(completed==1 && gs.rasterized_draw_count==1);
+    CHECK(shadow.calls==1 && shadow.last.has_value());
+    CHECK(shadow.last->original_order==0 && shadow.last->palette_generation==19);
+    CHECK(shadow.last->vertex[0].x==0 && shadow.last->requires_vram_hazard_proof);
+    CHECK(gs.vram.empty()); // The original degenerate triangle never writes pixels.
+    auto invalid=degenerate;invalid.primitive=7;
+    gs.draws.push_back(invalid);
+    hg::native_indexed_draw_observer=&shadow;
+    bool faulted=false;
+    try {gs.rasterize_pending_draws();}catch(const std::runtime_error&){faulted=true;}
+    hg::native_indexed_draw_observer=nullptr;
+    CHECK(faulted && shadow.calls==1 && gs.rasterized_draw_count==1);
+    std::cout<<"Native indexed draw contract: immutable CLUT/vertices, alpha/depth modes, original draw callback and rejection passed\n";
+    return 0;
+}
+static int native_psmt8_page_footprint_tests() {
+    hg::NativeIndexedDraw d;
+    d.primitive=3;d.prim_state=16u;
+    d.frame=(std::uint64_t(90)<<0)|(std::uint64_t(2)<<16);
+    d.zbuf=std::uint64_t(120);
+    d.scissor=(std::uint64_t(2047)<<16)|(std::uint64_t(2047)<<48);
+    d.vertex[0].x=16u*8u;d.vertex[0].y=16u*4u;
+    d.vertex[1].x=16u*128u;d.vertex[1].y=16u*4u;
+    d.vertex[2].x=16u*8u;d.vertex[2].y=16u*128u;
+    unsigned cases=0;
+    // All possible texture-source samples must fall in a conservatively
+    // marked page, including sub-page TBP0 alignment and physical wrap.
+    for(const unsigned tbp:{0u,1u,17u,31u,100u,16383u})
+      for(const unsigned tbw:{1u,2u,4u,8u})
+      for(const unsigned tw:{2u,7u,8u,10u})
+      for(const unsigned th:{2u,6u,8u,10u})
+      for(const unsigned mode:{0u,1u,2u,3u}) {
+        d.tex0=tbp|(std::uint64_t(tbw)<<14)|(std::uint64_t(0x13)<<20)|
+             (std::uint64_t(tw)<<26)|(std::uint64_t(th)<<30);
+        d.clamp=std::uint64_t(mode)|(std::uint64_t(mode)<<2);
+        // REGION_CLAMP can reach beyond TW/TH; REGION_REPEAT masks are
+        // independent. Both must be included conservatively.
+        if(mode==2){
+            d.clamp|=(std::uint64_t(11)<<4)|(std::uint64_t(1000)<<14)|
+                     (std::uint64_t(17)<<24)|(std::uint64_t(1000)<<34);
+        }else if(mode==3){
+            d.clamp|=(std::uint64_t(0x155)<<4)|(std::uint64_t(0x2aa)<<14)|
+                     (std::uint64_t(0x066)<<24)|(std::uint64_t(0x299)<<34);
+        }
+        const auto footprint=hg::native_psmt8_page_footprint(d);
+        CHECK(footprint.supported && footprint.screen_has_area);
+        CHECK(footprint.texture_reads.any() && footprint.frame_touches.any() && footprint.depth_touches.any());
+        const unsigned base=unsigned((d.tex0&0x3fffu)*64u),width=tbw*64u;
+        const unsigned max_u=mode==2?1000u:mode==3?(0x155u|0x2aau):((1u<<tw)-1u);
+        const unsigned max_v=mode==2?1000u:mode==3?(0x066u|0x299u):((1u<<th)-1u);
+        for(unsigned y:{0u,max_v/4,max_v/2,(3*max_v)/4,max_v})
+          for(unsigned x:{0u,max_u/4,max_u/2,(3*max_u)/4,max_u}) {
+            const unsigned word=hg::GsRegisterState::psmt8_word(base,width,x,y);
+            CHECK(footprint.texture_reads[word/2048u]);
+            ++cases;
+          }
+        for(unsigned y:{4u,5u,31u,32u,63u,127u,128u})
+          for(unsigned x:{8u,9u,63u,64u,127u,128u}) {
+            const auto f=hg::GsRegisterState::psmct32_word(90u*2048u,128u,x,y)/2048u;
+            const auto z=hg::GsRegisterState::psmz32_word(120u*2048u,128u,x,y)/2048u;
+            CHECK(footprint.frame_touches[f] && footprint.depth_touches[z]);
+          }
+      }
+    // TBP0=16383 is 64 words before the end of a physical VRAM wrap;
+    // a single indexed tile reads both page 511 and page 0.
+    d.tex0=std::uint64_t(16383u)|(std::uint64_t(2)<<14)|
+           (std::uint64_t(0x13)<<20)|(std::uint64_t(7)<<26)|
+           (std::uint64_t(6)<<30);
+    d.clamp=0;
+    auto physical=hg::native_psmt8_page_footprint(d);
+    CHECK(physical.texture_reads[511]&&physical.texture_reads[0]);
+    CHECK(physical.source_disjoint_from_destinations);
+    d.frame=(d.frame&~std::uint64_t(511))|std::uint64_t(511); // render to PSMT8 source pages
+    physical=hg::native_psmt8_page_footprint(d);
+    CHECK(!physical.source_disjoint_from_destinations);
+    // A Z-buffer alias is also a source hazard, even with masked Z writes.
+    d.frame=(d.frame&~std::uint64_t(511))|std::uint64_t(90);
+    d.zbuf=std::uint64_t(511)|(1ull<<32);
+    physical=hg::native_psmt8_page_footprint(d);
+    CHECK(!physical.source_disjoint_from_destinations);
+    d.zbuf=std::uint64_t(120);
+    d.vertex[0].x=d.vertex[1].x=d.vertex[2].x=0; // outside scissor with x >= 1
+    d.scissor=(std::uint64_t(1))|(std::uint64_t(2047)<<16)|
+              (std::uint64_t(2047)<<48);
+    physical=hg::native_psmt8_page_footprint(d);
+    CHECK(physical.supported&&!physical.screen_has_area&&!physical.source_disjoint_from_destinations);
+    d.scissor=(std::uint64_t(2047)<<16)|(std::uint64_t(2047)<<48);
+    d.tex0&=~(std::uint64_t(63)<<20);
+    CHECK(!hg::native_psmt8_page_footprint(d).supported);
+    std::cout<<"Native PSMT8 page footprint: "<<cases
+             <<" physical-address memberships and feedback/clip gates passed\n";
+    return 0;
+}
+static int native_psmt8_linear_texture_tests() {
+    hg::GsRegisterState gs;
+    gs.vram.assign(1024u*1024u,0);
+    std::uint32_t seed=0x76a5d481u;
+    auto* mutable_words=gs.vram.write_span(0,gs.vram.size());
+    for(std::size_t i=0;i<gs.vram.size();++i) {
+        seed^=seed<<13;seed^=seed>>17;seed^=seed<<5;
+        mutable_words[i]=seed;
+    }
+    hg::NativeIndexedDraw d;
+    struct Fixture{unsigned tbp,tbw,tw,th,mode,umin,umax,vmin,vmax;};
+    const std::array<Fixture,8> fixtures{{
+      {0,2,7,6,0,0,0,0,0},
+      {1,3,6,6,1,0,0,0,0},
+      {0x3fff,1,7,6,0,0,0,0,0},
+      {17,4,8,8,0,0,0,0,0},
+      {120,6,6,6,2,11,1000,5,70},
+      {133,8,6,6,3,0x155,0x2aa,0x066,0x299},
+      {511,3,9,7,1,0,0,0,0},
+      {8191,8,10,10,0,0,0,0,0}
+    }};
+    unsigned comparisons=0;
+    for(const auto& f:fixtures){
+        d.tex0=std::uint64_t(f.tbp)|(std::uint64_t(f.tbw)<<14)|
+                (std::uint64_t(0x13)<<20)|(std::uint64_t(f.tw)<<26)|
+                (std::uint64_t(f.th)<<30);
+        d.clamp=std::uint64_t(f.mode)|(std::uint64_t(f.mode)<<2)|
+                (std::uint64_t(f.umin)<<4)|(std::uint64_t(f.umax)<<14)|
+                (std::uint64_t(f.vmin)<<24)|(std::uint64_t(f.vmax)<<34);
+        const auto output=hg::native_psmt8_stage_texture(d,gs.vram);
+        CHECK(output.has_value() && output->requires_texture_epoch_proof);
+        CHECK(output->width>=(1u<<f.tw)&&output->height>=(1u<<f.th));
+        const unsigned base=f.tbp*64,width=f.tbw*64;
+        const unsigned xs[]={0u,1u,7u,8u,31u,63u,64u,127u,
+            output->width/2u,output->width-1u};
+        const unsigned ys[]={0u,1u,2u,7u,15u,31u,32u,63u,
+            output->height/2u,output->height-1u};
+        for(unsigned y:ys)for(unsigned x:xs){
+            if(x>=output->width||y>=output->height)continue;
+            const auto actual=gs.pixel8(base,width,x,y);
+            CHECK(output->sample_unwrapped(x,y)==actual);
+            const auto word=hg::GsRegisterState::psmt8_word(base,width,x,y);
+            CHECK(output->source_pages[word/2048u]);
+            ++comparisons;
+        }
+        // Every staging index is exactly the original PS2 indexed texel for
+        // its matching unswizzled coordinate, including outside TW/TH.
+        if(output->width<=128&&output->height<=128)
+            for(unsigned y=0;y<output->height;++y)
+                for(unsigned x=0;x<output->width;++x){
+                    CHECK(output->sample_unwrapped(x,y)==gs.pixel8(base,width,x,y));
+                    ++comparisons;
+                }
+        bool rejected=false;
+        try{(void)output->sample_unwrapped(output->width,0);}
+        catch(const std::out_of_range&){rejected=true;}
+        CHECK(rejected);
+    }
+    // HG-ARCH-007: staging touches only the required physical 8 KiB pages
+    // through the existing observer, including physical VRAM wrap 511 -> 0.
+    // Unrelated dirty GPU pages must never force a 4 MiB CPU visibility join.
+    struct ReadPageObserver final: hg::GsMemoryObserver {
+        std::bitset<512> pages;
+        std::size_t calls=0,words=0,unexpected=0;
+        void access(std::uint32_t*,std::size_t first,std::size_t count,bool write) override {
+            if(write||first%2048u||count!=2048u||first+count>1024u*1024u){
+                ++unexpected;return;
+            }
+            pages.set(first/2048u);
+            ++calls;words+=count;
+        }
+        void forget(std::uint32_t*) noexcept override {}
+    };
+    for(unsigned tbp:{0u,16383u}) {
+        d.tex0=std::uint64_t(tbp)|(std::uint64_t(2)<<14)|
+               (std::uint64_t(0x13)<<20)|(std::uint64_t(7)<<26)|
+               (std::uint64_t(6)<<30);
+        d.clamp=0;
+        auto reads=std::make_shared<ReadPageObserver>();
+        gs.vram.observe(reads);
+        const auto staged=hg::native_psmt8_stage_texture(d,gs.vram);
+        CHECK(staged&&staged->width==128u&&staged->height==64u);
+        CHECK(reads->unexpected==0u&&reads->pages==staged->source_pages);
+        CHECK(reads->calls==staged->source_pages.count());
+        CHECK(reads->words==reads->calls*2048u&&reads->words<gs.vram.size());
+        if(tbp==16383u)
+            CHECK(staged->source_pages[511]&&staged->source_pages[0]&&reads->calls==2u);
+        else CHECK(staged->source_pages[0]&&reads->calls==1u);
+        gs.vram.observe(nullptr); // Restore no observer before original pixel oracle.
+        const unsigned base=tbp*64u;
+        for(unsigned y:{0u,1u,31u,63u})for(unsigned x:{0u,8u,63u,127u}){
+            CHECK(staged->sample_unwrapped(x,y)==gs.pixel8(base,128u,x,y));
+            ++comparisons;
+        }
+    }
+    d.tex0=(d.tex0&~(std::uint64_t(63)<<20));
+    CHECK(!hg::native_psmt8_stage_texture(d,gs.vram));
+    d.tex0|=std::uint64_t(0x13)<<20;
+    d.clamp=2u|(std::uint64_t(99)<<4)|(std::uint64_t(20)<<14);
+    CHECK(!hg::native_psmt8_stage_texture(d,gs.vram));
+    hg::GsLocalMemory missing;
+    CHECK(!hg::native_psmt8_stage_texture(d,missing));
+    std::cout<<"Native PSMT8 linear staging: "<<comparisons
+             <<" original indexed-byte comparisons and error gates passed\n";
+    return 0;
+}
+static int native_psmt8_epoch_cache_tests() {
+    hg::NativeVramPageEpochs epochs;
+    hg::GsLocalMemory mem;
+    mem.assign(hg::NativeVramPageEpochs::word_count,0);
+    auto observer=std::make_shared<hg::NativeEpochTestMemoryObserver>(epochs);
+    mem.observe(observer); // Test-only: never install this over a GPU observer.
+    hg::NativePsmt8TextureCache cache(epochs,mem);
+    hg::NativeIndexedDraw d;
+    d.tex0=std::uint64_t(2)<<14|(std::uint64_t(0x13)<<20)|
+           (std::uint64_t(7)<<26)|(std::uint64_t(6)<<30);
+    d.clamp=0;
+    const auto layout=hg::native_psmt8_stage_layout(d);
+    CHECK(layout.has_value());
+    CHECK(layout->width==128&&layout->height==64&&layout->pages[0]);
+    CHECK(!epochs.stamp(layout->pages));
+    CHECK(!cache.get_or_stage(d,mem)); // Tracking is not trusted before fence.
+    CHECK(epochs.begin_after_coherent_fence());
+    const auto* staged=cache.get_or_stage(d,mem);
+    CHECK(staged&&staged->indices.size()==128u*64u);
+    CHECK(staged->sample_unwrapped(0,0)==0&&staged->source_pages==layout->pages);
+    CHECK(staged->requires_texture_epoch_proof&&cache.size()==1);
+    CHECK(cache.get_or_stage(d,mem)==staged);
+    CHECK(cache.lookup(d)==staged);
+    CHECK(cache.same_epoch_hits()>=2); // No 512-page proof on same epoch hits.
+    hg::GsLocalMemory foreign;
+    foreign.assign(hg::NativeVramPageEpochs::word_count,0xdeadbeefu);
+    CHECK(!cache.get_or_stage(d,foreign)); // Never reuse another GS memory image.
+    const auto old_stamp=epochs.stamp(layout->pages);
+    CHECK(old_stamp.has_value()&&epochs.matches(*old_stamp));
+    mem[100u*2048u]=0x55443322u; // Unrelated page must not flush a source cache.
+    CHECK(epochs.matches(*old_stamp)&&cache.lookup(d)==staged);
+    mem[0]=0x44332211u; // Mutable access notifies before the original word changes.
+    CHECK(!epochs.matches(*old_stamp)&&!cache.lookup(d));
+    const auto* changed=cache.get_or_stage(d,mem);
+    CHECK(changed&&changed->sample_unwrapped(0,0)==0x11u);
+    CHECK(cache.get_or_stage(d,mem)==changed);
+    // Two queued resident writes touching the same source must each finish:
+    // a partial GPU flush must never publish the cached texture.
+    CHECK(epochs.gpu_queued_write(layout->pages));
+    CHECK(epochs.gpu_queued_write(layout->pages));
+    CHECK(epochs.gpu_pending(layout->pages));
+    CHECK(!epochs.stamp(layout->pages)&&!cache.lookup(d));
+    CHECK(!cache.get_or_stage(d,mem));
+    mem.backend_data()[0]=0xaabbcc77u; // Simulated GPU producer: enqueue already invalidated.
+    CHECK(epochs.gpu_completed_write(layout->pages));
+    CHECK(epochs.gpu_pending(layout->pages)&&!cache.get_or_stage(d,mem));
+    CHECK(epochs.gpu_completed_write(layout->pages));
+    CHECK(!epochs.gpu_pending(layout->pages));
+    const auto* after_gpu=cache.get_or_stage(d,mem);
+    CHECK(after_gpu&&after_gpu->sample_unwrapped(0,0)==0x77u);
+    // An impossible extra completion invalidates all trust instead of
+    // approving a stale GPU/CPU state.
+    CHECK(!epochs.gpu_completed_write(layout->pages));
+    CHECK(!epochs.tracking_complete()&&!cache.lookup(d));
+    CHECK(epochs.begin_after_coherent_fence());
+    CHECK(!cache.lookup(d)); // New coherent baseline has new generation.
+    const auto* rebased=cache.get_or_stage(d,mem);
+    CHECK(rebased&&rebased->sample_unwrapped(0,0)==0x77u);
+    // A changed CLAMP requires separate source-byte stage layout/key.
+    auto clamp_draw=d;
+    clamp_draw.clamp=2u|(std::uint64_t(11)<<4)|(std::uint64_t(1000)<<14)|
+                     (std::uint64_t(5)<<24)|(std::uint64_t(70)<<34)|
+                     (std::uint64_t(2)<<2);
+    auto other_layout=hg::native_psmt8_stage_layout(clamp_draw);
+    CHECK(other_layout.has_value()&&other_layout->width==1001u&&other_layout->height==71u);
+    const auto* clamped=cache.get_or_stage(clamp_draw,mem);
+    CHECK(clamped&&clamped->source_pages==other_layout->pages);
+    CHECK(cache.lookup(clamp_draw)==clamped);
+    CHECK(cache.lookup(d)==rebased);
+    // Five distinct valid source-layout keys must not exhaust host RAM;
+    // a bounded four-entry LRU evicts the oldest.
+    for(unsigned i=1;i<=5;++i) {
+        auto next=d;
+        next.tex0=(d.tex0&~std::uint64_t(0x3fffu))|std::uint64_t(32u*i);
+        const auto* current=cache.get_or_stage(next,mem);
+        CHECK(current&&current->width==128&&current->height==64);
+        CHECK(cache.size()<=4u);
+    }
+    CHECK(cache.size()==4u);
+    // Source ranges with non-2K aligned start can span page 511 -> 0.
+    auto wrapped=d;
+    wrapped.tex0=(d.tex0&~std::uint64_t(0x3fffu))|std::uint64_t(16383u);
+    const auto wrapped_layout=hg::native_psmt8_stage_layout(wrapped);
+    CHECK(wrapped_layout&&wrapped_layout->pages[511]&&wrapped_layout->pages[0]);
+    CHECK(hg::native_psmt8_stage_layout(wrapped)->pages==
+          hg::native_psmt8_stage_texture(wrapped,mem)->source_pages);
+    CHECK(cache.get_or_stage(wrapped,mem));
+    auto invalid=d;
+    invalid.clamp=2u|(std::uint64_t(99)<<4)|(std::uint64_t(20)<<14);
+    CHECK(!hg::native_psmt8_stage_layout(invalid));
+    CHECK(!cache.get_or_stage(invalid,mem));
+    // HG-ARCH-008: one completed resident readback can synchronize multiple
+    // enqueued shader writes to one page; submission alone cannot do that.
+    std::bitset<512> unrelated;
+    unrelated.set(190);
+    const auto before_readback=epochs.stamp(layout->pages);
+    CHECK(before_readback);
+    CHECK(epochs.cpu_mutable_pages(unrelated));
+    CHECK(epochs.matches(*before_readback));
+    CHECK(epochs.gpu_queued_write(layout->pages));
+    CHECK(epochs.gpu_queued_write(layout->pages));
+    CHECK(epochs.gpu_pending(layout->pages)&&!epochs.matches(*before_readback));
+    CHECK(epochs.gpu_completed_visible_pages(layout->pages));
+    CHECK(!epochs.gpu_pending(layout->pages)&&!epochs.matches(*before_readback));
+    CHECK(!epochs.gpu_completed_visible_pages(layout->pages)); // Impossible completion invalidates.
+    CHECK(!epochs.tracking_complete());
+    CHECK(epochs.begin_after_coherent_fence());
+    // HG-ARCH-009: a complete-page CPU replacement supersedes pending GPU
+    // output for those pages only; it still advances their generation.
+    std::bitset<512> replaced;
+    replaced.set(40);
+    std::bitset<512> neighbor;
+    neighbor.set(41);
+    CHECK(epochs.gpu_queued_write(replaced|neighbor));
+    const auto replaced_sequence=epochs.sequence();
+    CHECK(epochs.gpu_superseded_pages(replaced)&&epochs.cpu_mutable_pages(replaced));
+    CHECK(!epochs.gpu_pending(replaced)&&epochs.gpu_pending(neighbor));
+    const auto superseded=epochs.stamp(replaced);
+    CHECK(superseded&&superseded->generations[40]>replaced_sequence);
+    CHECK(epochs.gpu_completed_visible_pages(neighbor)&&epochs.matches(*superseded));
+    // Unknown writes or observer detachment must leave all prior stamps unusable.
+    const auto stamp=epochs.stamp(layout->pages);
+    CHECK(stamp.has_value());
+    mem.observe(nullptr); // Explicitly forget the test-only memory observer.
+    CHECK(!epochs.matches(*stamp)&&!cache.get_or_stage(d,mem));
+    std::cout<<"Native PSMT8 source epochs: coherence, overlapping GPU producers, "
+                "CPU mutations, LRU and source-byte restaging passed\n";
+    return 0;
+}
 int main() {
+    CHECK(native_psmt8_epoch_cache_tests()==0);
+    CHECK(native_indexed_draw_contract_tests()==0);
+    CHECK(native_psmt8_page_footprint_tests()==0);
+    CHECK(native_psmt8_linear_texture_tests()==0);
     CHECK(hg_test::run_vu_specialization_regression());
     CHECK(vif_dma_regression::run()==0);
     CHECK(vif_direct_regression::run()==0);
@@ -511,6 +1029,7 @@ int main() {
         hg::HostInput pad;
         const std::string good="pad:49151,0,127,128,255,0,1,2,3,4,5,255,7,8,9,10,11";
         CHECK(hg::parse_diagnostic_pad(good,pad));
+        CHECK(hg::format_diagnostic_pad(pad)==good);
         CHECK(pad.buttons==49151 && pad.axes[0]==0 && pad.axes[3]==255);
         CHECK(pad.pressures[0]==0 && pad.pressures[6]==255 && pad.pressures[11]==11);
         const auto saved=pad;
@@ -521,6 +1040,9 @@ int main() {
             "pad:0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,", "pad: 0", "none"}) {
             CHECK(!hg::parse_diagnostic_pad(bad,pad));CHECK(pad==saved);
         }
+        hg::HostInput roundtrip;
+        CHECK(hg::parse_diagnostic_pad(hg::format_diagnostic_pad(saved),roundtrip));
+        CHECK(roundtrip==saved);
     }
     CHECK(vu_conversion_tests()==0);
     CHECK(packed_word_extension_tests()==0);
@@ -1178,5 +1700,20 @@ int main() {
     CHECK((s.vu0.mac&15)==12); // x/y zero, z positive, inactive w cleared.
     s.vu_arithmetic(4,4,4,15,false,6);
     CHECK(s.vu0.vf[4].hi==0x4000000040000000ull);
+    {   // OPMSUB exceptional paths (VU6.0 pp26-29,40-42), formerly an explicit fault.
+        // vf4 = (1,1,1), vf5 = (2,2,2): every product is 2.0.
+        s.vu0.vf[4]={0x3f8000003f800000ull,0x3f800000ull};s.vu0.vf[5]={0x4000000040000000ull,0x40000000ull};
+        s.vu0.acc[0]=0x7fffffffu;s.vu0.acc[1]=0xffffffffu;s.vu0.acc[2]=0x7f800000u;   // +MAX, -MAX, exponent 255
+        s.vu_outer(6,4,5,true);
+        CHECK(std::uint32_t(s.vu0.vf[6].lo)==0x7fffffffu);          // +MAX kept, product ignored
+        CHECK(std::uint32_t(s.vu0.vf[6].lo>>32)==0xffffffffu);      // -MAX kept
+        {hg::Fpu adder;CHECK(std::uint32_t(s.vu0.vf[6].hi)==adder.add(0x7f800000u,0xc0000000u));}   // exact adder, no fault
+        CHECK((s.vu0.status&8)!=0);                                  // overflow from the kept MAX lanes
+        // A product that overflows supplies its own saturated value, negated.
+        s.vu0.vf[4]={0x7f0000007f000000ull,0x7f000000ull};s.vu0.vf[5]={0x7f0000007f000000ull,0x7f000000ull};
+        s.vu0.acc[0]=s.vu0.acc[1]=s.vu0.acc[2]=0x3f800000u;
+        s.vu_outer(6,4,5,true);
+        CHECK(std::uint32_t(s.vu0.vf[6].lo)==0xffffffffu && std::uint32_t(s.vu0.vf[6].hi)==0xffffffffu);
+    }
     return 0;
 }

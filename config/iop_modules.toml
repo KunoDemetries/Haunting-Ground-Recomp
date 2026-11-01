@@ -152,6 +152,13 @@ functions = [
   {name="dbcman_worker_0",offset=0x1d94},
   {name="dbcman_worker_1",offset=0x1e2c},
   {name="dbcman_worker_2",offset=0x1ec4},
+  # Door-kick stop 20261011: SIFRPC dispatch ra=0x998bc called unrooted +0x1b70.
+  # Original +0x1f58..74 forms a2=+0x1b70 (relocated LUI/ADDIU) with a buffer in
+  # a3 and zero callback args, then calls the RPC register/loop import stubs;
+  # worker +0x1e2c forms +0x1bcc the same way at +0x1e8c. Both bodies follow a
+  # prior JR ra + delay and open a stack frame: independent RPC server entries.
+  {name="dbcman_rpc_server_0",offset=0x1b70},
+  {name="dbcman_rpc_server_1",offset=0x1bcc},
 ]
 
 [[modules]]

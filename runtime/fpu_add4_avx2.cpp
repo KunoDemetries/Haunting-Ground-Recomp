@@ -76,17 +76,20 @@ HG_AVX_INLINE void add4_impl(const std::uint32_t* a,const std::uint32_t* b,std::
     const auto old_a=av,old_ea=ea;
     av=_mm_blendv_epi8(av,bv,swap);bv=_mm_blendv_epi8(bv,old_a,swap);
     ea=_mm_blendv_epi8(ea,eb,swap);eb=_mm_blendv_epi8(eb,old_ea,swap);
-    const auto ma=_mm_or_si128(_mm_and_si128(av,fraction),hidden);
-    const auto mb=_mm_srlv_epi32(_mm_or_si128(_mm_and_si128(bv,fraction),hidden),_mm_sub_epi32(ea,eb));
+    // Measured hardware add (Fpu::add): one guard bit below the significand during
+    // alignment, then normalize and chop. Shift counts >= 32 give 0 in srlv.
+    const auto ma=_mm_slli_epi32(_mm_or_si128(_mm_and_si128(av,fraction),hidden),1);
+    const auto mb=_mm_srlv_epi32(_mm_slli_epi32(_mm_or_si128(_mm_and_si128(bv,fraction),hidden),1),_mm_sub_epi32(ea,eb));
     auto m=_mm_blendv_epi8(_mm_add_epi32(ma,mb),_mm_sub_epi32(ma,mb),_mm_srai_epi32(_mm_xor_si128(av,bv),31));
     const auto nonzero=_mm_cmpgt_epi32(m,zero);
-    const auto wide=_mm_srli_epi32(m,24);m=_mm_srlv_epi32(m,wide);ea=_mm_add_epi32(ea,wide);
-    // After the carry shift, 0 <= m <= 2^24-1. Conversion to binary32 is
-    // therefore exact in every host rounding mode and raises no FP exception.
-    // Its exponent supplies an exact bit length, not a rounded guest sum.
-    const auto exponent=_mm_srli_epi32(_mm_castps_si128(_mm_cvtepi32_ps(m)),23);
-    const auto amount=_mm_sub_epi32(_mm_set1_epi32(150),exponent);
-    m=_mm_sllv_epi32(m,amount);ea=_mm_sub_epi32(ea,amount);
+    const auto wide=_mm_srli_epi32(m,25);m=_mm_srlv_epi32(m,wide);ea=_mm_add_epi32(ea,wide);
+    // After the carry shift, 0 <= m <= 2^25-1, so h = m>>1 <= 2^24-1 converts to binary32
+    // exactly in every host rounding mode (no FP exception); its exponent gives the exact
+    // bit length (m's leading bit is one above h's). m == 1 (h == 0) needs a shift of 24.
+    const auto h=_mm_srli_epi32(m,1);
+    const auto exponent=_mm_srli_epi32(_mm_castps_si128(_mm_cvtepi32_ps(h)),23);
+    const auto amount=_mm_blendv_epi8(_mm_sub_epi32(_mm_set1_epi32(150),exponent),_mm_set1_epi32(24),_mm_cmpeq_epi32(h,zero));
+    m=_mm_srli_epi32(_mm_sllv_epi32(m,amount),1);ea=_mm_sub_epi32(ea,amount);
     const auto active=_mm_andnot_si128(_mm_or_si128(az,bz),nonzero);
     const auto uf=_mm_and_si128(active,_mm_cmpgt_epi32(_mm_set1_epi32(1),ea));
     const auto of=_mm_and_si128(active,_mm_cmpgt_epi32(ea,_mm_set1_epi32(255)));

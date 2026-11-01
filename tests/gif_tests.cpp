@@ -274,14 +274,18 @@ static int test_draw_history_retirement() {
         // Detect accidental replay of retired draws, independently of counters.
         gs.vram[G::psmct32_word(0,64,1,1)]=0x80445566;
         point(gs,2,0x80778899);point(gs,3,0x80aabbcc);
-        const auto first=gs.draws[gs.draws.size()-2],second=gs.draws.back();
+        const auto first=gs.materialize_draw_environment(gs.draws[gs.draws.size()-2]);
+        const auto second=gs.materialize_draw_environment(gs.draws.back());
+        const auto first_rgba=gs.draws[gs.draws.size()-2].vertices[0].rgba;
+        const auto second_rgba=gs.draws.back().vertices[0].rgba;
         CHECK(gs.draws.size()==G::max_draws);
         point(gs,4,0x80ddeeff); // Retire only the completed prefix on capacity.
         CHECK(gs.draws.size()==3 && gs.retired_draw_count==G::max_draws-2);
         CHECK(gs.rasterized_draw_count==G::max_draws-2 && gs.pending_draw_index()==0);
-        CHECK(gs.draws[0].environment==first.environment && gs.draws[1].environment==second.environment);
-        CHECK(gs.draws[0].vertices[0].rgba==first.vertices[0].rgba && gs.draws[0].vertices[0].x==32);
-        CHECK(gs.draws[1].vertices[0].rgba==second.vertices[0].rgba && gs.draws[1].vertices[0].x==48);
+        CHECK(gs.materialize_draw_environment(gs.draws[0])==first &&
+              gs.materialize_draw_environment(gs.draws[1])==second);
+        CHECK(gs.draws[0].vertices[0].rgba==first_rgba && gs.draws[0].vertices[0].x==32);
+        CHECK(gs.draws[1].vertices[0].rgba==second_rgba && gs.draws[1].vertices[0].x==48);
         CHECK(gs.pixel32(0,64,2,1)==0 && gs.pixel32(0,64,3,1)==0 && gs.pixel32(0,64,4,1)==0);
         CHECK(gs.rasterize_pending_draws()==3 && gs.rasterized_draw_count==G::max_draws+1);
         CHECK(gs.pixel32(0,64,1,1)==0x80445566);
@@ -482,9 +486,40 @@ int main() {
         }
         CHECK(actual.vram==reference.vram);
     }
+    { // Large consecutive PSMT8 IMAGE runs materialize each destination page once.
+        hg::GsRegisterState bulk,serial;
+        bulk.vram.assign(1024*1024,0x5ac396e7);serial.vram=bulk.vram;
+        const auto configure=[](hg::GsRegisterState& gs) {
+            gs.value[0x50]=(4ull<<32)|(8ull<<48)|(0x13ull<<56);
+            gs.value[0x52]=256ull|(32ull<<32);gs.transfer_x=2032;gs.transfer_y=2046;
+            gs.transfer_width=256;gs.transfer_remaining=8192;gs.gif_to_vram_active=true;
+        };
+        configure(bulk);configure(serial);
+        std::vector<hg::GifTransfer> transfers(520);
+        for(std::size_t n=0;n<transfers.size();++n) {
+            transfers[n]={hg::GifTransferKind::Image,0,
+                0x718293a4b5c6d7e8ull+n*0x0101010101010101ull,
+                0x192a3b4c5d6e7f80ull+n*0x0303030303030303ull,n==0};
+            serial.write_image_qword(transfers[n].low,transfers[n].high);
+        }
+        bulk.write_image_transfers(transfers.data(),transfers.size());
+        CHECK(bulk.vram==serial.vram&&bulk.transfer_remaining==serial.transfer_remaining);
+        CHECK(bulk.gif_to_vram_active==serial.gif_to_vram_active&&
+              bulk.host_transfer_completed==serial.host_transfer_completed);
+    }
     { // Compare native wide division with independent bit-at-a-time arithmetic.
         std::uint64_t seed=0x975319ac6842fedbull;
         const auto next=[&](){seed=seed*6364136223846793005ull+1442695040888963407ull;return seed;};
+        constexpr auto signed_limit=std::uint64_t(0x7fffffffffffffff);
+        for(unsigned i=0;i<200000;++i) {
+            const auto a=next(),b=next();
+            const bool expected=!a||!b||a<=signed_limit/b;
+            CHECK(hg::gs_unsigned_product_fits_i64(a,b)==expected);
+        }
+        CHECK(hg::gs_unsigned_product_fits_i64(signed_limit,1));
+        CHECK(hg::gs_unsigned_product_fits_i64(1,signed_limit));
+        CHECK(!hg::gs_unsigned_product_fits_i64(signed_limit,2));
+        CHECK(!hg::gs_unsigned_product_fits_i64(~std::uint64_t(0),~std::uint64_t(0)));
         for(unsigned i=0;i<200000;++i) {
             const auto n=next(),d=next()|1;const auto shift=unsigned(next()&63);
             const auto high=shift?n>>(64-shift):0;
@@ -725,11 +760,8 @@ int main() {
     }
     CHECK(hg::gs_stq_perspective_texel_coordinate(
         {1,0,0},{1,0,0},{std::int64_t(1)<<40,0,0},1)==1);
-    invalid_stq=false;
-    try{(void)hg::gs_stq_perspective_texel_coordinate(
-        {0x3f800000,0,0},{0x3f800000,0,0},{std::int64_t(1)<<40,0,0},1);}
-    catch(const std::runtime_error&){invalid_stq=true;}
-    CHECK(invalid_stq);
+    CHECK(hg::gs_stq_perspective_texel_coordinate(
+        {0x3f800000,0,0},{0x3f800000,0,0},{std::int64_t(1)<<40,0,0},1)==1);
     // Real post-opening triangle: width/height 256 exactly cancels the S/Q
     // exponent gap. Multiplying by 256 first would spuriously need 65 bits.
     const std::array<std::int64_t,3> post_opening_weights{5255420,190310292,131318766};
@@ -747,6 +779,22 @@ int main() {
         {0x3ede394e,0x3ae32152,0x3fa76e93},scene_q,scene_weights,256)==4925);
     CHECK(hg::gs_stq_perspective_texel_coordinate(
         {0,0x3b3ab693,0},scene_q,scene_weights,256)==66);
+    { // A low-magnitude endpoint and a normal endpoint need a 65-bit exact
+      // aligned sum, while the final perspective coordinate remains ordinary.
+        const std::array<std::int64_t,3> weights{1,1,300000};
+        const std::array<std::uint32_t,3> q{0x3c000000,0x3c000000,0x3c000000};
+        CHECK(hg::gs_stq_perspective_texel_coordinate(
+            {0x30000000,0x30000001,0x3b000000},q,weights,256)==63);
+        CHECK(hg::gs_stq_perspective_texel_coordinate(
+            {0xb0000000,0xb0000001,0xbb000000},q,weights,256)==-64);
+        CHECK(hg::gs_stq_perspective_texel_coordinate(
+            q,{0x30000000,0x30000001,0x3b000000},weights,1)==4);
+    }
+    invalid_stq=false;
+    try{(void)hg::gs_stq_perspective_texel_coordinate(
+        {1,0,0x7f7fffff},{0x3f800000,0,0x3f800000},{1,0,1},1);}
+    catch(const std::runtime_error&){invalid_stq=true;}
+    CHECK(invalid_stq); // Beyond the bounded 128-bit exact fallback remains explicit.
     { // A single enabled PCRTC circuit extracts its magnified source rectangle.
         hg::GsRegisterState gs;gs.ensure_vram();
         const auto base=2048u;

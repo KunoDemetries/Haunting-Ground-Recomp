@@ -31,7 +31,8 @@ inline bool same_state(const hg::GsRegisterState& a,const hg::GsRegisterState& b
     for(std::size_t n=0;n<a.draws.size();++n) {
         const auto& x=a.draws[n];const auto& y=b.draws[n];
         if(x.primitive!=y.primitive||x.prim_state!=y.prim_state||x.xyoffset!=y.xyoffset||
-           x.count!=y.count||x.environment!=y.environment||x.environment_captured!=y.environment_captured)return false;
+           x.count!=y.count||a.materialize_draw_environment(x)!=b.materialize_draw_environment(y)||
+           x.environment_captured!=y.environment_captured)return false;
         for(unsigned i=0;i<3;++i)if(!same_vertex(x.vertices[i],y.vertices[i]))return false;
     }
     return true;

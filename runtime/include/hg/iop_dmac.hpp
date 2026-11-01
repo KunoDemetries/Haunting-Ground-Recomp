@@ -2,6 +2,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <utility>
 #include <stdexcept>
 
 namespace hg {
@@ -131,6 +134,16 @@ struct IopDmac {
             if(high || (address&0x3f000003) || (count&0xff000003))
                 throw std::runtime_error("unsupported IOP SIF1 destination tag or partial qword");
             c[0]=address&0xffffff;receive_words=count;
+            {   // HG-DIAG-130 (HG_SIF1_WATCH=lo-hi hex): log SIF1 packets whose destination overlaps.
+                static const std::pair<std::uint32_t,std::uint32_t> watch=[]{
+                    const char* v=std::getenv("HG_SIF1_WATCH");if(!v)return std::pair<std::uint32_t,std::uint32_t>{0,0};
+                    char* end=nullptr;const auto lo=std::uint32_t(std::strtoul(v,&end,16));
+                    const auto hi=end && *end=='-'?std::uint32_t(std::strtoul(end+1,nullptr,16)):lo+256;
+                    return std::pair<std::uint32_t,std::uint32_t>{lo,hi};}();
+                static std::uint64_t packets=0;++packets;
+                if(watch.second && watch.second>c[0] && watch.first<c[0]+count*4)
+                    std::fprintf(stderr,"HG-DIAG-130 SIF1 packet %llu dest=0x%x bytes=%u\n",static_cast<unsigned long long>(packets),c[0],count*4);
+            }
             receive_end=(address&0x80000000)!=0;receive_irq=(address&0x40000000)!=0;
             sif1_active_record=sif1_history_cursor++%sif1_history.size();
             sif1_history[sif1_active_record]={c[0],count,0,0,false,{}};

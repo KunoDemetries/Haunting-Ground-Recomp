@@ -137,6 +137,10 @@ def straight(i):
         return 's.vu_waitq();'
     if n == 'vnop':
         return '; // Architecturally defined VNOP.'
+    if n == 'pref':
+        # EE Core Instruction Set Manual v6.0 p96: PREF is an advisory cache
+        # hint, has no architectural result and raises no addressing exception.
+        return '; // Architecturally defined cache-neutral PREF hint.'
     if n == 'vmulq':
         return f's.vu_arithmetic({i.sa}, {i.rd}, 0, {i.rs & 15}, true, 4);'
     if n == 'vsub':
@@ -189,6 +193,8 @@ def straight(i):
         return f's.cache_writeback(std::uint32_t({a}+{immediate}));'
     if n == 'cache_dxltg':
         return f's.cache_load_tag(std::uint32_t({a}+{immediate}));'
+    if n == 'cache_dxin':
+        return f's.cache_index_invalidate(std::uint32_t({a}+{immediate}));'
     if n in ('ei','di'):
         return f's.set_interrupts({str(n=="ei").lower()});'
     if n.startswith('mfc0_'):

@@ -3,6 +3,7 @@
 /Haunting Ground (USA)
 /UNEEDED images/
 /build/
+/build-trace/
 /out/
 __pycache__/
 *.pyc
@@ -10,3 +11,17 @@ __pycache__/
 
 # The devcontainer mount configuration (paths on your own machine).
 *.env
+
+# Portable beta builds (contain the user's game files and game-derived code)
+/builds/
+
+# PS2 hardware-capture build outputs (tools/hwtest)
+tools/hwtest/*.elf
+tools/hwtest/*.o
+tools/hwtest/RESULTS*.BIN
+tools/hwtest/VU0*.BIN
+tools/hwtest/STRUCT*.BIN
+tools/hwtest/spu2probe_irx.c
+tools/hwtest/spu2probe/obj/
+tools/hwtest/spu2probe/*.irx
+tools/hwtest/spu2probe/*.elf

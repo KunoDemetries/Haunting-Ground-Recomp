@@ -1,3 +1,11 @@
+## PCSX2 arithmetic profile versus the console (2026-10-25)
+
+Audio note: PCSX2 lets SPU2 sustain rate 0x7F decay slowly; the user's PS2 (STRUCT.BIN) holds it for 2 s, as psx-spx says and as we implement, so PCSX2 is wrong here. It also shows 0x7FFF after attack+decay where the console shows 0x7FF7. Measured directly with the struct_capture SPU2 probe in PCSX2: 0x7FFF -> 0x7FF5 over 2 s at rate 0x7F, and rates 0x7B/0x77 behave the same. SNDDRV ENVX copies therefore differ (0x7FFF ours vs 0x7FE1 PCSX2); not counted as a game-logic divergence (SOURCES.md 2026-10-25).
+
+Measured by running our capture programs (`tools/hwtest/*_capture.c`) in the pinned PCSX2 and comparing with the same programs on the user's PS2 (`docs/SOURCES.md`). PCSX2 (default settings): COP1 ADD/SUB equal the console's one-guard-bit adder; COP1 MUL chops (console: chop or -1); COP1 DIV.S and SQRT.S round to nearest (console: chop or +1); VU0 VADD/VSUB/VMADD take the exact sum and chop, differing from the console in ~27% of adds; VU0 DIV/SQRT (Q) chop. On the console FPU and VU0 results are identical, so PCSX2's FPU/VU split is an emulator setting. Consequences: oracle comparisons drift wherever game logic uses VU0 macro adds (slot 07: Hewie's path spline input, first different at frame 86); use HG-DIAG-126 to mirror PCSX2 when looking for other divergences, and treat hardware captures, not PCSX2, as the reference for float rules.
+
+DebugServer notes from this work: write memchecks catch `sw`/`swc1` stores but did not fire for the VU0 vector (`sqc2`) store of a stack local, so find such values from the consuming instruction's registers and stack (`read_registers`, `read_memory` at sp). A script that single-steps from a memcheck inside kernel interrupt code (0x8000369x) stalled, and PCSX2 then refused savestate loads; restart PCSX2 rather than retrying. Kernel context saves also hit stack memchecks; skip PCs >= 0x80000000. Right after a fresh PCSX2 start, the save-slot load twice reached a different game state (slot 07: Fiona x 52.04 instead of 67.74); a warm, reused instance is stable, so start PCSX2 once per session and let `section_check.py` reuse it (`%TEMP%/pcsx2pid.txt`). With HG-DIAG-126 all 12 save slots match PCSX2 at frame 3000 (Fiona/Hewie bit-identical), and slot 07 matches PCSX2 bit for bit in Fiona/Hewie and in the stalker's position through frame 5000.
+
 ## Live PCSX2-MCP debugger oracle (2026-09-21)
 
 The current external observation/debug oracle is the pinned package at
@@ -75,19 +83,19 @@ stops. Synthetic tests verify exact/double equality, pre-start/cancel rejection,
 and actual writes after restart. This is an observed reference profile, not
 physical-console proof or a general transfer-timing claim.
 
-## Non-intra BDEC probe — 2026-09-13
+## Non-intra BDEC probe â€“ 2026-09-13
 
 External ipu-nonintra-oracle/probe.elf SHA256 ad9606d2a19a4901a523efa257e6ddaa67fb99871eed0be1705862539676af0a; generator %TEMP%/haunting-ipu-nonintra-probe.py. Same oracle executable474dc24acf00ee398183235a15c97934bf099c2fa458dcc0cb174750aebe3cff; PID39848 closed. One complete stable double-read at stage4; four alias regions could not span the entire output and were excluded, not counted as disagreement. verified.json/output.bin retain all32cases/12288 signed residuals. CBP63, one coefficient per block (zero listed level denotes +1 first-coefficient shortcut), non-intra matrix16/nonlinearQ1/scan0. Existing manifest description inherits obsolete intra wording; the actual generator uses non-intra24010000 and CBP, and is authoritative.
 
 Independent signed quantization floor division, no mismatch correction, direct cosine transform and half-tie tolerance1e-9 agree on12264/12288 samples. Remaining24 differ by one, confined to case29/run38/level37; transform integer-rounding parity remains unresolved. This is explicitly not an exact emulator/physical PS2 match. Truncation toward zero differs on456samples; adding mismatch correction increases differences. Native implementation follows the independently derived transform with measured floor quantization; tests cover all63 valid CBP masks, skipped blocks, signed residual and negative half tie. MPEG1 and field-DCT stay explicit faults. No reference implementation consulted.
 
-## CSC RGB32 synthetic probe — 2026-09-13
+## CSC RGB32 synthetic probe â€“ 2026-09-13
 
 External %TEMP%/haunting-toc-probe/ipu-csc-oracle contains probe.elf, manifest.json, verified.json and output.bin; generator haunting-ipu-csc-probe.py. ELF SHA256 a0c340a6248698f11e99341d058d3bf667cd8321dd2925d1b8def0b063813d43. Same oracle executable hash474dc24acf00ee398183235a15c97934bf099c2fa458dcc0cb174750aebe3cff. PID40060 closed. Five stable agreeing stage4 views. Four24-qword RAW8 inputs: Y0..255, pseudorandom chroma seeded2a7110; threshold pairs(0,0),(0,128),(1,256),(64,192). Normal input/output DMA;64 output qwords each.
 
 Independent manual-coefficient calculation matches all1024 RGBA samples when Y-16 clamps at zero and signed green contributions -50*Cb and -104*Cr each floor-divide by64 before addition, followed by floor((sum+1)/2). Literal manual pp205-206 subtracts already-rounded positive contributions; that interpretation differs on700 samples. This discrepancy is explicitly retained as a measured emulator profile, not physical PS2 accuracy. No implementation consulted. Native synthetic tests retain independent examples for rounding/clipping/thresholds and two-block FIFO pressure/empty-input behavior. RGB16, dithering, zero-count and nonaligned CSC remain explicit unsupported cases.
 
-## Movie-copy mask-word probe — 2026-09-13
+## Movie-copy mask-word probe â€“ 2026-09-13
 
 Original ELF and live RAM contain four executed 0x00ff00ff words at2a2a30..3c, before JR RA. Synthetic ELF SHA256 02b2fe37965d5a9771682bf8b6ddd2ba4b529a309e773cf55c343782d2bf098d; external movie-pack-oracle/verified.json records stable agreeing completion-stage4 views, process9176, executable hash474dc24acf00ee398183235a15c97934bf099c2fa458dcc0cb174750aebe3cff. Process closed after capture. Generator %TEMP%/haunting-movie-pack-probe.py.
 
@@ -872,3 +880,24 @@ probe established control-flow dependencies only. MODLOAD helper `0x000ab8d8`
 returns `-2`, so the guarded device-operation transfer at `0x000ab2a4` is not
 yet reached; that helper/result is the next startup investigation. A real TOC
 payload remains separately required for correctness.
+
+## Live GetToc DMA capture (2026-10-06)
+
+The pinned `emu/PCSX2-MCP-v1.0.0-win64/pcsx2-qt.exe` was launched against the
+user-local game image and observed through its guest IOP debugger only. At the
+original CDVD interrupt callback (`rom_cdvdman` relocation plus `0x4288`, guest
+`0x00026ab8` in this boot), the live IOP DMA3 registers were
+MADR=`0x00033c94`, BCR=`0x00810004`, CHCR=`0x40000200`. The corresponding
+2,064-byte external capture is `%TEMP%/hg-door-real-toc-20261006.bin`, SHA-256
+`1bcd3fd5348ab8dcfb5f8e5253912a51ab7505e2691191615d02f99be2d3e1d4`.
+It begins `04 02 f2 00 86 72 00 00 00 00 00 00 01 02 01 00` and has a
+zero final 16-byte trailer. The process was stopped with an identity check;
+no oracle process remains.
+
+This supersedes the quarantined synthetic TOC for local diagnostic launches,
+but is still a PCSX2-oracle observation rather than physical-console evidence.
+Current official PCSX2 source at commit
+`9fffbdbd59b962d63a2259b150f419ad3773e7b4` was read only for sequencing clues:
+its GetToc path writes the 2,048-byte payload at live DMA3 MADR and completes
+the DMA/command around that transfer. No implementation, algorithm, comment or
+captured game byte is copied into the repository.

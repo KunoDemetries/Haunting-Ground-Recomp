@@ -1,6 +1,7 @@
 #include "hg/image.hpp"
 #include "hg/native_host.hpp"
 #include "hg/diagnostic_input.hpp"
+#include "hg/autopilot.hpp"
 #include "hg/iop_image.hpp"
 #include "hg/system.hpp"
 #include "hg/iop_interrupt.hpp"
@@ -14,11 +15,14 @@
 #include "hg/diagnostic_history.hpp"
 #include "hg/diagnostic_wav.hpp"
 #include "hg/host_audio.hpp"
+#include "hg/symbols.hpp"
 #include "hg/host_pacing.hpp"
 #include "hg/host_wait.hpp"
 #include "hg/execution_clock.hpp"
 #include "hg/device_thread.hpp"
+#include "hg/host_sampler.hpp"
 #include "hg/gs_acceleration.hpp"
+#include "hg/gs_triangle_acceleration.hpp"
 #include <sstream>
 #include <iostream>
 #include <ctime>
@@ -30,6 +34,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <exception>
+#include <cstdlib>
 
 namespace {
 void write_vu1_capture(const hg::Vif1Path& v,const std::filesystem::path& target) {
@@ -250,7 +255,30 @@ void invoke_iop(hg::IopState& s,std::uint32_t entry,std::uint32_t a0=0,std::uint
 }
 int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
     bool profile_enabled=false,profile_gs=false,sync_devices=false;
+    bool frame_rate_probe=false; // HG-DIAG-114: original-writer rate without --profile's synchronous devices.
     bool realtime=false;
+    bool input_replay_wait_live=false;
+    // Input-replay checkpoints: --fast-replay skips host pacing (never guest work)
+    // until the scheduled replay ends; F5 writes every applied input so far.
+    bool fast_replay=false;
+    std::filesystem::path checkpoint_file;
+    std::filesystem::path autopilot_file;   // HG-DIAG-123
+    std::uint32_t stop_word_address=0,stop_word_value=0;bool stop_word=false;   // HG-DIAG-124
+    // HG-DIAG-125: controller snapshots applied when an EE word first equals a value
+    // (e.g. a game frame counter), so a scripted input lands on the same game frame here
+    // and in the oracle.
+    struct WordInput {std::uint32_t address=0,value=0;std::string pad;bool done=false;};
+    std::vector<WordInput> word_inputs;
+    // True only while a --fast-replay schedule is still being replayed. Host
+    // pacing and host speaker output (which blocks on device buffers) pause;
+    // guest SPU2 state, clocks and every scheduled input are unchanged.
+    bool fast_replay_active=false;
+    // Virtual memory card (slot 1). --memory-card-after-replay keeps it
+    // unplugged while a checkpoint replays (matching its card-less history),
+    // then inserts it when live play begins, like a hot-plugged card.
+    std::filesystem::path memory_card_file;
+    bool memory_card_after_replay=false;
+    std::uint64_t memory_card_insert_at=0; // Repro: insert at this exact slice (0 = unused).
     bool issue_slot_clock=false;
     bool verify=false,verify_services=false,verify_loadfile=false,verify_cdvd=false,verify_reboot=false,stop_on_loadfile_error=false;
     std::filesystem::path toc_record;
@@ -259,18 +287,36 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
     std::filesystem::path dump_iop;
     std::filesystem::path preview_file;
     std::filesystem::path input_file;
+    std::filesystem::path input_events_file;
+    std::filesystem::path input_log;
     std::filesystem::path spu2_input_wav;
+    std::filesystem::path spu2_mix_wav; // HG-DIAG-120: final SPU2 mix capture.
     std::filesystem::path spu2_sync_log;
     int spu2_input_core=-1;
     int spu2_output_core=-1;
     // HG-DIAG-006: explicit guest-slice input makes performance replays repeatable.
-    struct InputEvent {unsigned slice;std::string command;};
+    constexpr std::uint64_t max_run_slices=1000000000000ull; // ~11 days at 1M slices/s.
+    struct InputEvent {std::uint64_t slice;std::string command;};
+    constexpr std::size_t max_input_events=1000000; // Long checkpoint histories (analog input) exceed thousands of events.
     std::vector<InputEvent> input_events;
+    const auto append_input_event=[&](const std::string& stamp,const std::string& command) {
+        try {
+            std::size_t used=0;
+            if(stamp.empty() || stamp.find_first_not_of("0123456789")!=std::string::npos)return false;
+            const auto value=std::stoull(stamp,&used);
+            hg::HostInput pad;
+            if(used!=stamp.size() || value>=max_run_slices || input_events.size()>=max_input_events ||
+               (!input_events.empty() && value<=input_events.back().slice) ||
+               (command!="none" && command!="left" && command!="cross" && command!="start" &&
+                !hg::parse_diagnostic_pad(command,pad)))return false;
+            input_events.push_back({std::uint64_t(value),command});return true;
+        } catch(...) { return false; }
+    };
     std::array<std::uint32_t,hg::IopState::max_trace_watches> watch_iop_pcs{};
     std::size_t watch_iop_pc_count=0;
     std::array<std::uint32_t,hg::State::max_trace_watches> watch_ee_pcs{};
     std::size_t watch_ee_pc_count=0;
-    unsigned slices=200000;
+    std::uint64_t slices=200000;
     unsigned checkpoint_every=0;
     unsigned cross_at=0;
     unsigned left_at=0;
@@ -328,19 +374,38 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
             }catch(...){return 1;}
         }
         else if(arg=="--input-at" && n+2<argc) {
-            try {
-                std::size_t used=0;const std::string stamp=argv[++n];
-                if(stamp.empty() || stamp.find_first_not_of("0123456789")!=std::string::npos)return 1;
-                const auto value=std::stoul(stamp,&used);
-                const std::string command=argv[++n];
-                hg::HostInput pad;
-                if(used!=stamp.size() || value>=3000000000u || input_events.size()>=1024 ||
-                   (!input_events.empty() && value<=input_events.back().slice) ||
-                   (command!="none" && command!="left" && command!="cross" && command!="start" &&
-                    !hg::parse_diagnostic_pad(command,pad)))return 1;
-                input_events.push_back({unsigned(value),command});
-            }catch(...){return 1;}
+            if(!input_events_file.empty())return 1;
+            const std::string stamp=argv[++n],command=argv[++n];
+            if(!append_input_event(stamp,command))return 1;
         }
+        else if(arg=="--input-events-file" && n+1<argc) {
+            if(!input_events_file.empty() || !input_events.empty())return 1;
+            input_events_file=argv[++n];std::ifstream input(input_events_file,std::ios::binary);
+            if(!input)return 1;
+            std::string line;
+            while(std::getline(input,line)) {
+                if(!line.empty() && line.back()=='\r')line.pop_back();
+                const auto split=line.find(' ');
+                if(split==std::string::npos || split==0 || split+1==line.size() ||
+                   line.find(' ',split+1)!=std::string::npos ||
+                   !append_input_event(line.substr(0,split),line.substr(split+1)))return 1;
+            }
+            if(!input.eof() || input_events.empty())return 1;
+        }
+        else if(arg=="--input-replay-wait-live")input_replay_wait_live=true;
+        else if(arg=="--fast-replay")fast_replay=true;
+        else if(arg=="--memory-card" && n+1<argc)memory_card_file=argv[++n];
+        else if(arg=="--memory-card-after-replay")memory_card_after_replay=true;
+        else if(arg=="--memory-card-insert-at" && n+1<argc)memory_card_insert_at=std::strtoull(argv[++n],nullptr,10);
+        else if(arg=="--checkpoint-file" && n+1<argc)checkpoint_file=argv[++n];
+        else if(arg=="--autopilot" && n+1<argc)autopilot_file=argv[++n];
+        else if(arg=="--input-on-ee-word" && n+3<argc) {
+            WordInput w;w.address=std::uint32_t(std::stoul(argv[++n],nullptr,0));w.value=std::uint32_t(std::stoul(argv[++n],nullptr,0));
+            w.pad=argv[++n];hg::HostInput check;
+            if(!hg::parse_diagnostic_pad(w.pad,check))return 1;
+            word_inputs.push_back(w);
+        }
+        else if(arg=="--stop-at-ee-word" && n+2<argc){stop_word_address=std::uint32_t(std::stoul(argv[++n],nullptr,0));stop_word_value=std::uint32_t(std::stoul(argv[++n],nullptr,0));stop_word=true;}
         else if(arg=="--capture-vu1" && n+1<argc)vu1_capture.prefix=argv[++n];
         else if(arg=="--capture-vu1-tex0" && n+1<argc) {
             try {
@@ -352,6 +417,7 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
             }catch(...){return 1;}
         }
         else if(arg=="--profile")profile_enabled=true;
+        else if(arg=="--frame-rate-probe")frame_rate_probe=true;
         else if(arg=="--profile-gs")profile_gs=true;
         else if(arg=="--sync-devices")sync_devices=true;
         else if(arg=="--realtime")realtime=true;
@@ -361,7 +427,7 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
             else if(value!="legacy")return 1;
         }
         else if(arg=="--checkpoint-every" && n+1<argc){try{checkpoint_every=std::stoul(argv[++n]);}catch(...){return 1;}if(!checkpoint_every || checkpoint_every>500000000)return 1;}
-        else if(arg=="--slices" && n+1<argc){try{slices=std::stoul(argv[++n]);}catch(...){return 1;}if(!slices || slices>3000000000u)return 1;}
+        else if(arg=="--slices" && n+1<argc){try{slices=std::stoull(argv[++n]);}catch(...){return 1;}if(!slices || slices>max_run_slices)return 1;}
         else if(arg=="--elf" && n+1<argc)elf=argv[++n];
         else if(arg=="--modules" && n+1<argc)modules=argv[++n];
         else if(arg=="--disc" && n+1<argc)disc=argv[++n];
@@ -369,7 +435,9 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
         else if(arg=="--dump-iop" && n+1<argc)dump_iop=argv[++n];
         else if(arg=="--preview-file" && n+1<argc)preview_file=argv[++n];
         else if(arg=="--input-file" && n+1<argc)input_file=argv[++n];
+        else if(arg=="--input-log" && n+1<argc)input_log=argv[++n];
         else if(arg=="--spu2-input-wav" && n+1<argc)spu2_input_wav=argv[++n];
+        else if(arg=="--spu2-mix-wav" && n+1<argc)spu2_mix_wav=argv[++n];
         else if(arg=="--spu2-sync-log" && n+1<argc)spu2_sync_log=argv[++n];
         else if(arg=="--spu2-input-core" && n+1<argc) {
             const std::string value=argv[++n];
@@ -383,7 +451,7 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
             else if(value=="1")spu2_output_core=1;
             else return 1;
         }
-        else {std::cerr<<"Usage: hg_system_diagnostic [--profile] [--profile-gs] [--realtime] [--capture-vu1 external-prefix --capture-vu1-tex0 value] [--clock-profile legacy|issue-slots] [--verify-sif|--verify-services|--verify-cdvd|--stop-on-loadfile-error] [--watch-ee-pc address] [--watch-iop-pc address] [--watch-iop-word aligned-address] [--slices count] [--checkpoint-every slices] [--press-cross-at slice] [--press-left-at slice] [--iop-worker-budget 1..128] [--elf path] [--modules directory] [--disc path] [--toc-record file] [--dump-iop external-path] [--preview-file external.ppm] [--input-file external.txt] [--input-at slice none|left|cross|start|pad:buttons,4axes,12pressures] [--spu2-input-wav external.wav --spu2-input-core 0|1] [--spu2-output-core 0|1] [--spu2-sync-log external.csv]\n";return 1;}
+        else {std::cerr<<"Usage: hg_system_diagnostic [--profile] [--profile-gs] [--realtime] [--capture-vu1 external-prefix --capture-vu1-tex0 value] [--clock-profile legacy|issue-slots] [--verify-sif|--verify-services|--verify-cdvd|--stop-on-loadfile-error] [--watch-ee-pc address] [--watch-iop-pc address] [--watch-iop-word aligned-address] [--slices count] [--checkpoint-every slices] [--press-cross-at slice] [--press-left-at slice] [--iop-worker-budget 1..128] [--elf path] [--modules directory] [--disc path] [--toc-record file] [--dump-iop external-path] [--preview-file external.ppm] [--input-file external.txt] [--input-events-file external.txt] [--input-replay-wait-live] [--input-log external.txt] [--input-at slice none|left|cross|start|pad:buttons,4axes,12pressures] [--spu2-input-wav external.wav --spu2-input-core 0|1] [--spu2-output-core 0|1] [--spu2-sync-log external.csv]\n";return 1;}
     }
     if((!input_file.empty() && (left_at || cross_at || !input_events.empty())) ||
        (!input_events.empty() && (left_at || cross_at))) {
@@ -392,8 +460,18 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
     if(!input_events.empty() && input_events.back().slice>=slices) {
         std::cerr<<"Diagnostic input event is outside the run budget\n";return 1;
     }
+    if(input_replay_wait_live && (input_events.empty() || !host)) {
+        std::cerr<<"Replay-ready wait requires scheduled input and a native host\n";return 1;
+    }
     if(spu2_input_wav.empty()!=(spu2_input_core<0)) {
         std::cerr<<"SPU2 input WAV capture requires both --spu2-input-wav and --spu2-input-core 0|1\n";return 1;
+    }
+    if(!spu2_mix_wav.empty()) {
+        spu2_mix_wav=std::filesystem::absolute(spu2_mix_wav).lexically_normal();
+        const auto relative=spu2_mix_wav.lexically_relative(std::filesystem::current_path().lexically_normal());
+        if(relative.empty() || *relative.begin()!="..") {
+            std::cerr<<"SPU2 mix WAV must be outside the repository\n";return 1;
+        }
     }
     if(!spu2_input_wav.empty()) {
         spu2_input_wav=std::filesystem::absolute(spu2_input_wav).lexically_normal();
@@ -416,7 +494,36 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
             std::cerr<<"Preview file must be outside the repository\n";return 1;
         }
     }
+    if(!input_log.empty()) {
+        input_log=std::filesystem::absolute(input_log).lexically_normal();
+        const auto relative=input_log.lexically_relative(std::filesystem::current_path().lexically_normal());
+        if(relative.empty() || *relative.begin()!="..") {
+            std::cerr<<"Input log must be outside the repository\n";return 1;
+        }
+    }
     hg::State ee;hg::EeDmaInterruptDispatcher ee_dma_interrupt;hg::EeIntcInterruptDispatcher ee_intc_interrupt;hg::DisplayTiming display_timing;hg::IopState iop;iop.sif=ee.sif;
+    // HG-PERF-118 preview file writer; declared before the device thread owner
+    // so posted preview closures can never outlive it.
+    struct PreviewWriter {
+        std::mutex mutex;
+        std::condition_variable wake,idle;
+        bool pending=false,busy=false,stopping=false;
+        unsigned width=0,height=0;
+        std::vector<std::uint32_t> image;
+        std::exception_ptr error;
+        std::thread thread;
+        void rethrow() {
+            std::lock_guard<std::mutex> lock(mutex);
+            if(error){const auto failure=error;error=nullptr;std::rethrow_exception(failure);}
+        }
+        // Waits until no frame is queued or being written (synchronous publication).
+        void drain() {std::unique_lock<std::mutex> lock(mutex);idle.wait(lock,[&]{return !pending&&!busy;});}
+        void stop() {
+            {std::lock_guard<std::mutex> lock(mutex);stopping=true;}
+            wake.notify_all();if(thread.joinable())thread.join();
+        }
+        ~PreviewWriter(){stop();}
+    } preview_writer;
     // Host device thread (device_link.hpp). Declared after `ee` so it always
     // drains and stops before the state it owns is destroyed.
     struct DeviceOwner {
@@ -466,7 +573,7 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
         int min_left=32767,max_left=-32768,min_right=32767,max_right=-32768;
     };
     std::array<Spu2RawStats,2> spu2_raw_stats{};
-    std::unique_ptr<hg::DiagnosticWavWriter> spu2_wav;
+    std::unique_ptr<hg::DiagnosticWavWriter> spu2_wav,spu2_mix_writer;
     std::unique_ptr<hg::HostAudioOutput> spu2_output;
     // HG-DIAG-014: read existing host counters without flushing or changing PCM.
     const auto report_speaker=[&](const char* stage) {
@@ -488,7 +595,6 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
             stats.hash^=byte;stats.hash*=1099511628211ull;
         }
         if(spu2_wav && int(core)==spu2_input_core)spu2_wav->append(left,right);
-        if(spu2_output && int(core)==spu2_output_core)spu2_output->append(left,right);
     };
     const auto report_spu2_capture=[&]() {
         if(!spu2_wav)return;
@@ -500,30 +606,17 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
         }
         std::cerr<<"SPU2 raw WAV core "<<spu2_input_core<<": "<<spu2_input_wav.string()<<" frames="<<spu2_wav->frames()<<'\n';
     };
-    const auto publish_preview=[&]() {
-        if(preview_file.empty()&&!host)return;
-        // Observe only committed VRAM. Presentation must not flush guest draws.
-        if(host&&!(ee.gs.privileged_pmode&3))return; // Scanout is explicitly disabled.
-        hg::GsDisplayImage display;
-        try {display=ee.gs.display_image();}
-        catch(const std::runtime_error&) {
-            if(host)throw; // A real host must report unsupported enabled scanout.
-            return; // The diagnostic preview may not have a supported scanout yet.
-        }
-        if(host) {
-            // Direct in-process presentation observes committed pixels only.
-            // Optional diagnostic file publication remains independent.
-            if(preview_file.empty()) {
-                host->present(display.width,display.height,std::move(display.rgba));return;
-            }
-            host->present(display.width,display.height,std::vector<std::uint32_t>(display.rgba));
-        }
+    // HG-PERF-118: the PPM encode/write/rename of --preview-file runs on a host
+    // writer thread (latest frame wins; the preview is sampled). The ordered
+    // committed-VRAM readback and host presentation stay at the original point.
+    // Final/fault publication is synchronous, so the retained file is exact.
+    const auto write_preview_file=[&](unsigned width,unsigned height,const std::vector<std::uint32_t>& image) {
         const auto pending=std::filesystem::path(preview_file.string()+".next");
         std::ofstream pixels(pending,std::ios::binary|std::ios::trunc);
-        pixels<<"P6\n"<<display.width<<' '<<display.height<<"\n255\n";
-        std::vector<char> rgb(display.rgba.size()*3);
-        for(std::size_t n=0;n<display.rgba.size();++n) {
-            const auto rgba=display.rgba[n];
+        pixels<<"P6\n"<<width<<' '<<height<<"\n255\n";
+        std::vector<char> rgb(image.size()*3);
+        for(std::size_t n=0;n<image.size();++n) {
+            const auto rgba=image[n];
             rgb[n*3]=char(rgba);rgb[n*3+1]=char(rgba>>8);rgb[n*3+2]=char(rgba>>16);
         }
         pixels.write(rgb.data(),std::streamsize(rgb.size()));
@@ -541,10 +634,58 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
         if(preview_error)throw std::filesystem::filesystem_error("publish preview",preview_file,preview_error);
         std::filesystem::rename(pending,preview_file);
     };
+    const auto queue_preview_file=[&](unsigned width,unsigned height,std::vector<std::uint32_t>&& image) {
+        if(!preview_writer.thread.joinable())
+            preview_writer.thread=std::thread([&] {
+                std::unique_lock<std::mutex> lock(preview_writer.mutex);
+                for(;;) {
+                    preview_writer.wake.wait(lock,[&]{return preview_writer.pending||preview_writer.stopping;});
+                    if(preview_writer.stopping)break; // Final frames are published synchronously.
+                    auto frame=std::move(preview_writer.image);
+                    const auto w=preview_writer.width,h=preview_writer.height;
+                    preview_writer.pending=false;preview_writer.busy=true;lock.unlock();
+                    std::exception_ptr failure;
+                    try{write_preview_file(w,h,frame);}catch(...){failure=std::current_exception();}
+                    lock.lock();preview_writer.busy=false;
+                    if(failure&&!preview_writer.error)preview_writer.error=failure;
+                    preview_writer.idle.notify_all();
+                }
+            });
+        preview_writer.rethrow();
+        {
+            std::lock_guard<std::mutex> lock(preview_writer.mutex);
+            preview_writer.width=width;preview_writer.height=height;
+            preview_writer.image=std::move(image);preview_writer.pending=true;
+        }
+        preview_writer.wake.notify_one();
+    };
+    const auto publish_preview=[&](bool synchronous) {
+        if(preview_file.empty()&&!host)return;
+        // Observe only committed VRAM. Presentation must not flush guest draws.
+        if(host&&!(ee.gs.privileged_pmode&3))return; // Scanout is explicitly disabled.
+        hg::GsDisplayImage display;
+        try {display=ee.gs.display_image();}
+        catch(const std::runtime_error&) {
+            if(host)throw; // A real host must report unsupported enabled scanout.
+            return; // The diagnostic preview may not have a supported scanout yet.
+        }
+        if(host) {
+            // Direct in-process presentation observes committed pixels only.
+            // Optional diagnostic file publication remains independent.
+            if(preview_file.empty()) {
+                host->present(display.width,display.height,std::move(display.rgba));return;
+            }
+            host->present(display.width,display.height,std::vector<std::uint32_t>(display.rgba));
+        }
+        if(synchronous) {
+            preview_writer.drain();preview_writer.rethrow();
+            write_preview_file(display.width,display.height,display.rgba);
+        } else queue_preview_file(display.width,display.height,std::move(display.rgba));
+    };
     iop.ram_write_trace_address=watch_iop_word;
     auto dump_iop_state=[&](const char* reason="fault") {
         // A failed host scanout must not throw again before the fault dump.
-        if(!host||std::string(reason)!="fault")publish_preview();
+        if(!host||std::string(reason)!="fault")publish_preview(true);
         if(dump_iop.empty())return;
         const auto target=std::filesystem::absolute(dump_iop).lexically_normal();
         const auto root=std::filesystem::current_path().lexically_normal();
@@ -571,10 +712,25 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
         std::cerr<<"Live GS transfer BITBLTBUF=0x"<<std::hex<<ee.gs.value[0x50]
                  <<" TRXPOS=0x"<<ee.gs.value[0x51]<<" TRXREG=0x"<<ee.gs.value[0x52]
                  <<" TRXDIR=0x"<<ee.gs.value[0x53]<<std::dec<<'\n';
+        auto serialized_environment=ee.gs.draw_environment_active?
+            ee.gs.draw_environment_base():ee.gs.value;
+        std::size_t serialized_event=0;
         for(std::size_t n=0;n<ee.gs.draws.size();++n) {
             const auto& draw=ee.gs.draws[n];if(n)draws<<',';
+            const GsDraw::Environment* environment=&ee.gs.value;
+            if(draw.explicit_environment)environment=draw.explicit_environment.get();
+            else if(draw.environment_event_count!=(std::numeric_limits<std::uint32_t>::max)()) {
+                if(draw.environment_event_count<serialized_event||
+                   draw.environment_event_count>ee.gs.draw_environment_events.size())
+                    throw std::runtime_error("invalid serialized GS draw environment cursor");
+                while(serialized_event<draw.environment_event_count) {
+                    const auto& change=ee.gs.draw_environment_events[serialized_event++];
+                    serialized_environment[change.address]=change.value;
+                }
+                environment=&serialized_environment;
+            }
             draws<<"{\"prim\":"<<draw.prim_state<<",\"xyoffset\":"<<draw.xyoffset<<",\"environment\":[";
-            for(unsigned r=0;r<draw.environment.size();++r){if(r)draws<<',';draws<<draw.environment[r];}
+            for(unsigned r=0;r<environment->size();++r){if(r)draws<<',';draws<<(*environment)[r];}
             draws<<"],\"vertices\":[";
             for(unsigned v=0;v<draw.count;++v) {
                 if(v)draws<<',';const auto& p=draw.vertices[v];
@@ -790,8 +946,14 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
         if(!spu2_sync_log.empty() && !hg::compiled_ee_instruction_trace())
             throw std::runtime_error("SPU2 sync log requires an EE instruction-history build");
         if(!spu2_input_wav.empty())spu2_wav=std::make_unique<hg::DiagnosticWavWriter>(spu2_input_wav);
+        if(!spu2_mix_wav.empty())spu2_mix_writer=std::make_unique<hg::DiagnosticWavWriter>(spu2_mix_wav);
         if(spu2_output_core>=0)spu2_output=std::make_unique<hg::HostAudioOutput>();
         std::ofstream spu2_sync,spu2_sync_events;
+        std::ofstream host_input_log;
+        if(!input_log.empty()) {
+            host_input_log.open(input_log,std::ios::binary|std::ios::trunc);
+            if(!host_input_log)throw std::runtime_error("cannot open input log");
+        }
         std::size_t spu2_sync_watch_cursor=0,spu2_sync_formula_cursor=0,spu2_sync_callback_a_cursor=0;
         std::size_t spu2_sync_ram_write_cursor=0;
         bool spu2_sync_dma_state_valid=false;
@@ -965,6 +1127,14 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
         unsigned csc_sequence=0;
         hg::HostDeadlineWaiter host_waiter(realtime);
         const auto playback_start=std::chrono::steady_clock::now();
+        // HG-DIAG-115: optional host stack sampler over a checkpoint window.
+        hg::host_sampler_start_if_requested();
+        hg::host_sampler_register_current("EE");
+        const auto sample_env=[](const char* name)->std::uint64_t {
+            const char* value=std::getenv(name);return value?std::strtoull(value,nullptr,10):0;
+        };
+        const auto sample_from=sample_env("HG_SAMPLE_FROM"),sample_to=sample_env("HG_SAMPLE_TO");
+        if(hg::host_sampler_enabled()&&!sample_from)hg::host_sampler_set_active(true);
         // Diagnostic-only qualification of original display-synchronized state.
         // Original 0x1bef84 copies the cause-2 counter into object+0x1c only
         // after 0x1beef0 observes enough display edges.  This remains a frame
@@ -981,7 +1151,7 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
             std::array<std::uint64_t,2> last_dispfb{},last_display{};
             std::chrono::steady_clock::time_point first_host{},last_host{},report_host{};
         } frame_probe;
-        frame_probe.enabled=profile_enabled && spu2_sync_log.empty() && ee.ram_write_trace_addresses[3]==0;
+        frame_probe.enabled=(profile_enabled||frame_rate_probe) && spu2_sync_log.empty() && ee.ram_write_trace_addresses[3]==0;
         const auto observe_original_frame_candidate=[&]() {
             if(!frame_probe.enabled)return;
             // s0 and the saved caller at sp+0x10 belong to 0x1beef0 while PC
@@ -1101,7 +1271,41 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
         std::uint64_t pacing_actual_us=0,pacing_max_late_us=0;
         std::uint64_t raster_host_ns=0,raster_profile_draws=0;
         std::size_t input_event_cursor=0;
-        const auto apply_input=[&](const std::string& command,unsigned slice) {
+        fast_replay_active=fast_replay&&!input_events.empty();
+        if(!memory_card_file.empty()) {
+            iop.memory_card=std::make_shared<hg::VirtualMemoryCard>();
+            iop.memory_card->open(memory_card_file);
+            iop.memory_card->present=!memory_card_insert_at&&!(memory_card_after_replay&&!input_events.empty());
+            std::cerr<<"Virtual memory card "<<(iop.memory_card->present?"inserted":"waiting for replay end")
+                     <<": "<<memory_card_file.string()<<'\n';
+        }
+        // Host-only checkpoint history: every input command applied, at its slice.
+        // Replaying it from boot reproduces the guest deterministically.
+        std::vector<std::pair<std::uint64_t,std::string>> applied_inputs;
+        const auto record_input=[&](std::uint64_t at,const std::string& command) {
+            if(checkpoint_file.empty())return;
+            if(!applied_inputs.empty()&&applied_inputs.back().first==at)applied_inputs.back().second=command;
+            else applied_inputs.emplace_back(at,command);
+        };
+        const auto write_checkpoint=[&](std::uint64_t at) {
+            // The final line re-applies the current input at `at`, so a
+            // --input-replay-wait-live resume pauses exactly at this slice.
+            auto lines=applied_inputs;
+            const auto current=lines.empty()?hg::format_diagnostic_pad(hg::HostInput{}):lines.back().second;
+            if(lines.empty()||lines.back().first<at)lines.emplace_back(at,current);
+            const auto pending=std::filesystem::path(checkpoint_file.string()+".next");
+            {
+                std::ofstream out(pending,std::ios::binary|std::ios::trunc);
+                for(const auto& [stamp,command]:lines)out<<stamp<<' '<<command<<'\n';
+                if(!out)throw std::runtime_error("cannot write checkpoint");
+            }
+            std::error_code error;
+            std::filesystem::rename(pending,checkpoint_file,error);
+            if(error){std::filesystem::remove(checkpoint_file,error);std::filesystem::rename(pending,checkpoint_file);}
+            std::cerr<<"Checkpoint saved at slice "<<at<<" ("<<lines.size()<<" input events): "<<checkpoint_file.string()<<'\n';
+            if(host&&host->notice)host->notice("Checkpoint saved");
+        };
+        const auto apply_input=[&](const std::string& command,std::uint64_t slice) {
             if(command.compare(0,4,"pad:")==0) {
                 hg::HostInput pad;
                 if(!hg::parse_diagnostic_pad(command,pad))throw std::runtime_error("invalid diagnostic pad snapshot");
@@ -1119,7 +1323,13 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
                 std::cerr<<"Diagnostic input "<<command<<" at slice "<<slice<<'\n';
             }
         };
-        auto next_input_slice=input_events.empty()?~0u:input_events[0].slice;
+        auto next_input_slice=input_events.empty()?~std::uint64_t{0}:input_events[0].slice;
+        // HG-DIAG-123: the autopilot owns the controller after any replayed events, until
+        // its script ends; its snapshots are recorded like live input.
+        std::unique_ptr<hg::Autopilot> autopilot;
+        if(!autopilot_file.empty()){autopilot=std::make_unique<hg::Autopilot>();autopilot->load(autopilot_file.string());
+            std::cerr<<"HG-DIAG-123 autopilot script loaded: "<<autopilot_file.string()<<'\n';}
+        hg::HostInput autopilot_last;bool autopilot_applied=false;
         std::cerr<<"Execution clock profile: "<<(issue_slot_clock?"experimental issue-slots":"legacy diagnostic")<<'\n';
         std::cerr<<"Host playback: "<<(realtime?"real time (10ms checks, 100ms catch-up bound)":"unlimited")<<'\n';
         if(realtime)std::cerr<<"Host wait backend: "<<host_waiter.backend()<<'\n';
@@ -1138,21 +1348,159 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
             ee.device->busdir=ee.gs.privileged_busdir;
             std::cerr<<"Host device thread: VIF1/VU1/GIF/GS\n";
         }
-        for(unsigned slice=0;slice<slices;++slice) {
+        for(std::uint64_t slice=0;slice<slices;++slice) {
             // HG-DIAG-005: GS reset restores device defaults. Re-arm this
             // host-only observer at the next quantum; counters are since reset.
             if(profile_gs)ee.gs.profile_raster=true;
-            if(host&&(slice&1023)==0) {
+            // HG-DIAG-006: a visible deterministic route owns the controller
+            // until its final scheduled snapshot. Live keyboard/gamepad input
+            // resumes on the next poll, allowing an exact replay to hand control
+            // back to the player without restarting or overwriting the route.
+            for(auto& w:word_inputs) {   // HG-DIAG-125
+                if(w.done||w.address+4>ee.ram.size())continue;
+                const std::uint32_t word=std::uint32_t(ee.ram[w.address])|std::uint32_t(ee.ram[w.address+1])<<8|
+                    std::uint32_t(ee.ram[w.address+2])<<16|std::uint32_t(ee.ram[w.address+3])<<24;
+                if(word!=w.value)continue;
+                w.done=true;apply_input(w.pad,slice);record_input(slice,w.pad);
+            }
+            // HG-DIAG-124: end the run (with its normal dumps) once an EE RAM word equals a
+            // value, e.g. a game frame counter, so state is compared at the same game frame.
+            // Checked every slice (~300 cycles) and the stop PC is reported, so the oracle
+            // can be run to the same instruction.
+            if(stop_word&&stop_word_address+4<=ee.ram.size()) {
+                const std::uint32_t word=std::uint32_t(ee.ram[stop_word_address])|std::uint32_t(ee.ram[stop_word_address+1])<<8|
+                    std::uint32_t(ee.ram[stop_word_address+2])<<16|std::uint32_t(ee.ram[stop_word_address+3])<<24;
+                // HG_WATCH_WORDS="addr,addr,...", HG_WATCH_EVERY=K: print those EE words each
+                // time the stop word (a frame counter) reaches a new multiple of K.
+                static const auto watch_words=[]{
+                    std::vector<std::uint32_t> out;
+                    if(const char* list=std::getenv("HG_WATCH_WORDS")) {
+                        std::stringstream text(list);std::string item;
+                        while(std::getline(text,item,','))if(!item.empty())out.push_back(std::uint32_t(std::stoul(item,nullptr,0)));
+                    }
+                    return out;
+                }();
+                static const std::uint32_t watch_every=[]{const char* v=std::getenv("HG_WATCH_EVERY");return v?std::uint32_t(std::stoul(v)):0u;}();
+                static std::uint32_t watch_last=~0u;
+                if(watch_every&&!watch_words.empty()&&word!=watch_last&&word<0x100000u&&word%watch_every==0) {
+                    watch_last=word;std::cerr<<"HG-DIAG-124 watch frame="<<word;
+                    for(const auto a:watch_words)if(a+4<=ee.ram.size())
+                        std::cerr<<' '<<std::hex<<(std::uint32_t(ee.ram[a])|std::uint32_t(ee.ram[a+1])<<8|std::uint32_t(ee.ram[a+2])<<16|std::uint32_t(ee.ram[a+3])<<24)<<std::dec;
+                    std::cerr<<'\n';
+                }
+                {   // HG-DIAG-131 (HG_EE_WRITE_WATCH=hex[,hex[,hex]]): print EE stores to those words live.
+                    static const std::array<std::uint32_t,3> ee_watch=[]{
+                        std::array<std::uint32_t,3> w{};const char* v=std::getenv("HG_EE_WRITE_WATCH");
+                        for(unsigned n=0;v && *v && n<3;++n){char* end=nullptr;w[n]=std::uint32_t(std::strtoul(v,&end,16));v=end && *end==','?end+1:nullptr;}
+                        return w;}();
+                    static std::size_t ee_watch_cursor=0;
+                    if(ee_watch[0]) {
+                        for(unsigned n=0;n<3;++n)if(ee_watch[n])ee.ram_write_trace_addresses[1+n]=ee_watch[n];
+                        const auto first=ee.ram_write_trace_cursor>ee.ram_write_trace.size()?ee.ram_write_trace_cursor-ee.ram_write_trace.size():0;
+                        if(ee_watch_cursor<first)ee_watch_cursor=first;
+                        for(;ee_watch_cursor<ee.ram_write_trace_cursor;++ee_watch_cursor) {
+                            const auto& write=ee.ram_write_trace[ee_watch_cursor%ee.ram_write_trace.size()];
+                            bool hit=false;for(const auto w:ee_watch)hit|=w && write.address<=w+3u && std::uint64_t(write.address)+write.size>w;
+                            if(!hit)continue;
+                            std::fprintf(stderr,"HG-DIAG-131 EE write slice=%llu pc=0x%x ra=0x%x addr=0x%x before=0x%x after=0x%x size=%u thread=%u spu2_frames=%llu\n",
+                                static_cast<unsigned long long>(slice),write.pc,write.ra,write.address,write.before,write.after,write.size,write.thread,
+                                static_cast<unsigned long long>(iop.spu2_input_frames));
+                        }
+                    }
+                }
+                {   // HG-DIAG-132 (HG_EE_PC_LOG=1, trace build, with --watch-ee-pc): print each new
+                    // watch hit with arguments; a2 is read as a {ptr,len} descriptor when in RAM.
+                    static const bool pc_log=std::getenv("HG_EE_PC_LOG")!=nullptr;
+                    static std::array<std::size_t,hg::State::max_trace_watches> seen{};
+                    if(pc_log)for(std::size_t n=0;n<ee.trace_watches.size();++n) {
+                        const auto& watch=ee.trace_watches[n];
+                        if(watch.cursor==seen[n])continue;
+                        seen[n]=watch.cursor;
+                        const auto& hit=watch.history[(watch.cursor+watch.history.size()-1)%watch.history.size()];
+                        const auto word=[&](std::uint32_t address)->std::uint32_t {
+                            address&=0x1ffffffu;if(address+4>ee.ram.size())return 0;
+                            return std::uint32_t(ee.ram[address])|std::uint32_t(ee.ram[address+1])<<8|std::uint32_t(ee.ram[address+2])<<16|std::uint32_t(ee.ram[address+3])<<24;};
+                        std::fprintf(stderr,"HG-DIAG-132 slice=%llu pc=0x%x ra=0x%x a0=0x%x a1=0x%x a2=0x%x a3=0x%x desc=[0x%x,0x%x] t0=0x%x s0=0x%x s1=0x%x s2=0x%x\n",
+                            static_cast<unsigned long long>(slice),hit.pc,hit.ra,hit.a0,hit.a1,hit.a2,hit.a3,word(hit.a2),word(hit.a2+4),hit.t0,hit.s0,hit.s1,hit.s2);
+                    }
+                }
+                {   // HG-DIAG-132 IOP side (HG_IOP_PC_LOG=1, trace build, --watch-iop-pc): new hits with thread.
+                    static const bool iop_pc_log=std::getenv("HG_IOP_PC_LOG")!=nullptr;
+                    static std::array<std::size_t,hg::IopState::max_trace_watches> iop_seen{};
+                    if(iop_pc_log)for(std::size_t n=0;n<iop.trace_watch_count;++n) {
+                        const auto& watch=iop.trace_watches[n];
+                        if(watch.cursor==iop_seen[n])continue;
+                        iop_seen[n]=watch.cursor;
+                        const auto& hit=watch.history[(watch.cursor+watch.history.size()-1)%watch.history.size()];
+                        std::fprintf(stderr,"HG-DIAG-132 IOP slice=%llu pc=0x%x ra=0x%x thread=%u a0=0x%x a1=0x%x a2=0x%x a3=0x%x s0=0x%x s1=0x%x\n",
+                            static_cast<unsigned long long>(slice),hit.pc,hit.return_pc,hit.thread,hit.a0,hit.a1,hit.a2,hit.a3,hit.s0,hit.s1);
+                    }
+                }
+                static const bool stop_word_trace=std::getenv("HG_STOP_WORD_TRACE")!=nullptr;
+                if(stop_word_trace&&(slice&32767)==0)std::cerr<<"HG-DIAG-124 trace slice="<<slice<<" word="<<word<<std::endl;
+                if(word==stop_word_value) {   // exact: the address may hold other data before the counter starts
+                    std::cerr<<"HG-DIAG-124 EE word 0x"<<std::hex<<stop_word_address<<" = "<<std::dec<<word<<" at slice "<<slice<<" pc=0x"<<std::hex<<ee.pc<<std::dec<<"; stopping\n";
+                    if(std::getenv("HG_STOP_SPU2")) {   // voice ENVX per core at the stop (HG-DIAG-124)
+                        for(unsigned core=0;core<2;++core) {
+                            std::cerr<<"HG-DIAG-124 core"<<core<<" ENVX";
+                            for(unsigned voice=0;voice<24;++voice)
+                                std::cerr<<' '<<std::hex<<iop.spu2_registers[(core*0x400u+voice*0x10u+0xau)/2]<<std::dec;
+                            std::cerr<<'\n';
+                        }
+                    }
+                    break;
+                }
+            }
+            const bool autopilot_owns=autopilot&&!autopilot->done()&&(input_events.empty()||input_event_cursor>=input_events.size());
+            if(autopilot_owns&&(slice&1023)==0) {
+                const auto state=hg::autopilot_read_state(ee.ram);
+                hg::HostInput pad;
+                try {pad=autopilot->step(state);}
+                catch(const std::exception& error) {   // explicit stop of the script, not of the game
+                    std::cerr<<"HG-DIAG-123 autopilot stopped: "<<error.what()<<" (slice "<<slice<<"); live input enabled\n";
+                    if(host&&host->notice)host->notice("Autopilot stopped - see log");
+                    autopilot.reset();
+                }
+                static const bool autopilot_trace=std::getenv("HG_AUTOPILOT_TRACE")!=nullptr;
+                if(autopilot&&autopilot_trace&&(slice&16383)==0)std::cerr<<"HG-DIAG-123 trace slice="<<slice<<' '<<autopilot->trace(state)<<std::endl;
+                if(autopilot&&!autopilot->last_message().empty()) {
+                    std::cerr<<autopilot->last_message()<<" (slice "<<slice<<")\n";
+                    if(host&&host->notice)host->notice(autopilot->last_message());
+                }
+                if(!autopilot_applied||!(pad==autopilot_last)) {
+                    iop.sio2_buttons[0]=pad.buttons;
+                    iop.sio2_controllers[0].axes=pad.axes;
+                    iop.sio2_controllers[0].pressures=pad.pressures;
+                    record_input(slice,hg::format_diagnostic_pad(pad));
+                    if(host_input_log){host_input_log<<slice<<' '<<hg::format_diagnostic_pad(pad)<<'\n';host_input_log.flush();}
+                    autopilot_last=pad;autopilot_applied=true;
+                }
+                if(autopilot&&autopilot->done())std::cerr<<"HG-DIAG-123 autopilot script finished at slice "<<slice<<"; live input enabled\n";
+            }
+            if(host&&host->closing()&&autopilot_owns&&(slice&1023)==0) {
+                report_original_frame_candidate("close");
+                if(spu2_wav){spu2_wav->finalize();report_spu2_capture();}
+                return 0;
+            }
+            if(host&&!autopilot_owns&&(input_events.empty() || input_event_cursor>=input_events.size())&&(slice&1023)==0) {
                 if(host->closing()) {
                     report_original_frame_candidate("close");
                     if(spu2_wav){spu2_wav->finalize();report_spu2_capture();}
                     return 0;
                 }
                 hg::HostInput input;
+                if(!checkpoint_file.empty()&&host->checkpoint_requested&&host->checkpoint_requested())
+                    write_checkpoint(slice);
                 if(host->input(input)) {
+                    record_input(slice,hg::format_diagnostic_pad(input));
                     iop.sio2_buttons[0]=input.buttons;
                     iop.sio2_controllers[0].axes=input.axes;
                     iop.sio2_controllers[0].pressures=input.pressures;
+                    if(host_input_log) {
+                        host_input_log<<slice<<' '<<hg::format_diagnostic_pad(input)<<'\n';
+                        host_input_log.flush();
+                        if(!host_input_log)throw std::runtime_error("cannot write input log");
+                    }
                     // HG-DIAG-006: capture only delivered game-controller changes,
                     // at their guest slice, to reproduce interactive faults.
                     if(profile_enabled) {
@@ -1166,10 +1514,16 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
                     }
                 }
             }
+            if(memory_card_insert_at&&slice==memory_card_insert_at&&iop.memory_card&&!iop.memory_card->present) {
+                iop.memory_card->present=true;
+                std::cerr<<"Virtual memory card inserted at slice "<<slice<<'\n';
+            }
             const auto clock_tick=execution_clock.quantum();
             // HG-DIAG-012: pace the host before profiling/executing this quantum.
             // Every guest quantum and its original input event still execute.
-            if(realtime) {
+            // Fast replay: host pacing only; every guest quantum and input still runs.
+            // The pacer re-bases itself (>100 ms lag) once paced play resumes.
+            if(realtime && !fast_replay_active) {
                 pacing_time_us+=clock_tick.microseconds;
                 if(host_pacer.due(pacing_time_us)) {
                     const auto now=std::chrono::steady_clock::now();
@@ -1190,6 +1544,10 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
                 host_profile.report();report_gs_profile();
                 report_speaker("checkpoint");
                 report_original_frame_candidate("checkpoint");
+                if(hg::host_sampler_enabled()) {
+                    if(sample_from&&slice==sample_from)hg::host_sampler_set_active(true);
+                    if(sample_to&&slice==sample_to)hg::host_sampler_set_active(false);
+                }
                 if(profile_enabled)std::cerr<<"Raster service host_ns="<<raster_host_ns
                     <<" draws="<<raster_profile_draws<<'\n';
                 // HG-DIAG-012: localize deliberate waiting separately from
@@ -1200,12 +1558,43 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
                     <<" max_late_us="<<pacing_max_late_us<<" rebases="<<host_pacer.rebases()<<'\n';
             }
             if((host||!preview_file.empty()) && ((!issue_slot_clock && slice%1000000==0) || preview_due)) {
-                device_owner.post_or_run([&]{publish_preview();});preview_due=false;
+                device_owner.post_or_run([&]{publish_preview(false);});preview_due=false;
             }
             if(slice==next_input_slice) {
                 apply_input(input_events[input_event_cursor].command,slice);
+                record_input(slice,input_events[input_event_cursor].command);
                 ++input_event_cursor;
-                next_input_slice=input_event_cursor<input_events.size()?input_events[input_event_cursor].slice:~0u;
+                next_input_slice=input_event_cursor<input_events.size()?input_events[input_event_cursor].slice:~std::uint64_t{0};
+                if(input_event_cursor==input_events.size()) {
+                    fast_replay_active=false;
+                    if(iop.memory_card&&!iop.memory_card->present) {
+                        iop.memory_card->present=true;
+                        std::cerr<<"Virtual memory card inserted at slice "<<slice<<'\n';
+                    }
+                }
+                if(host && input_event_cursor==input_events.size()) {
+                    if(input_replay_wait_live) {
+                        hg::HostInput discarded;
+                        while(host->input(discarded)) {}
+                        std::cerr<<"Diagnostic input replay ready at slice "<<slice
+                                 <<"; guest paused until live controller input\n";
+                        if(host->notice)host->notice("Checkpoint loaded - paused, press any game key");
+                        hg::HostInput live;
+                        while(!host->closing() && !host->input(live))
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        if(host->closing())return 0;
+                        record_input(slice,hg::format_diagnostic_pad(live));
+                        iop.sio2_buttons[0]=live.buttons;
+                        iop.sio2_controllers[0].axes=live.axes;
+                        iop.sio2_controllers[0].pressures=live.pressures;
+                        if(host_input_log) {
+                            host_input_log<<slice<<' '<<hg::format_diagnostic_pad(live)<<'\n';
+                            host_input_log.flush();
+                            if(!host_input_log)throw std::runtime_error("cannot write input log");
+                        }
+                        std::cerr<<"Diagnostic input replay released to live controller at slice "<<slice<<'\n';
+                    } else std::cerr<<"Diagnostic input replay complete; live host input enabled after slice "<<slice<<'\n';
+                }
             }
             if(!input_file.empty() && slice%10000==0) {
                 // Windows can briefly reject opens while the host atomically
@@ -1251,12 +1640,26 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
             if(clock_tick.microseconds) {
             ee_timer_clock.advance_us(ee.timers,ee.intc,clock_tick.microseconds);
             iop.advance_timers(clock_tick.microseconds);
-            if(spu2_wav || spu2_output) {
+            if(spu2_wav || spu2_output || spu2_mix_writer) {
                 // HG-DIAG-013: observe the already-modeled raw sound-input stream.
                 // Preserve the existing bounded history while copying one explicit core to WAV.
                 iop.advance_spu2(clock_tick.microseconds,[&](unsigned core,std::uint16_t left,std::uint16_t right) {
                     iop.spu2_input_history[iop.spu2_input_frames++%iop.spu2_input_history.size()]={core,left,right};
                     observe_spu2(core,left,right);
+                },[&](hg::Spu2Voices::Frame frame) {
+                    // Speaker: final SPU2 mix (core 1 output: voices + sound-data input via core 0).
+                    if(spu2_output && !fast_replay_active) {
+                        spu2_output->append(std::uint16_t(frame.left),std::uint16_t(frame.right));
+                        // HG-DIAG-127: log host speaker underruns as they happen (host-only;
+                        // a starved buffer is heard as crackle). One compare per frame.
+                        static std::uint64_t reported_underruns=0;
+                        if(spu2_output->underruns()!=reported_underruns) {
+                            reported_underruns=spu2_output->underruns();
+                            std::cerr<<"Host audio underrun total="<<reported_underruns<<" at guest_seconds="
+                                     <<spu2_output->frames()/48000.0<<" slice="<<slice<<'\n';
+                        }
+                    }
+                    if(spu2_mix_writer)spu2_mix_writer->append(std::uint16_t(frame.left),std::uint16_t(frame.right));
                 });
             } else iop.advance_spu2(clock_tick.microseconds);
             display_timing.configure(ee.gs.crtc_configured,ee.gs.crtc_interlace,ee.gs.crtc_mode,ee.gs.crtc_frame);
@@ -1729,6 +2132,7 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
                 fresh.ram_write_trace_address=iop.ram_write_trace_address;
                 fresh.rtc_bcd=iop.rtc_bcd;fresh.rtc_configured=iop.rtc_configured;
                 fresh.virtual_time_us=iop.virtual_time_us;
+                fresh.memory_card=iop.memory_card; // The card is a peripheral; it survives IOP reboot.
                 fresh.sif=ee.sif;iop=std::move(fresh);
                 ee.sif->sub_address=0;ee.sif->sub_flags=0;ee.sif->iop_control=0;
                 reboot={};++reboot_count;reboot_rpc_cleared=false;
@@ -2275,6 +2679,7 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
                  <<" raw frames="<<iop.spu2_input_frames<<" history truncated="
                  <<(iop.spu2_input_frames>iop.spu2_input_history.size()?iop.spu2_input_frames-iop.spu2_input_history.size():0)<<'\n';
         if(spu2_wav){spu2_wav->finalize();report_spu2_capture();}
+        if(spu2_mix_writer){spu2_mix_writer->finalize();std::cerr<<"SPU2 mix WAV frames="<<spu2_mix_writer->frames()<<" voice ticks="<<iop.spu2_voices.ticks()<<'\n';}
         if(spu2_output){spu2_output->flush();std::cout<<"SPU2 speaker output: core="<<spu2_output_core
             <<" frames="<<spu2_output->frames()<<" underruns="<<spu2_output->underruns()
             <<" max_queued_buffers="<<spu2_output->max_queued_buffers()
@@ -2293,6 +2698,13 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
             std::cout<<"EE thread "<<n+1<<" entry=0x"<<std::hex<<t.entry<<" pc=0x"<<t.context.pc
                      <<" status=0x"<<t.status<<" wait=0x"<<t.wait_type<<" id=0x"<<t.wait_id
                      <<std::dec<<" priority="<<t.priority<<" initialized="<<t.initialized<<'\n';
+        }
+        hg::host_sampler_stop_and_write();
+        if(iop.memory_card) {
+            std::cerr<<"Virtual memory card commands:";
+            for(unsigned c=0;c<256;++c)if(iop.memory_card->command_counts[c])
+                std::cerr<<" 0x"<<std::hex<<c<<std::dec<<'='<<iop.memory_card->command_counts[c];
+            std::cerr<<'\n';
         }
         report_original_frame_candidate(stopped_on_loadfile_error?"loadfile-stop":"budget");
         report_gs_profile();
@@ -2332,9 +2744,18 @@ int hg::run_native_game(int argc,char** argv,hg::NativeHost* host) {
             std::cerr<<" SMFLAG=0x"<<iop.sif->sub_flags<<'\n';
         }
     }
-    catch(const hg::Fault& e){device_owner.stop_reporting(e.what());if(host&&host->stopped)host->stopped(e.what());dump_iop_state();if(spu2_wav){spu2_wav->finalize();report_spu2_capture();}std::cerr<<"EE stopped at 0x"<<std::hex<<e.pc<<": "<<e.what()
+    catch(const hg::Fault& e){device_owner.stop_reporting(e.what());if(host&&host->stopped)host->stopped(e.what());dump_iop_state();if(spu2_wav){spu2_wav->finalize();report_spu2_capture();}std::cerr<<"EE stopped at 0x"<<std::hex<<e.pc<<hg::describe_ee_pc(std::uint32_t(e.pc))<<": "<<e.what()
         <<"; v0=0x"<<ee.r(2)<<" a0=0x"<<ee.r(4)<<" a1=0x"<<ee.r(5)<<" a2=0x"<<ee.r(6)
         <<" t0=0x"<<ee.r(8)<<" sp=0x"<<ee.r(29)<<" ra=0x"<<ee.r(31)<<'\n';
+        if(ee.vif1.trace_vifcodes) { // HG-DIAG-116
+            const auto count=std::min(ee.vif1.vif_trace_cursor,ee.vif1.vif_trace.size());
+            for(std::size_t n=0;n<count;++n) {
+                const auto& t=ee.vif1.vif_trace[(ee.vif1.vif_trace_cursor-count+n)%ee.vif1.vif_trace.size()];
+                std::cerr<<"VIF trace "<<std::dec<<n<<" code=0x"<<std::hex<<t.code<<" dest=0x"<<t.destination
+                    <<" cycle=0x"<<t.cycle<<" mode="<<t.mode<<" mask=0x"<<t.mask<<" tops=0x"<<t.tops<<" top=0x"<<t.top
+                    <<" base=0x"<<t.base<<" offset=0x"<<t.offset<<" dbf="<<t.dbf<<std::dec<<'\n';
+            }
+        }
         std::cerr<<"EE fault scheduler current="<<std::dec<<ee.boot.current_thread<<" interrupt="<<ee.boot.in_interrupt
                  <<" dma="<<ee_dma_interrupt.active()<<" intc="<<ee_intc_interrupt.active()<<'\n';
         // HG-DIAG-001: exit-only arithmetic evidence; no normal-path sampling.

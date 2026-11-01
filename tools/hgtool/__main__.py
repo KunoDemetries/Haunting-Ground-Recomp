@@ -18,6 +18,30 @@ def write_text_if_changed(path, text):
     return True
 
 
+def symbol_table_source(code,cfg,names_path):
+    """Host-diagnostic EE symbol table: configured roots + JAL targets, named from the
+    evidence-only out/function_names.json when present (never affects guest code)."""
+    starts={f['address'] for f in cfg.get('functions',[])}
+    for pc,i in code.items():
+        if i.name=='jal' and i.target is not None:starts.add(i.target)
+    starts={a for a in starts if a in code}
+    names={}
+    if names_path.exists():
+        for key,value in json.loads(names_path.read_text(encoding='utf-8')).items():
+            if value.get('name'):names[int(key,16)]=value['name']
+    starts|={a for a in names if a in code}
+    rows=[]
+    for a in sorted(starts):
+        name=names.get(a)
+        safe=''.join(c for c in name if c.isalnum() or c in '_:.~') if name else ''
+        rows.append('{0x%08xu,%s}'%(a,'"'+safe+'"' if safe else 'nullptr'))
+    lines=['','#include "hg/symbols.hpp"','namespace {','const hg::SymbolEntry hg_ee_symbols[]={',
+           ',\n'.join(rows),'};',
+           'const bool hg_ee_symbols_registered=(hg::ee_symbol_table={hg_ee_symbols,sizeof hg_ee_symbols/sizeof hg_ee_symbols[0]},true);',
+           '}','']
+    return '\n'.join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Independent EE static analysis and C++ translation')
     parser.add_argument('command', choices=['analyze', 'emit', 'inspect', 'major-scan', 'vu-inspect', 'assets', 'modules', 'iop-plan', 'iop-emit', 'iop-audit', 'iop-bundle', 'reboot'])
@@ -146,6 +170,11 @@ def main():
             else: raise ValueError('inspect requires --pc or --state external-prefix')
             return 0
         code, report = discover(image, cfg)
+        # A truncated discovery silently drops reachable code (2026-10-14: 164 new roots
+        # pushed the total past the cap and 0x2295c4 vanished). Fail explicitly instead.
+        exhausted=[i for i in report['issues'] if i.get('reason')=='instruction budget exhausted']
+        if exhausted:
+            raise SystemExit(f"discovery hit analysis.max_instructions ({len(code)} words; first dropped pc 0x{exhausted[0]['pc']:08x}); raise the limit in the config")
         args.out.mkdir(parents=True, exist_ok=True)
         (args.out / 'analysis.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
         listing = '\n'.join(f'{pc:08x} {i.word:08x} {i.name}' for pc, i in sorted(code.items()))
@@ -164,6 +193,7 @@ def main():
         if args.command == 'emit':
             main,shards=emit_shards(code,image.sha256,cfg.get('overlays',[]),image,
                                     cfg.get('vu1_programs',[]))
+            main+=symbol_table_source(code,cfg,args.out/'function_names.json')
             changed=int(write_text_if_changed(args.out/'translated.cpp',main))
             expected=set()
             for name,source in shards.items():

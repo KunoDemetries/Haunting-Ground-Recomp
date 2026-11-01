@@ -33,8 +33,8 @@ inline HostInput keyboard_with_select_alias(KeyboardKeys keys,bool tab,bool focu
 struct BindingRow {std::string_view control,keys;};
 inline constexpr std::array<BindingRow,15> bindings{{
     {"MOVE - LEFT STICK","W / A / S / D"},
-    {"CAMERA - RIGHT STICK","I / J / K / L"},
-    {"D-PAD","ARROW KEYS"},
+    {"CAMERA - RIGHT STICK","ARROW KEYS"},
+    {"D-PAD","I / J / K / L"},
     {"CROSS","SPACE"},
     {"CIRCLE","X"},
     {"SQUARE","C"},
@@ -142,6 +142,7 @@ inline PanelImage make_panel() {
     image.fill(24,420,PanelImage::width-48,1,rgba(78,92,110));
     image.text(28,435,"GAME KEEPS RUNNING WHILE THIS PANEL IS OPEN.",2,muted);
     image.text(28,458,"PAUSE WITH ENTER FIRST. F1 RETURNS TO THE GAME.",2,muted);
+    image.text(28,475,"F2 TOGGLES THE HOST 30 FPS LOCK.",2,accent);
     return image;
 }
 } // namespace hg::host_controls

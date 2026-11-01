@@ -18,6 +18,39 @@ def make_elf(words):
 
 
 class Tests(unittest.TestCase):
+    def test_pref_all_fields_are_cache_neutral(self):
+        from hgtool.constants import update
+        offsets = (0, 1, 0x7fff, -1, -0x8000)
+        for base in range(32):
+            for hint in range(32):
+                for offset in offsets:
+                    word = 51 << 26 | base << 21 | hint << 16 | (offset & 0xffff)
+                    instruction = decode(0x227e90, word)
+                    self.assertEqual(instruction.name, 'pref')
+                    self.assertEqual((instruction.rs, instruction.rt, instruction.immediate),
+                                     (base, hint, offset))
+                    self.assertEqual(straight(instruction),
+                                     '; // Architecturally defined cache-neutral PREF hint.')
+                    regs = {0: 0, 3: 0x12345678, 31: 0xffffffff81234567}
+                    update(regs, instruction)
+                    self.assertEqual(regs, {0: 0, 3: 0x12345678, 31: 0xffffffff81234567})
+
+    def test_cache_dxin_all_bases_are_explicit_and_state_neutral(self):
+        from hgtool.constants import update
+        offsets = (0, 1, 0x7fff, -1, -0x8000)
+        for base in range(32):
+            for offset in offsets:
+                word = 47 << 26 | base << 21 | 22 << 16 | (offset & 0xffff)
+                instruction = decode(0x26cb74, word)
+                self.assertEqual(instruction.name, 'cache_dxin')
+                expected_base = 'std::uint64_t(0)' if base == 0 else f's.gpr[{base}].lo'
+                expected_offset = offset & 0xffffffffffffffff
+                self.assertEqual(straight(instruction),
+                                 f's.cache_index_invalidate(std::uint32_t({expected_base}+{expected_offset}ull));')
+                regs = {0: 0, 3: 0x12345678, 31: 0xffffffff81234567}
+                update(regs, instruction)
+                self.assertEqual(regs, {0: 0, 3: 0x12345678, 31: 0xffffffff81234567})
+
     def test_vu_macro_conversions(self):
         for base,prefix in ((0x13c,'vitof'),(0x17c,'vftoi')):
             for selector,scale in enumerate((0,4,12,15)):
@@ -96,6 +129,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(decode(0, 62 << 26 | 6 << 21 | 16 << 16).name, 'sqc2')
         self.assertEqual(decode(0, 47 << 26 | 16 << 16).name, 'cache_dxltg')
         self.assertEqual(decode(0, 47 << 26 | 20 << 16).name, 'cache_dxwbin')
+        self.assertEqual(decode(0, 47 << 26 | 22 << 16).name, 'cache_dxin')
         self.assertEqual(decode(0, 18 << 26 | 2 << 21).name, 'cfc2')
         self.assertEqual(decode(0, 18 << 26 | 6 << 21).name, 'ctc2')
         for word in (18 << 26 | 2 << 21 | 2, 18 << 26 | 6 << 21 | 2, 47 << 26 | 17 << 16):

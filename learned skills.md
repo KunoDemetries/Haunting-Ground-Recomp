@@ -1,3 +1,254 @@
+### HG-LEARN-099 - Equal-priority IOP threads must not time-slice
+
+CRI's ADX streaming split a left/right block pair across two IOP threads of priority 39 because our cooperative scheduler rotated equal-priority ready workers each quantum; the right channel's free-space report fell a step behind and its ring mirror stopped refreshing (audible right-ear static). THREADMAN only switches on block/yield/higher-priority wakeup. When per-channel or per-buffer state drifts apart only in our build, check scheduling semantics (owner vs. round robin) before suspecting arithmetic; trace call order per channel (instruction-trace build + PC-watch log) rather than reading code.
+
+### HG-LEARN-098 - Ask the console the narrow question; PCSX2 was wrong on SPU2 rate 0x7F
+
+When PCSX2 and the PS1 reference disagreed on SPU2 sustain rate 0x7F, a 25-second IOP probe (our module + ROM LIBSD, silent voice, ENVX sampled over time, results by SIF DMA) folded into the next capture settled it: the console holds the level, and it also exposed two envelope details neither source had (decay takes one step before the sustain check, giving 0x7FF7; a linear release reads negative for one sample). Structured sweeps (fixed operand, consecutive other operand) likewise pinned the multiplier to a Booth + carry-save structure where random data had not. Prefer one more structured hardware trip over guessing between two references.
+
+### HG-LEARN-097 - Measure the oracle with the same probe before "fixing" a drift
+
+Slot 07 Hewie drifted 0.003 against PCSX2 after every hardware-exact float fix. Running the hardware capture programs inside PCSX2 showed its VU0 adder (exact sum, chop) and DIV/SQRT rounding are not the console's, while ours matched the console exactly. When the oracle and the hardware disagree, keep the hardware rule as default and add an opt-in oracle profile (HG-DIAG-126) for comparisons; do not bend the default toward the emulator. Where hardware is still unfitted, pick the measured-closest rule (COP1 DIV.S nearest: 85% vs chop 60%) and document it as interim.
+
+### HG-LEARN-096 - Find a float drift's origin in three steps
+
+1) Bisect with exact-pause section checks (both sides paused at the same frame-counter write) to the first differing frame and object words. 2) PCSX2 write memcheck on a differing word gives the writer PC; read registers and the stack there. 3) Compare the instruction's inputs with ours: equal inputs mean an arithmetic rule differs; different inputs move the search upstream. Polling traces (watch_trace) sample mid-frame and are only good for a coarse range.
+
+### HG-LEARN-095 - Pin a unit's result structure before fitting its internal rule
+
+For the PS2 divider, the decisive step was testing which results can be +1: with ma >= mb, +1 appears only when the dropped low bit is 1 (0 of 11,000+ otherwise), which proves an inner 25-bit quotient truncated afterwards; SQRT has the same shape and RSQRT = DIV(SQRT). Only then fit digit rules. Families disproved on simple divisors (radix-2 SRT exact/carry-save with constant or per-divisor thresholds, overlapped stages, dropped carry-in, estimate correction, radix-4 {-3..3} exact, reciprocal-multiply) are recorded in SOURCES; prefer a structured hardware capture (fixed divisors, consecutive dividends) over more blind model search.
+
+### HG-LEARN-094 - Discovery caps must fail loudly
+
+A configured instruction budget (650,000) was reached exactly after a root batch; discovery recorded "instruction budget exhausted" in analysis.json but emission continued, silently dropping reachable code and producing a "no static translation" stop at 94M on the pinned route. Keep the limit above the executable segment size and make emit/analyze exit on exhaustion. After any root batch, check the reachable-word count is not a round configured limit and rerun the pinned replay.
+
+### HG-LEARN-093 - Missing music can be a stalled IOP timer, not audio synthesis
+
+Sony MIDI sequencing (MODMIDI/MODHSYN) advances only on its driver's hardware-timer IRQ. Root-counter mode bit 3 (reset at target) was ignored, so a repeating 240 Hz tick fired once. Diagnose by voice-usage stats (whole cores silent) and a timer-configuration trace before touching the synthesizer.
+
+### HG-LEARN-092 - Cooperative quanta must not reopen interrupts for a masked worker
+
+A worker paused at a quantum boundary inside CpuSuspendIntr still owns the CPU on hardware. Scheduling already honored this (`locked_thread`), but IRQ delivery read the idle context's enable flag, letting SIFMAN's SIF0 completion handler re-arm the channel mid-SetDma (2026-10-13 ~448M stop). Gate every asynchronous delivery on the owner's mask (`iop_cpu_interruptible`). Expect guest timing (EE RAM) to change versus older controls; refresh the pinned control after such corrections.
+
+### HG-LEARN-091 - "Only music in gameplay" meant the voice path was unimplemented
+
+Streamed music/cutscenes use SPU2 sound-data input (AutoDMA), which was modeled; every sound effect uses voices (here core 1). Trace guest SPU2 writes first (HG-DIAG-118) to confirm offsets and routing (core 0 output -> core 1 SIN via AVOL), then synthesize per Ts in guest time. Verify with a headless mix WAV (HG-DIAG-120): the mix must equal the input where only music plays and add content where input is silent. Guest captures stayed byte-exact on the pinned replay.
+
+### HG-LEARN-090 - VU1 program identity must cover only the code an activation can execute
+
+Whole-composite MicroMem identity made every new area's upload combination a fresh "no static translation" stop, although the reachable code from each entry was already proven (2026-10-12 ~325M: all four entries equal scene14). Checking per entry over the reachable pair set (plus delay pairs; relative branches only) is exact and keeps explicit faults for any changed executed pair. Verify a card save by its slot payload, not by the save directory's existence (HG save files are created with 12 blank templates first).
+
+### HG-LEARN-089 - A rejected optimization can become decisive in another scene; re-census per scene
+
+HG-FAIL-053 dropped a GPU path for own-pixel PSMT8H feedback because it was flat where that class was rare. In the Debilitas encounter the class was every GPU refusal (882k triangles in 40M slices), and the CPU fallback plus forced readback/re-upload saturated stage C (17â€“25/s). Implemented exactly (tile lists preserve per-pixel order, so an own-pixel read sees the same frame word as the scalar path), it raised that window to ~40/s and the pinned benchmark from ~42 to ~54, byte-exact. Before dismissing an earlier failure, rerun a cheap rejection census (counters at each refusal) on the slow scene in hand. Treat "flat in scene A" as scene-scoped evidence, not a universal verdict.
+
+### HG-LEARN-088 - Every VU lower store needs the same-pair snapshot, not just SQ
+
+The upper and lower halves of a VU pair read their operands at issue, so a lower store paired with an upper that writes the stored VF lanes must store the pair-start value. The emitter applied this only to `SQ`. `SQI` (and any future `SQD`) went through live state, so `ITOF12 VF19 | SQI VF19,(VI4++)` wrote the converted floats instead of the header. The GIF then parsed the floats as a ~118k-entry tag ("XGKICK packet exceeds VU1 data memory"). Diagnose such faults by checking the kicked memory against the VIF-unpacked input (HG-DIAG-116 trace) before suspecting hardware wrap. Values that are an exact transform of another register point to an in-pair ordering bug. When adding a store or move form to the emitter, check the same-pair snapshot condition explicitly.
+
+### HG-LEARN-087 - Benchmark the execution mode players use, then sample the saturated thread with real symbols
+
+The synchronous `--profile` replay (13â€“15/s) hid the real limits. The same pinned inputs in normal threaded mode (with `--frame-rate-probe`) ran 24â€“27/s, and HG-DIAG-091 stage stats showed stage C (GIF/GS/GL) at 0% idle. Only then did a suspend-and-copy stack sampler with PDB/inline resolution (HG-DIAG-115) find concrete stage-C costs. These were a driver-blocking `glGetError` after `glFlush` (14.5%), alpha-test modes forcing CPU triangles, and a diagnostic PPM writer running synchronously at up to 60 Hz (13%). Fixing them took the heavy scene from ~27 to ~42 updates/s, and to a locked 30 FPS paced. Map-file symbolization alone mis-attributed inlined code badly. Judge changes on per-interval distributions (median, p10, count below 29.9) over several interleaved pairs: host variance between runs was up to Â±20%. A flat aggregate can hide whether the slowest frames improved. Diagnostic and harness work on the critical thread counts as real cost until it is moved off it.
+
+### HG-FAIL-069 - Coalescing forwarded GIF qwords into blocks did not reduce stage-C time
+
+HG-PERF-117 batched consecutive PATH3/DIRECT qwords on stage B into owned `gif_words` blocks for `GifPath::submit_words`, preserving order through every flush point. It was exact but flat (34.11 vs 34.84 mean aggregate). The per-qword ring/parse overhead is small next to the packet application (A+D register writes, CLUT loads, draws) it feeds. Do not retry ring-level batching without new evidence.
+
+### HG-LEARN-086 - Key GPU residency by minted content identity, and make reuse tests defeat LRU eviction
+
+GPU uploads of staged guest texture bytes may only be reused under an identity minted when the epoch-verified CPU cache staged those bytes (`content_id`, and palette `identity` per snapshot). Process-wide counters avoid aliasing between GS instances or reused addresses. TEX0, `clut_load_count` or a pointer are not safe keys. HG-ARCH-010 verified this with 50,412 exact GPU point samples. The reuse test first missed a deliberate TEX0-keyed mutation: the preceding fixture loop overflowed the 8-entry LRU, so the stale entry had already been evicted. A cache-staleness test must make the old content resident immediately before the mutation and assert that the observed value changes. Then run the weakened-key mutation to confirm it fails.
+
+### HG-LEARN-085 - Qualify renderer-private trackers at real GL boundaries, and prove the test bites with mutations
+
+Synthetic tracker tests alone missed a liveness defect: resident `discard_write` cleared GPU-dirty state but not epoch pending counts. A live resident fixture (`gs_gpu_tests --native-epochs`) queried pending/stamp state between each real GL operation: enqueue, `glFlush`, one-page `read_span`, `finish`, masked, discard, CPU raster scope, triangle, owner swap/destruction, a deliberate `GL_INVALID_ENUM` and teardown. It compared VRAM with the scalar renderer after every step, exposed the defect and passed after a one-call fix. Two intentional source mutations (drop the fix; mark completion at `glFlush`) each failed with the specific message, which proves the fixture distinguishes submission from completion. Restore mutations with a fresh mtime (`touch` after copying, or copy without `-p`). `cp -p` kept an older timestamp, MSBuild skipped recompiling, and a full-matrix run silently used the mutated binary. Rehash the source and check that the object recompiles before trusting results.
+
+### HG-LEARN-084 - First-touch indexed VRAM pages avoid unnecessary full-memory readback on cache misses
+
+HG-ARCH-007 replaced the standalone PSMT8 staging helper's `GsLocalMemory::data() const` (full-4 MiB CPU observer read) with one observer-backed `read_span` per distinct physical 8 KiB page, cached only within a single immutable staging operation. It preserved 21,292 original indexed-byte parity comparisons, page-511/0 wrap and the 38,400 physical address checks. A synthetic counting observer proved a 128x64 texture requests only 8 KiB, or 16 KiB with unaligned TBP0 wrap, rather than the entire 4 MiB. This avoids gratuitous synchronization requests, not necessarily measured GPU transfers; host timing and real cache-hit behavior remain unqualified. The helper is off-path and still requires a coherent source generation and native GPU upload/parity before live rendering.
+
+### HG-FAIL-068 - Doubling resident GPU triangle payload capacity saves batches but not gameplay time
+
+HG-PERF-112 raised only the 1024-triangle payload limit to 2048. It passed build/runtime/translation/VU, complete authentic 180M replay and exact original-frame, EE, GS, VU, console, and input comparisons against the restored control. All 5,270 qualified original writers matched with zero unexpected writer/caller failures; raw IOP retained known RTC differences. GPU triangle batches fell from 36,047 to 25,670 (28.79% fewer), flushes from 58,247 to 47,869, but heavy final 30-writer throughput was **14.0522 updates/s** candidate vs **14.8173** adjacent restored control. The material >=5% speed improvement was not observed. Host scheduling and residency vary between runs, so the test does not establish a universal deterministic slowdown; it does establish that reducing dispatch count alone is inadequate. This exact isolated capacity expansion was rejected and byte-restored. Future candidates must attack measured host submission/coherence cost or game-visible dependencies rather than only increase job batch size.
+
+### HG-FAIL-067 - Moving resident error polling ahead of glFlush fails the authentic gameplay gain gate
+
+HG-PERF-111 pre-`glFlush` resident `glGetError()` (one poll per resident flush, nonresident path untouched) preserved identical frame, EE RAM, GS VRAM/state, VU1 data/state, console, pinned input and 5,270 qualified original frame writers across exact authentic 180M candidate/early-control/late-control runs, with zero unexpected writers/caller mismatches/faults. Raw IOP RAM diverges at the known host-RTC payload; full RTC-masked memory equivalence has not been separately proved. Despite ~22% less resident synthetic flush time, candidate **did not beat either adjacent authentic control** in the final 30-writer tail: 11.7817 updates/s versus controls 13.3947 and 14.8537. Full-run elapsed host time varies across controls, so do not assert a fixed causal slowdown. Preserve the useful *mechanism* as a driver-specific observation, but **reject and restore the source change** because the >=5% actual throughput gain is absent. Driver waits can shift to later GPU/CPU coherence, and per-flush microbenchmarks are not gameplay FPS. Reconsider only with a demonstrably different synchronization strategy and rigorous output/fault proof, never by reapplying the same one-line query relocation.
+
+### HG-LEARN-083 - Separate API-error observation from resident GPU submission when the driver serializes the pair
+
+On RTX 5070 / NVIDIA 617.42, current resident flush attribution shows the final
+post-`glFlush` `glGetError()` consumes ~88% of flush time while `glFlush()` itself is
+only ~2.6%. Moving the same single error observation to immediately before `glFlush()`,
+after all renderer GL calls for the batch, preserves ordinary renderer API-error
+reporting and reduces identical resident synthetic flush time by ~22% (1,079-flush full
+suite: 103.2423 ms -> 80.5049 ms). A deliberate NVIDIA `GL_INVALID_ENUM` still reaches
+the existing `GS compute dispatch/readback failed` fault, and 1,159 resident GPU/CPU
+cases pass. A follow-up current-driver query shows the matching 4.3 core GLFW context
+uses `GLFW_NO_RESET_NOTIFICATION` (200705) on this NVIDIA stack. KHR robustness specifies
+that this strategy does not deliver reset-event notification, so the old post-`glFlush`
+poll was not a guaranteed one-flush-earlier reset detector; context state loss itself is
+still not guaranteed impossible. This removes the specific notification-order objection, but the exact authentic
+180M qualification subsequently **rejected** the proposed relocation for missing its
+>=5% gameplay-throughput gain. See HG-FAIL-067. Do not remove polling entirely or
+infer material gameplay throughput from nonresident or isolated flush timings.
+
+### HG-FAIL-066 - Match synthetic mode to the production branch before using an A/B
+
+A resident-only renderer change cannot be evaluated by the default `gs_gpu_tests`
+invocation. The ordinary 1,159-case run creates its main accelerator with `resident=false`;
+a later HG-DIAG-108 timer proved the 1,058-flush workload had zero resident `glFlush`
+time. Therefore the apparent 3.85% HG-PERF-110 candidate/control difference on that
+workload was ordinary run variance and does not measure the moved resident buffer-update
+barrier. The candidate is restored and remains unqualified, not proven slow. For future
+renderer A/Bs, pass `--resident` (and `--triangles` when appropriate) or otherwise prove
+activation from resident-only counters before interpreting timing. A test that passes
+correctness but misses the changed branch provides no performance ceiling.
+
+### HG-FAIL-065 - Deferring a disjoint CPU-fallback flush can only move GPU submission
+
+Do not remove the eager triangle CPU-fallback flush merely because the retained bulk
+`GsCpuMemoryScope` proves the fallback pages are disjoint from queued GPU pages. In a
+contiguous retained final-draw sample, 305/306 self-feedback rejects need no bulk-scope
+flush even under deliberately over-broad queued sprite masks. However the preceding
+triangle batch is already flushed by the first sprite; the sprite commands then remain
+queued. Current fallback submits those commands at the first reject, while the deferred
+candidate would submit the same commands at the first later accepted triangle because
+`render_triangle()` flushes when `commands` is nonempty. Thus the actual dispatch is
+moved, not removed. Resident `flush()` calls `glFlush()` specifically to overlap GPU
+execution with later guest/CPU work, so deferring across a long scalar fallback island
+can lose overlap. This structurally explains the old ~+0.45% result and removes the
+credible >=5% ceiling for unchanged HG-PERF-109. Preserve the eager flush unless a new
+mechanism can prove it removes work rather than only postponing submission.
+
+### HG-LEARN-082 - Use stage deltas to set optimization ceilings before writing code
+
+When a production-shaped fixed-rate observer already brackets the hot path, subtract
+adjacent checkpoint aggregates before proposing another renderer mechanism. In the
+exact 175M--180M triangle tail, 2,703 sampled complete dispatches add 2.109 ms while
+measured inner stages explain 1.864 ms (~88.4%); ordered backend flush alone contributes
+0.821 ms (~39.0%). Setup, coverage, packing, conversion, palette and tile insertion
+are each much smaller, matching the weak or negative results of recent micro-changes.
+Treat whole-route flush/readback counters as context, not tail attribution, and do not
+infer GPU saturation from host flush time when independent GL timing shows headroom.
+The next useful experiment is flush-reason attribution at the same exact tail, not
+another arithmetic/payload tweak. If the exact qualifier is unavailable, keep
+production unchanged and record the diagnostic boundary instead of stacking an
+unqualified candidate.
+
+### HG-FAIL-064 - Exact first-covered edge stepping is too small alone
+
+The pre-admission triangle search can replace three determinant recomputations per
+candidate pixel with exact signed-64 edge stepping while preserving the identical
+row-major first-covered sample and top-left rule. Build/runtime/translation/VU and
+1,159 GPU/CPU cases pass, and the exact 180M candidate/control artifacts are byte-
+identical. The matched 175M checkpoint improves only 12.0187 vs 11.9157 (+0.86%) and
+the final tail 12.0512 vs 11.9113 (+1.17%). The arithmetic factoring is valid but its
+standalone ceiling is below the 5% gate; the source is restored. Do not retry this
+unchanged. A larger win must remove work across broader triangle setup/replay rather
+than only the first-covered determinant scan.
+
+### HG-FAIL-063 - Rare wide-STQ fallback recovery has too little performance ceiling
+
+The native-relaxed renderer can safely recover the perspective triangles rejected
+only because `coefficient * area` exceeds the signed-64 prepared representation.
+A widened checked path passed 1,159 GPU/CPU cases plus runtime/translation/VU suites,
+activated exactly 6,195 additional GPU triangles on the authentic 180M route, and
+preserved display, EE, GS, VU and console artifacts byte-for-byte. But 6,195 is only
+about 0.028% of the ~21.99M triangle draws. An immediately adjacent enabled/disabled
+pair measured 11.9849 vs 11.9479 updates/s at 175M (+0.31%) and 11.9595 vs 11.9406
+at 180M (+0.16%), far below the retention gate. Keep the capability disabled and
+do not spend more complexity optimizing this narrow overflow class unless a later
+workload census shows it has become materially more common.
+
+### HG-FAIL-062 - Do not prepack native-float STQ in producer validation
+
+The native GL consumer formerly converted nine validated int64 STQ coefficients
+to float after copying each triangle job. Moving those identical casts into the
+producer's existing per-vertex validation loop was byte/pixel exact and removed
+all 15.67M backend conversions, but reduced the saturated tail from
+20.1939/20.1994 to19.1972FPS. The likely code-shape/register-pressure cost in the
+already large producer outweighs the cold consumer pass. The candidate is removed;
+keep the conversion consumer-side unless a future job layout removes the int64
+representation entirely without expanding the producer hot loop.
+
+### HG-FAIL-061 - PSMT8 page revisits do not cross a safe local cache boundary
+
+A per-`write_image_transfers` 512-page pointer cache is semantically safe when
+cleared before scalar fallback and does collapse revisits in a synthetic wrapped
+call. It has no material production reuse. The unchanged 4,164,551
+`bulk_cpu_scopes` initially appeared to quantify IMAGE mappings, but source audit
+shows it counts `GsCpuMemoryScope` raster coherence instead; do not infer one
+observer interface's traffic from another's counter. Initializing the unused
+table regressed the tail from
+20.1939/20.1994 to19.1746FPS. The candidate was removed. Do not retry a local
+page-pointer table; a future reduction must safely coalesce owned IMAGE payloads
+before application or change the coherence interface with explicit ordered
+lifetime/version proof.
+
+### HG-LEARN-081 - Replace repeated quotient overflow proofs with exact wide products
+
+`PreparedCoordinate::prepare` used `magnitude > INT64_MAX / area` for every S/T/Q
+vertex coefficient, causing up to nine variable 64-bit divisions before triangle
+coverage rejection or GPU admission. A native 64x64->128 product tests the exact
+same bound (`_umul128` on MSVC x64, `unsigned __int128` on GCC/Clang), with the
+division definition retained on other hosts. 200,004 direct comparisons, native
+regressions and two byte-exact 180M qualifications pass. The saturated tail rises
+from18.86--18.93 to20.1939/20.1994FPS (+6.66% to+7.10%) without changing the
+15.72M accepted triangles or27,266 batches. Prefer exact wide arithmetic when a
+hot validation predicate otherwise divides; retain the portable definition and
+do not weaken coefficient/fault bounds.
+
+The same substitution is not automatically profitable after GPU admission. Three
+shifted coefficient proofs in job packing were exact but reduced the tail to
+19.9468FPS versus the retained20.1939/20.1994. They were removed. Keep the wide
+product in the nine-call preparation loop; do not broaden it to the packer without
+a different code shape or new evidence.
+
+### HG-FAIL-060 - Scalar triangle quotient setup is not the slow-tail ceiling
+
+Deferring `GsTriangleQuotient` construction until the scalar pixel fallback was
+semantically exact: native regressions passed and the 180M replay matched display,
+EE, GS, VU and console artifacts. Despite avoiding the reciprocal for uncovered
+and GPU-admitted triangles, the tail measured18.1571FPS versus the retained
+18.8598--18.9329. The change was removed. Do not target this constructor again;
+the remaining renderer work lies in accepted GPU triangle construction/replay or
+larger state/coherence costs, not scalar interpolation preparation.
+
+### HG-LEARN-080 - Choose masked GPU RMW or page materialization by transfer size
+
+The retained per-word GPU masked path is still right for small partial PSMT8
+uploads, but the 180M scene issued 2.55B masked word updates. For complete IMAGE
+runs of at least256 qwords, materializing each physical GS page once and applying
+all ordered lane writes directly removes the host merge/index storm. Two exact
+runs preserve every retained non-RTC artifact and improve the saturated tail from
+17.35--17.41 to18.31--18.41FPS (+5.2% to+6.1%). This intentionally accepts more
+page upload/readback traffic; the saved CPU merge work is larger in this workload.
+Keep the size split, page/order/fault tests and scalar fallback. Do not generalize
+that readback is always cheaper than masked GPU writes or lower the threshold
+without adjacent evidence.
+
+When one supplied run proves a complete aligned 128x64 PSMT8 page replacement,
+old resident contents need ordering but not download. Invalidate only those old
+pages, write every byte in the host shadow, then upload the replacement normally.
+Strict guards reduced downloads from ~11.0GB to ~7.9GB and raised the tail again
+to18.86--18.93FPS with exact captures. Never use discard semantics for partial
+pages, wrapped coordinates, incomplete IMAGE runs or an unproved format.
+
+### HG-FAIL-059 - Removing both sides of repeated triangle-palette work still has too little ceiling
+
+On the exact 180M route, lazy GS-side CLUT expansion plus one versioned palette
+copy per ordered GL batch was correct and mechanically strong: triangle batches
+dropped 46,227 -> 39,848 and GL flush time dropped 10.263 -> 9.142 s. Yet the
+saturated 175M--180M interval improved only 17.3488 -> 17.5313 updates/s (~1.05%),
+far below the 5% gate. This extends HG-FAIL-042 beyond backend-only deduplication:
+even eliminating per-job zero/fill work does not address the dominant tail cost.
+Do not retry palette packing, hashes or payload thresholds without new evidence;
+target per-triangle construction/coverage or GPU per-pixel replay.
+
+### HG-LEARN-078 - Model cache index operations as cache-state transitions, not RAM traffic
+
+When a reachable EE CACHE encoding is new to the AOT decoder, derive the exact operation from the official instruction manual before assigning any host effect. `DXIN` (`CACHE` op `0x16`) clears the selected data-cache line's Lock/Valid/Dirty state while preserving LRF and requires the documented synchronization sequence. In this runtime's coherent-cache abstraction every modeled data-cache line is already invalid, clean, and unlocked, so the exact modeled transition is state-neutral: keep an explicit decoder/emitter/runtime helper, but do not turn the indexed cache operation into a RAM read/write or a generic ignored instruction. Test invalid-looking base values so accidental address translation or host-memory access faults are caught, and keep writeback/hit operations separate because those can have ordering or memory effects.
+
 ### HG-FAIL-058 - Bigger VU1 speculation window and spinning workers did not help a saturated host
 
 With ~2100 VU1 activations per gameplay frame, raising the in-flight window from 7 to 12/20 or letting workers spin 50/200 us before sleeping did not raise FPS (200 us spin cost ~8% from hyperthread contention). Workers looked ~45% busy, but the 8 logical CPUs (2 HT P-cores, 4 E-cores) already carry EE, VIF/VU, GS and worker threads. Once total busy time is near the host's real core capacity, reduce work per activation rather than adding parallelism.
@@ -479,6 +730,8 @@ The overflow-safe4-byte span guard preserved535050 value/exception comparisons, 
 
 ### HG-FAIL-029 - Guarded embedded-rounding MADD did not demonstrate a gameplay gain
 
+2026-10-25 update: the embedded-rounding path is now retired for correctness too: host IEEE adds cannot reproduce the console's one-guard-bit adder (real-PS2 captures, SOURCES.md), so `fpu_madd4_er_available()` returns false.
+
 The isolated guarded helper passed2113152 direct vectors/8452608 scalar lanes,16 MXCSR modes, boundary/exponent/signed-zero checks, exact flags and rejection atomicity. Original gameplay with the route enabled passes all established state/image hashes and864 frame-writer events, but candidate11.388375885FPS (60/5.26853s) versus subsequent disabled-route control11.401186864FPS (60/5.26261s) is essentially flat (~0.11%). This is an inconclusive performance result, not proof the arithmetic is wrong or universally slower. Keep use_embedded_rounding_madd=false; preserve helper/direct fixtures for reproducibility and the original integer/AVX2 route in gameplay. Do not re-enable unchanged on the assumption that ISA-level simplification implies end-to-end improvement. Both runs used the retained event/refresh host and143-input freshness. Evidence project-link-verifier/9e7d985c63b6448c8312d3d912fa8039 and47eac334b33a4a2b9f0a5b3acd8fce84; current exe78a0c91d.... Host fix1a122b9f... remains protected and11.4FPS qualified. This is not the rejected prepared-matrix path or a loss of the host recovery.
 
 
@@ -753,7 +1006,7 @@ keep scalarproduct/add arithmetic andoriginalfaultfallbacks.872AOTcalls changed;
 scene0.67%lower,bothpairsfaster;retainwithsmall-effect caveat. Not evidenceforbroad
 SIMDXYZ orcompoundforce-inlining. See vu-xyz-scalar artifacts andPERFORMANCE.
 
-### HG-FAIL-014 — Replacing command storage did not reduce scene wait
+### HG-FAIL-014 â€” Replacing command storage did not reduce scene wait
 
 Fresh glBufferData storage for each immutable command/tile batch preserved all
 910 GPU cases in both modes and four original captures, but warmed scene mean
@@ -761,7 +1014,7 @@ Fresh glBufferData storage for each immutable command/tile batch preserved all
 that overwriting command storage causes the wait. Keep existing sub_data path.
 Artifacts command-storage-baseline/rejected and command-storage-pair-times.json.
 
-### HG-FAIL-015 — Combining dependency clocks increased native cost
+### HG-FAIL-015 â€” Combining dependency clocks increased native cost
 
 AOT max of next issue cycle and all operand readiness timestamps preserved
 131072 randomized clock/Q/P cases and original state, but scene mean
@@ -769,7 +1022,7 @@ AOT max of next issue cycle and all operand readiness timestamps preserved
 fewer helper calls do not guarantee cheaper generated code; keep original sequence.
 Artifacts vu-pair-clock-baseline/rejected and vu-pair-clock-pair-times.json.
 
-### HG-FAIL-016 — Packed32 product normalization lacked repeatable benefit
+### HG-FAIL-016 â€” Packed32 product normalization lacked repeatable benefit
 
 Four packed32 normalization lanes after exact SSE2 24x24 multiplication passed
 295168 arithmetic cases and four original state comparisons. Warmed scene
@@ -777,7 +1030,7 @@ Four packed32 normalization lanes after exact SSE2 24x24 multiplication passed
 and whole process was slower. Reverted; keep original two64-lane normalization.
 Artifacts vu-packed-products-baseline/rejected and corresponding pair-times.json.
 
-### HG-FAIL-017 — Selective MSVC LTCG hurt gameplay throughput
+### HG-FAIL-017 â€” Selective MSVC LTCG hurt gameplay throughput
 
 /GL on generated main and VU helper sources with /LTCG preserved all four original
 states (RTC only), but warmed scene8.95825->10.5671s (+17.96%). Startup improved
@@ -786,7 +1039,7 @@ binary/map. Linker used about16GB private memory and completed; no memory failur
 Do not infer faster execution from broader compiler visibility. Artifacts
 vu-ltcg-baseline/rejected, vu-ltcg-pair-times.json and vultcg-*.
 
-### HG-LEARN-026 — Separate bulk read visibility from raster write ownership
+### HG-LEARN-026 â€” Separate bulk read visibility from raster write ownership
 
 Keep original full readback but mark only conservative clipped frame/depth pages
 writable. This avoids false dirty state without per-pixel checks.1920 page cases,
@@ -794,7 +1047,7 @@ writable. This avoids false dirty state without per-pixel checks.1920 page cases
 faster, both pairs better. Small gain; do not equate write-footprint reduction with
 readback savings. Inputs need an independent footprint proof before narrowing.
 
-### HG-FAIL-018 — Bounded raster reads saved bytes, not gameplay time
+### HG-FAIL-018 â€” Bounded raster reads saved bytes, not gameplay time
 
 Whole wrapped-texture/output page bounds passed5760 read/1920 write coverage cases,
 910 GPU comparisons and4original states (RTC only). Downloads fell~31%, but scene
@@ -805,7 +1058,7 @@ flush counts alone are not the optimization objective. Evidence raster-read-page
 raster-deferred-flush and raster-read-deferred-rejected artifacts. Retain four new
 GPU/CPU dependency fixtures; no deferred-flush API or texture-read helper remains.
 
-### HG-LEARN-027 — Exact small-integer conversion can supply packed bit length
+### HG-LEARN-027 â€” Exact small-integer conversion can supply packed bit length
 
 For post-carry addition mantissas0..2^24-1, binary32 integer conversion is exact.
 Its exponent replaces five packed normalization steps without rounding guest sums.
@@ -815,7 +1068,7 @@ fallback retained. Scope full-lane validVU MADD; not general host-float replacem
 General packed binary-normalization variant was0.65% slower, so SIMD alone was
 insufficient. Evidence PERFORMANCE and vu-add4-exact artifacts.
 
-### HG-FAIL-019 — Padding XYZ to reuse add4 did not improve the original scene
+### HG-FAIL-019 â€” Padding XYZ to reuse add4 did not improve the original scene
 
 Three scalar products plus padded packed addition preserved VU tests and4original
 states (RTC only), but scene9.4156->9.47435s (+0.62%), both pairs slower. Reverted
@@ -956,3 +1209,18 @@ Two low-level candidates preserved the fixed gameplay verifier but failed to cle
 ### HG-LEARN-054 - Keep source portable to GCC/Clang pp-number and target-attribute rules
 
 MSVC accepts `0x4e+context`, but GCC/Clang lex it as one invalid preprocessing number because hex digit `e` followed by `+`/`-` looks like an exponent. Put spaces around `+`/`-` after any hex literal ending in `e`/`E` (grep `0[xX][0-9a-fA-F]*[eE][+-]`). GCC lambdas also do not inherit a surrounding `__attribute__((target("avx2")))`, so always-inline AVX2 helpers called from lambdas fail to inline; compile AVX2-only, CPU-guarded dispatch files with per-file `-mavx2` (mirroring MSVC `/arch:AVX2`). Evidence: 2026-09-28 Debian trixie GCC build of the base runtime and full `hg_game`.
+
+### HG-LEARN-079 - Compress queued renderer state across draws, not just the raster swap
+
+The exact 180M route rasterizes 61,992,917 primitives.  Replacing each draw's
+1 KiB GS-register snapshot with one base plus ordered register deltas, and carrying
+a persistent replay cursor across raster service calls, improves the final heavy
+interval repeatably from 16.1883 to 17.4105/17.3488 updates per second while all
+retained frame, EE, GS VRAM/state, VU and console captures remain byte-identical.
+The earlier selected-register swap was flat/regressive because it left snapshot
+construction/storage intact and added per-draw swapping.  Delta replay must be
+strictly linear: restarting from the base at every service call creates quadratic
+stage-C stalls.  Keep large working snapshots heap-backed with deep-copy value
+semantics; placing two more 1 KiB arrays inline overflowed the monolithic GIF test
+stack frame.  This removes a measured structural renderer cost but does not alone
+reach 30 FPS; current evidence remains about 17.35--17.41 in the worst interval.

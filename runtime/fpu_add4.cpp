@@ -40,18 +40,21 @@ const bool er_available=[] {
     return false;
 #endif
 }();
-constexpr bool use_embedded_rounding_madd=false; // Experimental route disabled: no demonstrated qualified FPS gain.
+constexpr bool use_embedded_rounding_madd=false; // Retired: host IEEE adds do not match the measured hardware add.
 }
 bool try_fpu_transform(const std::array<const std::uint32_t*,8>& sources,const std::array<std::uint32_t,4>& point,VuTransformResult& result) {
     if(!available)return false;
     fpu_transform_avx2(sources,point,result);return true;
 }
-bool fpu_madd4_er_available() noexcept {return er_available;}
+// The AVX-512 embedded-rounding MADD used host IEEE round-toward-zero adds, which the
+// 2026-10-24/25 real-PS2 captures show differ from the hardware's one-guard-bit add;
+// it is retired (always unavailable) rather than kept as a mismatching path.
+bool fpu_madd4_er_available() noexcept {return false;}
 bool try_fpu_madd4_er(const std::array<std::uint32_t,4>& a,std::uint32_t b,
                       const std::array<std::uint32_t,4>& acc,std::array<std::uint32_t,4>& result,
                       unsigned& under,unsigned& over) noexcept {
-    if(!er_available)return false;
-    return fpu_madd4_er_impl(a.data(),b,acc.data(),result.data(),under,over);
+    (void)a;(void)b;(void)acc;(void)result;(void)under;(void)over;
+    return false;
 }
 bool try_fpu_add4(const std::array<std::uint32_t,4>& a,const std::array<std::uint32_t,4>& b,
                   std::array<std::uint32_t,4>& result,unsigned& under,unsigned& over) {

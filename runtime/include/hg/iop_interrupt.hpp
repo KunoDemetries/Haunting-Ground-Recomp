@@ -1,11 +1,15 @@
 #pragma once
 #include "hg/iop.hpp"
 namespace hg {
+// A runnable worker paused at a quantum boundary with interrupts masked
+// (locked_thread) still owns the CPU: the outer idle context's enable flag
+// must not let an asynchronous handler run inside its critical section.
+inline bool iop_cpu_interruptible(const IopState& s) {return s.interrupts_enabled && !s.locked_thread;}
 // Native cooperative IRQ entry: save the full guest CPU context, run only AOT
 // code, and restore the interrupted context after a normal handler return.
 template<class Run>
 bool service_iop_dma_interrupt(IopState& s,Run run) {
-    if(!s.interrupts_enabled)return false;
+    if(!iop_cpu_interruptible(s))return false;
     // Exact DMAC interrupt routes exercised by the retained devices.  LIBSD
     // registers 36/40 for SPU2 channels 4/7; SIFMAN registers 42/43 for SIF
     // channels 9/10.  Keep this table explicit until another channel is proven.
@@ -37,7 +41,7 @@ bool service_iop_dma_interrupt(IopState& s,Run run) {
 template<class Run>
 bool service_iop_cdvd_interrupt(IopState& s,Run run) {
     constexpr unsigned irq=2;constexpr std::uint32_t return_pc=0x1f0010;
-    if(!s.cdvd_irq_pending || !s.interrupts_enabled || !(s.interrupt_mask&(std::uint64_t(1)<<irq)))return false;
+    if(!s.cdvd_irq_pending || !iop_cpu_interruptible(s) || !(s.interrupt_mask&(std::uint64_t(1)<<irq)))return false;
     const auto handler=s.interrupt_handlers[irq];
     if(!handler.registered)throw IopFault(s.pc,"CDVD completion has no registered IOP interrupt handler");
     const auto registers=s.gpr;const auto pc=s.pc,hi=s.hi,lo=s.lo,pending=s.pending_value,next=s.next_value;
@@ -54,7 +58,7 @@ bool service_iop_cdvd_interrupt(IopState& s,Run run) {
 template<class Run>
 bool service_iop_sio2_interrupt(IopState& s,Run run) {
     constexpr unsigned irq=17;constexpr std::uint32_t return_pc=0x1f0010;
-    if(!s.sio2_irq_pending || !s.interrupts_enabled || !(s.interrupt_mask&(std::uint64_t(1)<<irq)))return false;
+    if(!s.sio2_irq_pending || !iop_cpu_interruptible(s) || !(s.interrupt_mask&(std::uint64_t(1)<<irq)))return false;
     const auto handler=s.interrupt_handlers[irq];
     if(!handler.registered)throw IopFault(s.pc,"SIO2 completion has no registered IOP interrupt handler");
     const auto registers=s.gpr;const auto pc=s.pc,hi=s.hi,lo=s.lo,pending=s.pending_value,next=s.next_value;
@@ -71,7 +75,7 @@ bool service_iop_sio2_interrupt(IopState& s,Run run) {
 template<class Run>
 bool service_iop_timer_interrupt(IopState& s,Run run) {
     constexpr std::uint32_t return_pc=0x1f0010;
-    if(!s.interrupts_enabled)return false;
+    if(!iop_cpu_interruptible(s))return false;
     for(unsigned timer=0;timer<6;++timer) {
         const unsigned irq=timer<3?timer+4:timer+11;
         if(!(s.timer_irq_pending&(1u<<timer)) || !(s.interrupt_mask&(std::uint64_t(1)<<irq)))continue;

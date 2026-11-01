@@ -1,3 +1,2160 @@
+## 2026-10-31 Sources published
+
+User asked to push all sources to the public repo KunoDemetries/Haunting-Ground-Recomp. Checked first: no game files, binaries or credentials in the tree or history. README got a current status section. Build upload NOT done: the repo is public and hg_game.exe contains the translated game code; awaiting the user's decision. Audio next step: redo the PCSX2 L/R and input-ring poll with word decoding (struct.unpack of pine.block); ours in boot music: input ring readable median ~0xdec, max 0x3648.
+
+## 2026-10-25 IOP scheduler: THREADMAN owner rule (removes the boot-music right-ear static)
+
+Root cause of the first static episode found with the trace build (`build-trace/`, `-DHG_EE_INSTRUCTION_TRACE=ON`, HG-DIAG-132): the IOP's free-space reports differ per channel at slice 23,612,830 (L gets (0xea140,0x800), R (0xee240,0x400) at the same ring offset; reports round to 0x400), i.e. CRI's report thread (IOP thread 17, writer 0x17c40) ran between its copy thread's (thread 19) left and right block copies. Both threads have priority 39, and `service_iop_thread` rotated equal-priority ready workers every quantum (time slicing), which THREADMAN never does. Fix (`iop_thread.hpp`, `IopState::owner_thread`): the last dispatched worker keeps the CPU while ready, not yielded and no strictly higher-priority worker is ready; blocking, ExitThread and threadman_reschedule release it. Results: boot music input stream right-channel steps 1,436 -> 0 in 40 s (left 0 -> 0); ctest all pass except the known gif check; iop_tests pass. Remaining: in session 2's replay a second track (~197.5 M slices) still diverges L/R (late ring objects 0x3cffe8 L / 0x3d0028 R, R +0x14/+0x18 = 0x10c0), 1,569 R steps in 258 s; trace build (with HG-DIAG-132 IOP logging, `HG_IOP_PC_LOG=1` + `--watch-iop-pc`) shows this is a different cause: around 197.50-197.59 M slices the IOP copy thread (19) feeds the SPU2 DMA buffers from CRI's fixed buffer 0x1c9b0 (underrun path, ring empty) while the EE movers move 0 bytes (EE ring empty: the decoder fell behind at the second track's start); after the underrun the IOP reports arrive for R only (197,537,361 and 197,570,574) and L/R stay out of step. Root of the underrun (EE decode / disc-stream timing at track change) still to be found; PCSX2 comparison of the same track change needed. ADX input ring object 0x3cffa8 (base 0x18c0800, size 0x1a800, mirror 0x24) in that session holds only 0x2200-0x5140 readable bytes and grows by ~0x240-0x480 per ~16.7k-slice cycle, close to the playback consumption (~900 B per 1/60 s for 48 kHz stereo ADX), so the stream never builds a cushion and any hiccup underruns. Our CDVD reads complete when requested (no seek/speed model), so the throttle is in how often/how much CRI's stream requests read; next: trace the CRI stream read requests (sceCdStRead/ReadDvd sizes and cadence) and compare the input ring fill level with PCSX2 at a comparable moment. Section checks vs PCSX2 with the new scheduling (`%TEMP%/hg-saves/check/all12-owner.txt`): all 12 slots MATCH(float-drift) at frame 3000, frame diff <=0.1%. Build 4 (`builds/build4-2026-10-26`, game files included, Settings.cmd device Arctis Nova 7X, boot-tested) carries the fix.
+
+## 2026-10-25 Right-ear music static: located in the CRI ADX ring mirror (fix in progress); WASAPI output; build 3
+
+User: crackle/static in the music, right ear. Evidence chain (all offline-reproducible from boot, slot card):
+- Loopback recording tool (scratch `loopback.cpp`, WASAPI loopback of every render endpoint): waveOut/WASAPI straight to the Arctis headphones arrive bit-exact vs the game's stream (corr 1.0000); the Sonar Gaming endpoint (96 kHz 8 ch) adds processing. Added `HG_AUDIO_DEVICE` (device-name choice), `HG_AUDIO_API=wasapi` (WASAPI shared mode, AUTOCONVERTPCM; COM objects created on the audio-feeding thread - creating them on another thread deadlocked), `HG_AUDIO_BUFFER_FRAMES`, HG-DIAG-127 (live underrun log, 0 underruns seen), HG-DIAG-128 (exact submitted-PCM dump).
+- The static is in the game's own mix, right channel only: the raw SPU2 core-0 input stream (CRI ADX music) has 1,436 steps in 40 s on R, none on L; PCSX2 over the same music: 0 steps (headphone loopback of PCSX2 pointed at the Arctis via its ini, restored afterwards). So it is ours.
+- Each glitch = the first 96 samples of a 256-sample input half, every 16,384 samples, holding R data from two laps earlier. EE side (CRI on EE decodes, SIF1 sends L/R chunk pairs to IOP rings 0xe9540/0xed640, 16 KB each): the EE ring objects are at 0x3d0128 (L, ring 0x1078a80) and 0x3d0168 (R, ring 0x107cb40), size 0x4000, mirror 0xc0 bytes after each ring end; the ring commit routine (EE 0x1e34f0, IOP twin 0x15c98) copies data written into the first 0xc0 bytes to the mirror. In ours the R object's positions drift to an 0xc0 offset (+0x0c/+0x10/+0x14 = 0x18c0/0x1f40/0x2cc0 vs L's 0x400 multiples) from ~24 s, so R chunks never start at ring offset 0, the R mirror (0x1080b40..) is never refreshed after slice 23,629,413 (L's keeps refreshing), and transfers that read through the mirror send stale bytes. PCSX2's L/R objects carry identical, 0x400-aligned counters once the music settles (both show a transient 0xc0 offset at music start). Narrowed further (HG-DIAG-131, multi-word): all ring calls run sequentially on EE thread 4 (no race). Per ~16.7k-slice cycle: request write window (0x1e3458 sets +0x18, 0x1e3464 lowers +0x0c), decoder fills, return-unused (0x1e3804/0x1e3818, which checks (pos+size-len)%size == (ptr-base)%size with div/div1 - verified translated correctly), commit (+0x10). First asymmetry: slice ~23,629,420, both rings granted 0x34c0 from position 0xc00 (window ends exactly at ring end + mirror), left returns 0x2cc0 unused (used 0x800), right returns 0x30c0 (used 0x400); from then R's positions carry the 0xc0 offset and its mirror is never refreshed. The ADX stereo decode loop (0x1c7e38..0x1c7fbc, mult/mult1/madd, L via t9, R via t0) writes both channels the same frame count, so the asymmetric 'used' length comes from the per-channel bookkeeping between decode and return (caller of 0x1e3660 with the descriptor at s1). Deeper (same session): the per-channel 'used' length comes from the mover at EE 0x1d9d40 (one per channel: L 0x3c3cd0, R 0x3c3d10). It moves min(EE-ring readable, IOP free space) rounded down to the unit at mover+0x38 (0x400) from the EE ring (+4: ring object) into IOP ring space (+8: chunk queues 0x3d4040 L / 0x3d4070 R, vtable 0x3d3fa8, nodes 0x3ccc60 / 0x3ccd60 holding IOP ring {ptr,len} free chunks reported back by the IOP). The asymmetry starts at slice 23,612,831: the right queue's chunk return (EE 0x1e42f8 via 0x1e41e4) is processed alone; the left's, which had always happened in the same slice, does not. After that R holds (0xee240,0x400) where L holds (0xea140,0x800), R moves 0x400 where L moves 0x800, R positions take the 0xc0 offset and the R mirror is never refreshed. PCSX2 L/R counters matched in 5 word reads 5 s apart; a later "45 s, 3,010 samples, never differ" poll was INVALID (pine.block returns bytes, so it could not flag a difference; retracted 2026-10-31, redo pending). Probable root: ordering of IOP-side free-space reports vs. our SPU2 input DMA completion timing (our input DMA copies a whole 1 KB L/R half instantly at the half boundary); not an instruction mistranslation (div/div1, mult, ring arithmetic checked). The legacy clock profile never starts the music within 56 s, so it cannot be used to compare. Next: trace the IOP side of the reports (who frees L/R space in the IOP rings and when relative to the SPU2 input DMA completion), and the caller that builds the return descriptors (find via the decode function's caller chain) and compare its per-channel pointer math at the ring-end boundary; a mistranslated instruction there (64-bit/32-bit, MMI, or a branch-likely) is the leading suspect since PCSX2 keeps L/R identical.
+- Build 3 (`builds/build3-2026-10-25`): Settings.cmd `HG_AUDIO_DEVICE=Arctis Nova 7X` bypasses Sonar; does not fix the right-ear static (it is in the mix).
+
+## 2026-10-25 Divider structure found; COP1 DIV.S rounds to nearest; third (structured) capture ready
+
+Divider (SOURCES.md 2026-10-25): DIV.S/VU DIV form a 25-bit inner quotient of the unnormalized significands (floor or floor+1) and truncate it (one bit dropped when ma >= mb, none otherwise); SQRT likewise has one extra bit then truncation. The inner digit rule is still unfitted: radix-2 SRT (exact or carry-save, constant or per-divisor thresholds, several variants), radix-4 {-3..3} exact, estimate-corrected and reciprocal models all fail on simple divisors (best ~90%). PCSX2 measured with our capture programs: COP1 DIV.S and SQRT.S round to nearest, MUL chops, VU0 DIV/SQRT chop. Against 32,768 hardware quotients nearest matches 85%, chop 60%, so `Fpu::divide(a,b,nearest)` now rounds to nearest for COP1 DIV.S (`div_float`); VU0/VU1/VIF divides keep chop (= PCSX2). fpu_tests cover the nearest path. `tools/hwtest/struct_capture.c` (STRUCT.BIN, 58,794 structured div/sqrt/mul/rsqrt records) builds and dry-runs in PCSX2 (user's slot-1 card backed up and restored byte for byte); `tools/hwtest/analyze_struct.py` summarizes it. Slot 07 rerun: Hewie drift unchanged (0.003 at frame 2100). Exact bisection (section_check at frames 80-90) puts the first difference at frame 86: Hewie's path-point array (+0x274.., written by the Hermite spline at PC 0x1a92e8 during frame 85) has x one ulp off. PCSX2 DebugServer reads at that store (registers + stack) show the spline's arithmetic agrees; its input point P0.x (sp+0x160, a VU0 vector, sqc2-stored, invisible to PCSX2 memchecks) already differs. Cause: PCSX2's VU0 add is exact-sum-then-chop, the console's keeps one guard bit (our default, hardware-exact). Opt-in HG-DIAG-126 `HG_PCSX2_VU0_ADD=1` mirrors PCSX2 for oracle comparisons; `fpu_vector_check <dir> RESULTS.BIN VU0.BIN` validates both (PCSX2 file: exact-chop 0 mismatches; hardware file: default add 0 mismatches). Tooling: `%TEMP%/hg-saves/check/{findwriter,atwriter,writers}.py` (PCSX2 write-break helpers; restart PCSX2 if a script leaves it paused). Result with `HG_PCSX2_VU0_ADD=1`: our Hewie at frame 90 becomes PCSX2's exact value (0xc29f6608; 0xc29f660c without it). Slot 07 at frame 2100: Fiona and Hewie objects bit-identical (all words). Slot 07 at frame 5000: still bit-identical, and the stalker (previously diverging at the frame-3665 summon room choice) matches: room 105 at (-74.88, -66.88, 2.145) on both sides. Remaining differences are not game logic: the 'pursuer' slot (0x44F828) holds stale memory (same words differ at frame 2100, before any stalker; the live stalker in slot 2 matches), and sound/ADX words are handle counters and IOP buffer addresses that depend on boot history (PCSX2 starts from a savestate, ours boots fresh). So the remaining slot-07 drift was entirely PCSX2's non-hardware VU0 adder; the default build keeps the console's adder. Caveat: right after a fresh PCSX2 start the oracle twice reached a different state (Fiona x 52.04 instead of 67.74 at frames 1085/2100); a warm PCSX2 instance gives the stable result, so start PCSX2 once and reuse it. Output: `%TEMP%/hg-saves/check/f5000-profile.txt`. All 12 slots with the profile at frame 3000 (`%TEMP%/hg-saves/check/all12-profile.txt`): MATCH(float-drift) everywhere, Fiona/Hewie objects bit-identical in every slot, frame difference <=0.1%; remaining: stale pursuer slot, sound/ADX handle counters, SNDDRV words. SNDDRV analysis: most differing words are its command ring (0x12700-0x13300) and voice-allocation order (history/timing). One systematic pattern: SNDDRV's ENVX copies (+0xF72C) are often exactly 0x7FFF/0x3FFF in ours and slightly lower in PCSX2 (106 halfwords over 9 slots). HG-DIAG-121 now prints ADSR1/ADSR2: those voices use ADSR2 0x5FEF/0x5FCF/0x5FC0 = sustain linear decrease with rate 0x7F. psx-spx (hardware-tested on the PS1 SPU) says rate 0x7F never steps, which is what we implement; PCSX2 decays slowly. Kept ours; the PS2 SPU2 behaviour for rate 0x7F is unmeasured (candidate for a future hardware capture via an IOP-side probe). The game keys these voices off explicitly (release phases seen), so audibly this only affects how a held note's level drifts before key-off. User chose to fold an SPU2 envelope probe into the same capture: `tools/hwtest/spu2probe/` (IOP module, ROM LIBSD, results by SIF DMA) embedded in `struct_capture` via bin2c (`make EE_BIN=struct_capture.elf EE_OBJS="struct_capture.o spu2probe_irx.o"`). PCSX2 dry run: 58,794 float records + 900 key-on + 576 key-off samples; slot-1 card backed up/restored byte for byte. `analyze_struct.py` prints the envelope summary. User's STRUCT.BIN analysed (SOURCES.md "Third real-PS2 capture"): SPU2 rate 0x7F (and all of shift 0x1F) never steps on the console (PCSX2 wrong); new hardware rules implemented in `spu2_voices.hpp` - decay checks sustain only after an applied step (level 0x7FF7 after attack/decay at sustain level F, like the console), linear release may read negative for one sample, shift 0x1F frozen for every step value; `spu2_voice_tests` extended and passing. MUL: Booth + carry-save tree with the low-column carry dropped at column 17 fits 99.3% (all structured cases), wiring still open; chop kept. DIV: sweeps confirm path dependence; rule still open. Rebuilt with the SPU2 fixes (iop_tests, spu2_voice_tests pass); 12-slot regression interrupted after slot 01 (MATCH) so the user could play - rerun it when nobody is playing. User play test 2026-10-25 20:12 (session saved: `%TEMP%/hg-saves/session-20261025/` input-events, log, card copy): reported Hewie disappearing, squeaks, delayed audio, uneven FPS, control desync. The whole session ran alongside the PCSX2 check + a second hg_game (CPU contention; video-rate log 17-40 produced frames/s) - likely cause of FPS/audio-delay/input drift and live-playback squeaks. Offline replay of the session's inputs (deterministic) with `--spu2-mix-wav`: no clicks or discontinuities in the synthesized mix (largest sample jumps are ordinary content). Hewie (0x16BE3C0) stays in Fiona's room 0x5C for the whole session at 4-114 units, never leaves; no on-screen dropout identified yet. Retest with nothing else running: Hewie fine; music sometimes gets loud and crackles. Portable recorder build for another PC (first made in Documents, then superseded and removed when the user asked for builds in `builds/` with game files included: `builds/build2-2026-10-25/`, 4.4 GB, Play.cmd records every session to `Documents\Haunting Ground Recordings\<stamp>\`). Original Documents package: hg_game.exe (current build), app-local MSVC runtime DLLs (msvcp140, vcruntime140, vcruntime140_1 from VS Redist 14.51), toc.bin, a copy of the user's memory card, `PLAY_AND_RECORD.cmd` and README; the user adds SLUS_210.75, MODULES and the ISO from their own dump. Each session records to `Documents\Haunting Ground Recordings\<stamp>\` (input-events flushed per change, card-at-start snapshot, log, F5 checkpoint); the game refuses logs under its working folder (repo guard), hence Documents. Tested from the package folder via a temporary junction to the dump (removed afterwards). Music crackle: user hears LOUD crackling live (build2 boot test too). Offline mixes are clean (boot: silent to 22 s then music peak ~5,000, no spikes; session 2: one 0.5 s burst of sharp transients at 236.7 s inside a loud noise-like sound effect). New HG-DIAG-127 logs host speaker underruns live: 0 underruns in a 40 s boot, steady 30 fps. So the generated mix is clean and the queue never starves; next: confirm with the user whether that 40 s test crackled, then examine the host waveOut path (buffer reuse, device format/rate) rather than synthesis. Then: if Hewie vanishes again, press F5 at that moment (checkpoint = exact replay point) so the frame can be reproduced.
+
+## 2026-10-25 VU0 capture: one shared adder for FPU and VUs; drift vs PCSX2 shrinks again
+
+VU0.BIN (SOURCES.md 2026-10-25): VU0 add/sub/madd follow the FPU's one-guard-bit add; VU0 MUL, DIV (Q) and RSQRT (Q) equal the FPU's. `Fpu::add` is now the measured adder for every caller (COP1, VU0 macro, VU1, VIF), `add_cop1` removed; `fpu_add4_avx2.cpp` add4_impl implements the guard bit (bit length taken from m>>1 so the int->float conversion stays exact; m==1 handled). AVX-512 embedded-rounding MADD retired (always unavailable). dmac_tests/gif_tests got a 32 MB stack (MSVC) after 0xC00000FD start-up overflows; ctest: all pass except the known gif FLUSH/host_vu_stalled check (pre-existing, also in v1). fpu_tests/runtime_tests/translation_tests pass; fpu_vector_check: every captured add/sub (36+16,384 each) and MADD-with-hardware-product matches. Slot 07 at frame 2100: Fiona's cos words now equal PCSX2's (her object differs in 1 word), Hewie drift 0.003 (was 0.009, originally 0.014). Remaining hardware gaps: MUL (exact or -1), DIV/RSQRT (exact or +1), SQRT (nearest or -1) - rules still to be fitted (SRT model next). PCSX2 itself is not hardware-exact for these, so the oracle comparison can't reach bit-exactness there; hardware captures are the reference.
+
+## 2026-10-24 Stalker divergence pinned to the summon room choice; second hardware capture ready
+
+With the hardware add, slot-07 at frame 5000 still diverges. Frame-by-frame traces (ours: `HG_WATCH_WORDS`/`HG_WATCH_EVERY` with HG-DIAG-124; PCSX2: `tools/oracle/watch_trace.py`; the oracle load now verifies Fiona's room and retries, since menu presses are sometimes dropped) show the summoner firing on the same frame (~3665) on both sides but bringing the stalker into room 0x59 in ours and 0x6A (next to Fiona's 0x69) in PCSX2, which then reaches Fiona by ~3850. RNG state was equal at 3700, so the candidate rooms differed: most plausibly door state touched by Hewie, whose position still drifts (0.009 at f2100 after the add fix, was 0.014). Fiona's cos still differs 2 ulp: the remaining drift likely comes from VU0 macro arithmetic, whose adder still uses the pre-capture rule (only VU0 MUL was measured). `tools/hwtest/vu0_capture.c` (16 words/case: VU0 vadd/vsub/vmadd(ACC)/vmul, VU0 DIV/SQRT/RSQRT via Q, FPU RSQRT.S, more MUL/DIV; VU0 ops get |b|) builds and dry-runs in PCSX2 (`mc0:/HGFPU/VU0.BIN`, 1,048,576 bytes; user's PCSX2 slot-1 card restored). Waiting for the user's hardware VU0.BIN.
+
+## 2026-10-24 Real-PS2 capture analysed: COP1 add fixed exactly; MUL/DIV/SQRT rules open
+
+User ran `fpu_capture` on their PS2 (SOURCES.md 2026-10-24). Exact result: COP1 ADD/SUB keep one guard bit -> `Fpu::add_cop1` (16,384/16,384 adds and subtracts; MADD = hardware product + this add, 16,384/16,384), used by add_float/sub_float/adda and madd/msub; VU paths unchanged pending VU data. fpu_tests gained five captured add cases; fpu_tests, runtime_tests, translation_tests pass. Our previous add differed from hardware in ~18% of mixed-sign cases, the main source of last-bit drift (PCSX2's add already matched the hardware). Open: MUL (exact or -1 ulp; best structural model 265/32,768 off), DIV (exact or +1), SQRT (nearest or -1). Next: rebuild, rerun the slot-07 stalker comparison (vs PCSX2 our add now agrees; MUL equal (both exact-chop); DIV/SQRT may still drift), then design a second capture with structured inputs (one operand fixed, the other sweeping bit patterns) to isolate the multiplier's partial-product structure.
+
+## 2026-10-23 Real-PS2 float capture program ready (user has a homebrew-capable PS2)
+
+`tools/hwtest/fpu_capture.c` (our program; ps2sdk via user-approved Docker image `ps2dev/ps2dev:v2.0.0`, `tools/hwtest/Makefile`; build outputs ignored) runs 16,384 cases and writes `mc0:/HGFPU/RESULTS.BIN` (786,432 bytes; 12 words/case: a, b, c, mul(a,b), mul(b,a), div(a,b), madd(acc=c), VU0 vmulx.x, d, add(a,d), sub(a,d), sqrt|a|; inputs from fixed mantissa classes + xorshift, recorded in the file). Uses only ROM SIO2MAN/MCMAN/MCSERV and libmc. Dry-run in PCSX2 with a formatted slot-1 card: DONE, file extracted with tools/saves/mcinject.Card (user's PCSX2 Mcd001 backed up as Mcd001.ps2.before-fpu-capture-20261023.bak and restored; their PCSX2 slot-1 card reports unformatted). `tools/hwtest/analyze.py RESULTS.BIN` compares with our model and fits the Booth multiplier family. PCSX2 (default settings) result: multiply = exact chop and symmetric (unlike the hardware vectors, so PCSX2 is not hardware-exact for MUL); add/sub differ from our add in ~18% of cases (PCSX2 = exact subtract then chop; ours = chop the aligned operand first, per the EE manual and matching all 36 hardware add/sub vectors) - the likely source of the last-bit drift vs PCSX2. Waiting for the user's hardware RESULTS.BIN; then fit T (candidates predict 1.8k-16k mismatches each, so one should fit exactly), fix MUL/MADD/MSUB/DIV, check add/sqrt/VU0, rerun the section checks.
+
+## 2026-10-23 Stalker scenario: divergence traced to last-bit float drift; hardware FPU vectors
+
+Stalker coverage: slot 2 holds one of seven stalker classes in most saves (vtables 0x470A90, 0x46F020, 0x477AE0, 0x46F6B0, 0x4738A0, 0x4715C0, 0x4718F0); the summoner (SceneGame 0x888440 +0x7A4, lead from OpenHuey summoner.md) counts a time away (slot 07: 664 frames left at frame 3000). The section check now tracks `stalker` (room/position/yaw when slot 2 holds a known class) and the summoner object, and scales the oracle deadline with the target frame. Slot 07 at frame 5000: PCSX2's stalker entered Fiona's room (105) and Hewie ran to him; ours had not placed him. Bisection: summoner state and RNG equal through 3600; Hewie's object differs only in float values, growing (0.007 at f1200, 0.014 at f2100, 0.23 at f3000) until his movement decision splits at ~f3200-3400; the stalker outcome follows. So long-horizon 1:1 depends on bit-exact float rounding. Hardware evidence (SOURCES.md 2026-10-23, `tools/fpu_vector_check.cpp`): add/sub/sqrt now match all captured vectors (sqrt(-0) = +0 fixed in `Fpu::sqrt_exact`, fpu_tests updated); MUL/MADD/MSUB (3 vectors each) and DIV (1) differ: the hardware multiplier is inexact and operand-order dependent, but the vectors fit a whole family of models, so no change was made. Settling it needs more hardware results (e.g. a PS2 running a vector-capture homebrew); PCSX2 is not a hardware reference for these bits.
+
+## 2026-10-22 Long idle check (frame 3000, ~100 s after load), slots 06-12
+
+`HG_CHECK_LIMIT=160000000 HG_CHECK_FRAME=3000 python tools/oracle/section_check.py 6 ... 12`: frames identical in all; Fiona exact everywhere; Hewie exact or within 0.05 except slot 07 (0.23 units after ~100 s of wandering: the last-bit float drift growing, not a new divergence). No stalker became active in any of these rooms within 100 s (pursuer slot never valid), so stalker behaviour still needs a save taken during an encounter or a scripted route into one. PCSX2 closed after the run (section_check relaunches it; savestate 9 remains the start point).
+
+## 2026-10-22 Scripted walk per section: all 12 saves still match PCSX2
+
+`HG_CHECK_WALK=1 python tools/oracle/section_check.py 1 ... 12`: left stick up held from game frame 300 to 360 (ours: HG-DIAG-125 `--input-on-ee-word 0xFC7280`; PCSX2: key posted while the DebugServer holds the EE at that frame's counter write), compared at frame 450 at the identical instruction. All 12 `MATCH(float-drift)`: frames identical, Fiona/Hewie positions exact in 9 slots and within 0.05 in 3 (float drift). Slot 07 sanity: Fiona walked from (67.74,-111.67) to (75.0,-84.65) on both sides. Remaining SNDDRV words (~300/slot) are mostly the MIDI message rings at +0x12700..0x13300: same controller messages one or two entries out of phase (channel 0 vs 2), i.e. a different count of queued sequencer messages since boot, not different music. No stalker was present in these rooms at load (pursuer slot not valid), so chases are not yet covered. Next: a scenario with a stalker (save near an encounter or a longer scripted route), and a listening check of the envelope fix by the user.
+
+## 2026-10-22 All 12 section saves: gameplay state matches PCSX2 at frame 450
+
+`python tools/oracle/section_check.py 1 ... 12` after the OPMSUB and envelope fixes: every slot `MATCH(float-drift)`: identical frame image, Fiona and Hewie room/position/yaw exact in 11 slots and within 0.05 in slot 12. Remaining object-level differences, classified: (1) last-bit float drift inside actor objects (see slot 12 entry; hardware-undecidable); (2) IOP kernel handle numbering: sound +0x6C..0x78 and ADX +0x128 are thread/semaphore ids assigned at initialisation (PCSX2 jumps straight to 29/30 about 4 s after boot because its BIOS kernel already created ~28 objects; ours start at 4/5); the game only passes them back, so no behavioural effect; (3) further SNDDRV words (~300 per slot; e.g. the command/id ring at +0x12BA8) to be reduced by excluding handle-valued fields before treating any as behavioural. The bank table that differed at the title (C_0000 vs TITLE current) matches in gameplay.
+
+## 2026-10-22 Audio bug found by the section check: SPU2 envelopes froze at 0FFFh
+
+The section check's new IOP comparison (SNDDRV located by its code bytes in both IOP images; data/BSS compared, IOP addresses ignored) showed the synthesizer's per-voice status buffer (SNDDRV+0xF6C0 area: 24 state bytes at +0xF6FC, 24 envelope halfwords at +0xF72C, filled from ENVX) holding exactly 0FFFh/7FFFh/3FFFh in ours where PCSX2 had decaying levels (0005h, 0002h...). `HG_STOP_SPU2=1` (prints our core ENVX at the HG-DIAG-124 stop) confirmed the array mirrors ENVX and that core-0 music voices 0,1,5,6,20 sat at 0FFFh. Cause: `Spu2Voices::envelope_step` scaled exponential decreases with C division (`step*level/0x8000`), which rounds the negative product toward zero, so the step became 0 once level < 1000h with step -8: released voices never ended (kept sounding faintly and stayed busy for SNDDRV/modhsyn voice allocation). Fix: arithmetic shift (`(step*level)>>15`, rounds down), consistent with PCSX2's levels continuing below 1000h. New spu2_voice_tests cases (exponential decrease from 0FFFh reaches 0 at shifts 0 and 15); spu2_voice_tests and spu2_tests pass. Slot 07 after the fix: voice envelopes track PCSX2 (2522h vs 2513h, 27A1h vs 2797h; small release-timing gaps). Open: voices held at sustain rate 7Fh stay 7FFFh in ours but creep down in PCSX2 (psx-spx calls rate 7Fh infinite; hardware unverified); SNDDRV id/command ring (+0x12BA8) and boot-time sound counters still differ (boot sound history: PCSX2 shows TITLE bank as current and ADX count 29 at the title, ours C_0000 and 4). Likely relevant to the user's random audio problems in later areas; needs a listening check.
+
+## 2026-10-22 Section check now compares at the identical instruction; audio/stalker state added
+
+Read alignment fixed: our build checks the HG-DIAG-124 stop word every slice and reports the stop PC; the oracle pauses on the game's counter write via the PCSX2-MCP DebugServer (127.0.0.1:21512, newline JSON; `set_memcheck` write-break fires before the store at 0x3A19A8, one frame = 9.84M EE cycles), then runs to our stop PC with a temporary breakpoint (`tools/oracle/pcsx2_drive.py Debug`). Slots 07/12 now line up field for field (current and previous positions). What remains in every compared slot is last-bit float drift (Hewie a few-200 ulp, Fiona's yaw cosine 2 ulp); PCSX2 is configured FPU/VU Roundmode 3 (chop), like our FPU, but computes on host IEEE hardware, so the hardware-exact side is unknown (see ORACLE.md SQRT note). The earlier 2-decimal MATCH lines hid this drift. Added objects: pursuer (only when its vtable is a known pursuer class, 0x469D10), sound driver (*0x44E560), music (*0x44E970), ADX (*0x44E980). Sound/ADX differ already at the save-list screen (sound +0x6c..0x78 ids 5-8 vs 30-33, +0x7c.. buffer addresses 0x126E00.. vs 0xE3C00..; ADX +0x128 4 vs 29): consistent with different boot histories (the PCSX2 savestate session sat through the opening movie/attract loop), not yet a demonstrated bug. Next: drive both boots with identical frame-timed inputs (apply input at game-frame counts on both sides) so history-dependent audio state is comparable; then treat float drift with a tolerance and integers exactly.
+
+## 2026-10-22 Slot 12 bisected: last-bit float difference vs PCSX2 (not decidable without hardware)
+
+Bisection with `HG_CHECK_FRAME`: slot 12 equal at frames 60/200/325/390/410/430/440/445/448 on the compared fields, different from 449-450 (Hewie starts walking at ~440). Whole-object comparison (`HG_CHECK_DETAIL=1`, batched PINE reads, `tools/oracle/pcsx2_drive.py Pine.block`) shows two things: (1) a read-timing artifact: PCSX2 is read just after that frame's actor update (its Hewie +0x40 previous position equals our +0x10 current), so moving actors compare one frame apart; (2) real least-significant-bit differences already present: Fiona +0x60 (cos of yaw -0.959, rotation matrix) 0x3f12f9ba ours vs 0x3f12f9b8 PCSX2 (2 ulp), Hewie position low bits. The cosine comes from the game's MSL `cosf` (lead from OpenHuey symbols: 0x31C058, fdlibm-style kernels). Our FPU follows the EE manual (round toward zero, p164) and PCSX2 uses host arithmetic, so neither is proven hardware-exact (same status as the SQRT profile in ORACLE.md). Recorded as an open last-bit question, not a bug; a hardware reference would settle it. Next: align PCSX2 reads before the actor update (or compare our frame N against PCSX2's previous-position fields), then add audio and stalker state and a short scripted walk per slot.
+
+## 2026-10-22 Section check found and fixed a VU0 OPMSUB gap (slot 09)
+
+Slot 09 (Mansion Entrance) stopped explicitly in our build at EE 0x10db2c: `VU outer product exceptional accumulator path is unimplemented` (OPMSUB with a +/-MAX ACC, an overflowing product or an exponent-255 ACC). `vu_outer` (runtime.hpp) now applies the same VU6.0 rules as the MADD/MSUB family: canonical MAX ACC kept unless the product overflows, overflowing product gives its negated saturated value, everything else through the exact adder; product flags sticky only. New runtime_tests cases cover the three paths; runtime_tests pass. Slot 09 now MATCHes PCSX2 exactly at frame 450 (Fiona and Hewie). Score: 11/12; slot 12 Hewie difference under bisection (`HG_CHECK_FRAME`).
+
+## 2026-10-21 Section check results (all 12 saves vs PCSX2, frame 450 after load)
+
+`python tools/oracle/section_check.py 1 ... 12` (PCSX2 savestate 9 = save list on the injected slot-2 card; ours stops via HG-DIAG-124 at counter 0xFC7280 == 450; PCSX2 read right after its counter ticks to 450). 10/12 exact MATCH on room, Fiona and Hewie position/yaw, frame diff 0%: slots 01-08, 10, 11. Open: **slot 09** (Mansion Entrance, room 0x40): our run ended with the counter at 4 (it likely reset, e.g. an event after load, so the 450 stop never fired); Fiona matches, Hewie differs, so re-run reading at a later point or follow the counter reset. **slot 12** (H.O.T. Alcove, room 0x91): Hewie differs slightly at frame 450 (z 103.09 vs 103.08, yaw -1.320 vs -1.334): a real small divergence to trace (first frame it appears; Hewie AI/float path). Next: those two, then add audio and stalker state to the comparison and a short scripted walk per slot.
+
+## 2026-10-21 Section saves for 1:1 checks (user chose this over long autoplay runs)
+
+User asked for a low-token way to check each gameplay section 1:1. Plan: load a save per section in our build and in the PCSX2 oracle, apply the same short scripted input, compare game state (room, actors, flags, RNG, frame regions, audio) at fixed frames, one result line per section. Saves: GameFAQs NA Max Drive save by icon771 (2005-05-17, `haunting-ground.7757.max`, downloaded by the user; kept in `%TEMP%\hg-saves\icon771\`, never in the repo). New tools (no game data): `tools/saves/maxsave.py` (own LZARI unpacker for .max) and `tools/saves/mcinject.py` (writes a save directory over the same-sized files on a raw 528-byte-page card image along the existing FAT chains; its ECC function reproduces all 496 pages MCMAN wrote on the user's card). Card `%TEMP%\hg-saves\icon771\card-icon771.ps2` (copy of the user's card; theirs untouched). Verified in our build: main menu shows HARD MODE and SECRET ROOM; Load lists 12 filled slots: 01 Castle Suite, 02-03 Castle Corridor, 04-05 Castle Spiral Stairs, 06 Mansion Library (12:26:44), 07 Mansion W. Corridor, 08 Mansion Catwalk, 09 Mansion Entrance, 10 W. Tower Planetarium, 11-12 H.O.T. Alcove. Boot inputs: first 10 lines of the pinned `input-events.txt`, Cross at 52.5M (Load Game), Cross at 58.5M (slot 1). HG-DIAG-123 autopilot (camera-relative steering verified; room 0x21 test unfinished) is paused.
+
+## 2026-10-21 Autoplay (full playthrough by itself): approach and first verified state
+
+User: finish our version 1:1 with the PS2, and have it play through the whole game by itself, using inputs from an A-ending speedrun. Findings: no TAS or input recording exists for this game; the speedrun.com records have no input display (console A-ending WR 56:49, https://youtu.be/5a5hdshfbQ0, is NG+, webcam + splits only). Even exact inputs would desync open-loop (stalker AI uses the RNG at 0x44E550, load times and our timing differ from a console). Plan: a closed-loop autopilot (synthetic input, to be labelled HG-DIAG) that reads game state from EE RAM each frame and steers with the pad: route = room sequence + actions taken from the run videos and the room event scripts; navigation = the editor's decoded nav meshes and door graph. State verified from our own captures (157.8M-160.12M, room 0x21): `*(0x44F818)` = Fiona (vtable 0x46AAB0, 0x1510C80 in this run), position f32[4] at +0x10 tracks her walk, room id at +0x30 = 0x21, yaw at +0x54; `*(0x44F820)` = Hewie (vtable 0x46A120), `*(0x44F828)` = pursuer slot (vtable 0x469D10); gGame `*(0x44E978)` = 0x487A00. Addresses came as leads from OpenHuey's headers (GPL-3.0, read only, no code used) and were checked against our RAM before use.
+
+## 2026-10-21 World editor: characters and creatures in the object library
+
+Decoded the game's character models (PCK; skinned groups, rigid parts, morph faces/hands; strip restart = per-vertex byte table) in `editor/src/character.hpp`; all 115 files parse and render as the expected characters. The library lists 50 distinct models after the room objects (`CHAR ...`, preview included); dropping one converts it to room mesh records + textures. In-game (pinned 157.8M replay on an exported image): a Fiona model placed in room 0x21 is drawn textured with face and hair. Static scenery only (no animation/collision/AI). Test ISO deleted. Format: WORLD_EDITOR.md "Character models".
+
+## 2026-10-19 World editor: play modded (F5), re-opening floor (J)
+
+F5 exports and launches hg_game on the modded image with the launchers' TOC/memory-card paths (dev tree and beta folder both resolved; launch verified running). J reconnects cut floor (cut then open restores the original topology exactly) and fills enclosed holes / wall notches under the selection by ear clipping, refusing fills that wind the wrong way or overlap floor; covered by the new `editor_nav_tests` target (synthetic). Real-disc notch fill not yet demonstrated.
+
+## 2026-10-19 World editor: walkable-floor cutting
+
+K cuts the selected object's footprint out of the room's navigation mesh (`editor/src/navedit.hpp`): conforming longest-edge splits around the outline, inside triangles disconnected, triangle numbers stable (new pieces appended and added to portal lists/switchable groups), wall list rebuilt with original kinds, costs recomputed only where geometry changed. Verified on all rooms (serializer round trip) and on the edited mesh (symmetric links, shared edges, exact wall list, correct costs). In-game: an object placed on Fiona's recorded path in room 0x21 with the floor cut stopped her (x 4.6 instead of 20.7 at 160.12M). Test ISO deleted.
+
+## 2026-10-19 World editor: object library
+
+User asked for a sub-menu of all objects that can be dropped into a level. L opens a library panel (own 2D UI and 5x7 font, no new dependency) listing 3,611 de-duplicated objects grouped from all 168 rooms' mesh records, with search, rotating textured preview, and drop-at-crosshair placement onto the room surface; placed objects (and Shift+click sets) move/copy/delete as one group. Finding: mesh header flags with high byte 0x15-0x1C are event-switched groups (room 0x00's vase/shards 0x16/0x17); a vase pasted with them stayed invisible in the game, and appeared on room 0x21's bed in the game's frame once pastes clear that byte (now automatic). Test ISOs deleted.
+
+## 2026-10-19 World editor: add/remove objects, resizable rooms, cross-room paste
+
+User asked for the ability to add and remove resources. `editor/src/edit.hpp`: section split/rebuild (byte-identical for all 168 unchanged rooms), duplicate/remove for meshes, lights, cameras (editor-added only) and trigger shapes (removal clears the entry), cross-room mesh copy/paste with texture carry-over (bank rebuilt; limits = shipped maximum of 16 textures / 1,064,960 bytes; room buffer 0x2A0000). Export now handles size changes: in place when the room fits its sectors, otherwise relocated into the 10,254 free sectors after DATA.CVM with inner directory record, inner volume size, CVM header size fields and outer DATA.CVM size updated. In-game evidence (pinned 157.8M replay): relocated grown room loaded completely (RAM differs only in the 439 slot-0 bytes the game rewrites anyway); mattress removal + leaf copy visible (7,822 px); mesh pasted from room 0x40 drawn textured in front of Fiona. Fixed: scripted `--export` without moves now runs; saved rooms of any valid size reload. User's original ISO verified untouched (SHA-256 3f8c658e...bcca, identical to the 2026-10-16 beta copy); export refuses to write to it. Test ISOs deleted.
+
+## 2026-10-19 World editor: mesh moves, text editing, slot 14, door state
+
+Room meshes are pickable (objects overlay on, navigation off) and movable through their placement matrix; in-game check on the pinned 157.8M replay: lifting two leaf meshes of room 0x21's plant removed exactly those leaves from the game's frame (5,512 changed pixels). Room text editing: `editor/hgworld text <room> --dump FILE` / `text-apply <room> FILE` (messages run to the next offset because control codes carry 0x00 arguments; unedited text re-encodes byte for byte in all rooms; edits must fit the slot, 0-31 spare bytes per room). Slot 14 = switchable navigation regions (class 0x46DB40 sets/clears triangle flags per group). Door graph: entries can be disabled by a saved 400-bit set; per-side flag bits 0x40/0x10 and 0x80/0x08. Exits without door models are not positioned in room data (likely event code). Test ISOs deleted.
+
+## 2026-10-19 World editor: camera paths, trigger-area analysis
+
+Slot 6 decoded as camera paths (6 keyframed channels: eye xyz, target xyz; Bezier keys) and drawn in the objects overlay; layout fits all 154 rooms, 430 paths, Python and C++ agree. Slot 2 analysed geometrically: shapes sit on walkable floor (not walls) and polygons cover only part of the floor, so they are trigger areas/trip lines (exact use unproven). Remaining unknowns: slots 12-15, exits without door models, door-table `value`/`flags`, item/enemy placement (probably per-room event code).
+
+## 2026-10-19 World editor: door graph and first editing
+
+Door destinations decoded from the executable: static table at 0x3DCFC0 (303 entries) read by the door-graph object's methods 0x21C610/0x21C6A0/0x21C550; door k = slot-7 portal k (266 of 269 portals listed; higher door numbers are exits without a model). Editor shows a door's destination on click, Enter jumps to that room, the title lists the room's exits; `python editor/hgworld doors` prints the whole castle's connections (Python and C++ agree: 303 entries, 266 portals linked). Editing: lights, cameras, doors and slot-2 shapes can be moved and the room saved to `%LOCALAPPDATA%\HauntingGroundRecomp\mods` (in-place float patches; scripted test changed exactly the moved floats, size identical). Edits reach the game without changing it: Ctrl+E exports a patched copy of the disc image (edited rooms written in place at their own disc position/size) and `hg_game --disc <copy>` runs it. Verified: exported image differs only in the edited bytes; on the pinned 157.8M replay the resident room-0x21 PAC in EE RAM carries the edited light value, and raising room 0x21's doors removed door 0 from its frame in the game's own output (9,355 changed pixels in the doorway). That also confirms the editor's door placement (portal A + angle). The 4.4 GB test image was deleted afterwards.
+
+## 2026-10-19 World editor stage 2 (in progress): navigation and object overlays, picking
+
+Decoded and verified across all rooms (Python `editor/hgworld/layout.py` and C++ `--check-all` agree): navigation mesh (slot 0, setup routine 0x17CC00; costs equal centroid distances), per-triangle flag bytes (slot 16), border edges (slot 1), floor shapes (slot 2), lights (slot 4), portals/doors (slot 7). Editor: N navigation overlay, O objects overlay, G geometry toggle, left-click picking with values in the title bar; `--pick NX NY` for tests. Totals: 77,754 nav triangles, 14,732 edges, 2,329 shapes, 269 portals, 882 lights, 564 cameras. Visual evidence in room 0x21: light markers on the lamps/chandelier, portal on the doorway, navigation surface fits floor/stairs/upper level. Later the same day: slot 8 = door models (one mesh chain per portal in 131/132 rooms), placed at portal A rotated by the portal angle (the only convention that seats the door in its frame) and now drawn by the editor; slot 10 = room message text (`python editor/hgworld text <room>`; 1,315 distinct messages). Python and C++ agree: 3,061,466 triangles, 270 door models. Unproven: slot-2 purpose, edge kinds, nav attribute meaning, slot-16 bits, door destinations; slots 6, 12-15 not decoded. Details: docs/WORLD_EDITOR.md.
+
+## 2026-10-19 World editor stage 1: standalone room viewer
+
+User asked to begin the world editor and then required it to be **standalone, separate from the game**. Built `editor/` (no game runtime linked): `hg_world_editor` (GLFW/OpenGL 3.3) reads the user's `DATA.CVM` or the `.iso` read-only and shows any of the 168 rooms with textures, vertex lighting and translucent passes; free-fly camera plus each room's fixed cameras. `editor/hgworld/` holds the Python reference parsers (room PAC, `.TEX` banks, slot-3 geometry), extraction and PNG/OBJ export. Formats and their evidence (loader 0x120720, activation 0x11FFB0, whole-disc parse counts) are in `docs/WORLD_EDITOR.md`. Verified: C++ `--check-all` and Python agree exactly on all 168 rooms (3,037,823 triangles, 1,625 textures, 564 cameras, 0 failures); renders from the room cameras show the same bedroom as the pinned-route game frame (158M); ISO and DATA.CVM inputs give byte-identical screenshots. Game build unaffected (provenance manifest regenerated, exe `5c463426…`).
+
+Build environment repair: Windows temp cleanup had deleted `src/mappings.h.in` and `CMake/GenerateMappings.cmake` from the pinned GLFW copy in `%TEMP%/hg-glfw-pinned/`, so any CMake regeneration failed (and then hg_game's provenance step). Restored the template from the copy's own `mappings.h` and replaced the script with a placeholder that fails explicitly if `update_mappings` is ever built. **Durable fix done (user OK 2026-10-19):** cloned GLFW at the same pinned commit `7b6aead9…` (3.4 release) to `%LOCALAPPDATA%/HauntingGroundRecomp/deps/glfw-7b6aead9fb88b3623e3b3725ebb42670cbe4c579` and set `FETCHCONTENT_SOURCE_DIR_GLFW` there. Every file present in both copies is identical except the two stand-ins (the temp copy had also lost many non-Windows files). Rebuilt hg_game (`42ba45ad…`, provenance OK) and the editor; editor `--check-all` unchanged; 45M-slice headless game replay reached budget presenting frames. The old `%TEMP%` copy is no longer referenced.
+
+Next (stage 2, inspector): decode and overlay the remaining room slots (probable lights in slot 4; collision/doors/triggers/placements among slots 0–2, 6–8, 10–16, cross-referenced with the activation consumers listed in WORLD_EDITOR.md). Side data: four RAM snapshots of the pinned route while Fiona walks (157.8M/158.75M/159.19M/160.12M) are in `%TEMP%/hg-world-editor/snap/caps/` for locating the player/position structures.
+
+## 2026-10-16 Arrow keys = right stick; portable beta build 1
+
+User request: arrow keys drive the right stick (IJKL felt odd). `runtime/game_host.cpp` key table now maps the KeyboardKey D-pad slots to I/L/K/J and the right-stick slots to Left/Right/Up/Down arrows (no binding lost; host-only). F1 panel, window title and `docs/CONTROLS.md` updated; `runtime_tests` pass (65,536 button + 256 stick combinations, controls panel bitmap).
+
+Portable beta: `builds/build1-2026-10-16/` (gitignored `/builds/`): `hg_game.exe` (sha256 bb36bf97…), app-local VC++ runtime (`msvcp140.dll`, `vcruntime140.dll`, `vcruntime140_1.dll` from VS Redist 14.51 Microsoft.VC145.CRT; other imports are Windows/UCRT), `Haunting Ground (USA)/` (ISO, SLUS_210.75, MODULES, SYSTEM.CNF), `data/toc.bin` (the HG-DIAG-007 synthetic TOC record), `saves/` (copy of the user's card as of 2026-10-16), `Play.cmd`, `Resume From Checkpoint.cmd`, `README.txt`, `BUILD-INFO.txt`. Logs/input recordings/checkpoints go to `%LOCALAPPDATA%\HauntingGroundRecomp\{logs,sessions}` because `--input-log` must be outside the working directory. Verified launching from the folder: window up, card inserted from `saves`, 3 VU workers. Not verified on a second PC (non-NVIDIA GPUs untested). Its card copy diverges from `Documents\Haunting Ground Saves` once either is saved to.
+
+## 2026-10-15 Evidence-only function naming (EE + IOP) and named freeze messages
+
+User asked to label functions, with names only where evidence exists. `tools/naming/name_ee.py`: function starts = configured roots + JAL targets (10,051); a name is assigned only from (a) a self-naming string in the body (identifier right after an error code, trailing "(Name)", or "Class::method"; mid-sentence "Name()" callees ignored; strict majority per function; a name claimed by more than one function is dropped; generic prefixes such as `erAdx` and bare class names excluded) or (b) a syscall wrapper `addiu v1,zero,N; syscall; jr ra` named from the ps2tek EE syscall list. Result: **246 EE names** (174 self-string — CRI ADXF/ADXT/mwPly/MWSFD/cvFs/SVM, `basic_string::reserve`, `_sceMpegSliceA0` — and 72 syscall wrappers) plus 37 module tags from source-file strings (e.g. `rofs_hn.c`). `tools/naming/name_iop.py`: module export tables and import stubs relocated by configured bases and named from ps2tek "BIOS IOP <library>" export lists: **406 IOP exports + 715 import stubs** (e.g. `libsd.sceSdVoiceTrans`); undocumented library ordinals stay unnamed. `tools/naming/ps2tek_names.json` keeps the number→name tables only (with source). Outputs are game-derived and stay in ignored `out/` (`function_names.*`, `iop_function_names.*`).
+
+Named freeze messages: `hg.py emit` appends a host-diagnostic EE symbol table (all known starts; evidence names where present) to `out/translated.cpp`, registered in `runtime/include/hg/symbols.hpp`; EE stop messages now read `EE stopped at 0x… (nearest known function start: NAME+0xOFF)` (or `sub_xxxxxx+0x…`). Guest code unchanged; pinned 180M replay byte-exact (`different: []`), heavy median 42.1. IOP bundle not yet regenerated with names. Backup `%TEMP%/haunting-toc-probe/symbols/preedit`.
+
+## 2026-10-14 Prologue sweep (user-approved): 740 functions
+
+User approved translating the unreferenced function starts "as long as we maintain our 30 fps". Classification by referenced strings: ~301 CRI ADX/AFS/ROFS/cvFs/PS2RNA (0x1C0000–0x1EFFFF), ~311 CRI Sofdec mwPly/MWSFSVR/SFX (0x230000–0x25FFFF), ~80 Sony SIF RPC/stdio (0x260000–0x27FFFF), ~48 unlabelled (mostly 0x100000–0x11FFFF). Scratchpad `prologue_sweep.py` rooted all 740 frame-allocating prologues in 0x100000–0x3A0000 that pass the epilogue entry and 65,536-limit body checks (`sweep_*`); converged next pass (71 untranslated prologues remain, all failing the checks; data-pointer scan 0). Reachable EE words 652,414 → 677,016. Translation tests pass; pinned 180M replay byte-exact vs the 20261014 control in two runs, heavy median 41.5 / 42.2, p10 40.4 / 41.1, 0 below 29.9 (30 FPS maintained). EXE ~59.0 MB (was ~56.7). Backup `%TEMP%/haunting-toc-probe/prologue-sweep/preedit`.
+
+## PINNED (user, 2026-10-14) — Debilitas AI aggression/detection write-up
+
+User asked for a full write-up of how Debilitas's AI aggressiveness and detection are determined, then parked it ("put a pin in it"). Findings so far: the executable has almost no debug names; the stage-1 data block at VA 0x45D7C0–0x45DA80 (file offset = VA - 0x100000 + 0x80) names Debilitas's model `DE0009\DE0009.SF` ("DE" prefix), `BGM\STAGE1_BANK.HD/BD`, `PANIC.SQ`, `S1_NORMALA/B.SQ`, `S1_CHASE.SQ`, and holds code-pointer tables (0x45D950: 0x2d6a88/0x2d6ac8 …; 0x45D980: 0x2d6b30…0x2d6eec; 0x45D9B0: 0x2d7280/0x2d72b8; earlier blocks at 0x45D700/0x45D730/0x45D780 point into 0x2cd7f8…0x2cf660) that look like per-state handler tables. Agreed plan when resumed: (1) find his live object in an archived session replay (`%TEMP%/haunting-toc-probe/sessions/`) via position relative to Fiona; (2) map his state machine against those tables and show it to the user; (3) only then decode sight (distance/cone/LOS), hearing (run vs walk, noises), aggression build-up/cooldown, hiding/Hewie/panic effects and difficulty scaling, with addresses. Also groundwork for "tier 1" debug tools.
+
+**Resolved 2026-10-14 (approved, done):** sweep-root the 740 unreferenced function starts that pass the entry/body checks (87% → ~98–99% of frame-allocating prologues; would exceed the AGENTS scoped rooting exception, so it needs explicit approval).
+
+## 2026-10-14 Host audio device loss no longer stops the game
+
+The user's overnight session (old EXE) stopped at 48,412M with `IOP stopped at 0x1f0000: cannot submit Windows audio buffer: The specified device handle is invalid.` (the Windows output device went away). Host speaker output is presentation-only, so `runtime/include/hg/host_audio.hpp` now treats device loss as a host event: on waveOutWrite/Restart failure, or a buffer not returned for 2 s (which previously could spin forever), it closes the device, drops frames silently, logs once, and reopens the current default device about every second of audio; startup without a device also continues silently. Guest timing/state unchanged (output-only path). Relaunched the user on EXE `c900161d…` (also includes the data-pointer batch and discovery-cap fix). First use of the new session archive: `sessions/20261014-111549.*`. Backup `%TEMP%/haunting-toc-probe/audio-recover/preedit`.
+
+## 2026-10-14 Generic data-pointer batch; silent discovery cap removed; session logs archived
+
+Proactive (unattended) coverage pass: scratchpad `data_pointer_scan.py` checks every aligned ELF word that points at uncompiled executable code (4,926 words, 3,208 targets) with the same epilogue entry check and 65,536-limit body check as all earlier batches: **164 accepted** (`dataptr_batch_*`), converged on the next pass; vtable/desc16/any-offset/address-taken/member scans also 0. **Found a latent bug:** `analysis.max_instructions = 650000` was reached exactly, and discovery silently dropped the tail (pinned replay stopped at 94M on missing 0x2295c4; the issue was only recorded in analysis.json). Fix: limit 1,000,000 (above the 912,512-word executable segment) and `hg.py emit`/`analyze` now exit with an explicit error if the budget is ever exhausted (`tools/hgtool/__main__.py`). Reachable EE words 649,430 → 652,414. Translation tests pass; pinned 180M replay byte-exact vs the 20261014 control (`different: []`), heavy median 41.5, 0 below 29.9. Backups `%TEMP%/haunting-toc-probe/dataptr-batch/preedit`, `discovery-cap/preedit`. Earlier builds were below the cap (desc16 build 649,430), so user-run EXEs were unaffected.
+
+Launchers (`RUN_MANUAL_AUTHENTIC_TOC.cmd`, `RUN_FROM_CHECKPOINT.cmd`) now move the previous session's input recording and stderr log to `%TEMP%/haunting-toc-probe/sessions/<yyyyMMdd-HHmmss>.*` instead of deleting/overwriting them, so later stops can be replayed from any recent session.
+
+Linux note: earlier Linux headless replays (2026-09-29..10-01, other contributor) were exact against the Windows-era digests; the current tree is not re-verified on Linux (no toolchain in local WSL; Docker Desktop available but stopped).
+
+## 2026-10-14 Unattended work: speed A/B and memory soak
+
+User asked for unattended work. Their game had idled overnight (40,540M slices; 1.37 GB working set / 2.0 GB private, flat over 2 minutes of idling; it was ~365 MB at 5,378M). Benchmarks on the pinned 180M inputs, with that idle game still running: newest EXE `73201b00…` 39.8 / 40.2 median (0 below 29.9). Interleaved A/B in the same conditions: pre-voices `879462f1…` 41.9, voices `5fe1649a…` 40.8, newest 40.5. The earlier 52 → 40 drop is mostly environmental (the concurrent idle game); voice synthesis costs ~1/s (~3%) and the timer fix is negligible. Soak: headless fast replay of the user's 2,422M-slice session on the newest build with per-minute memory sampling (`%TEMP%\haunting-toc-probe\soak\memory.csv`) to test for unbounded growth.
+
+**Soak result:** all 43,492 session inputs replayed to 2,600M with **no stop**; memory ranged 245 MB–2.24 GB and fell back to ~250 MB at the end (transient spikes during fast-forward, consistent with graphics-driver staging; the inter-thread rings are fixed 24 MB arrays). No leak found. **Pinned control refreshed:** three runs of EXE `73201b00…` are byte-identical (display 314435de…, EE RAM 1acd3bcc…, GS VRAM 9a1f7912…, VU1 data 1e129b40…); new control `%TEMP%/haunting-toc-probe/project-link-runtime/20261014-control-73201b00` (inputs/TOC unchanged from the 20261011 control). Scratchpad `perf114.py` now defaults to it (`PERF_CONTROL` overrides). Verification run: `different: []`, heavy median 40.4, p10 39.4, 0 below 29.9 (user idle game still running).
+
+## 2026-10-13 Sequenced music restored: IOP timer reset-on-target; SPU2 reverb
+
+User: ambience and chase music never play. Disc has 13 `.SQ` sequences with `.HD/.BD` banks played by MODMIDI/MODHSYN under SNDDRV; trace showed only 11 core-1 voices ever sounding and core-0 voices unused. HG-DIAG-122 (`HG_IOP_TIMER_TRACE=1`) showed SNDDRV's sequencer clock is IOP timer 4, mode 0x58 (reset at target | target IRQ | repeat), target 0x2580C = 240 Hz. `advance_timers` ignored mode bit 3, so after the first target IRQ the 32-bit counter ran on and the next IRQ was minutes away: the sequencer stalled. **Fix (`iop.hpp`):** with bit 3 the counter wraps to 0 after reaching the target (period target+1), raising the repeating target IRQ (psx-spx root-counter layout). Session replay (`%TEMP%\haunting-toc-probe\ambience\`) with HG-DIAG-121 voice stats: before, c1 v00/02/04/05/12-15/17/20/21 only; after, most of core 0's 24 voices also sound (sequenced music). iop_tests pass. Pinned 180M: runs to budget, no unexpected writers/lost trace; display/EE/GS captures differ (IOP timing now correct; control predates both IOP fixes and must be refreshed); concurrent-run rate 40.9 (user game running). EXE `73201b00…`. Backup `%TEMP%\haunting-toc-probe\iop-timer-reset\preedit`.
+
+**Reverb implemented** in `spu2_voices.hpp` (psx-spx network, 24 kHz half-rate with 39-tap FIR resampling, ESA..EEA work area, writes only with ATTR bit 7, EVOL return; MMIX MSNDEL/ER, MINEL/ER, SINEL/ER feed it). The game's core-1 preset is PS1 "Hall"; EVOL 0x2300 is set in later areas. HG-DIAG-119 now covers only the sound-data output areas. `spu2_voice_tests` adds a delayed wet-only return and ATTR-bit-7 write gating; the existing `spu2_tests` now pass (input queue enlarged to 8192 frames; it previously overflowed on long test advances). New diagnostics: HG-DIAG-121 `HG_SPU2_VOICE_STATS=1`, HG-DIAG-122 `HG_IOP_TIMER_TRACE=1`.
+
+User question (cheat codes): scratchpad `cheat_scan.py` found no stored button-sequence tables (only small-integer noise) and no cheat/debug strings; a code hard-wired in menu logic is not excluded without tracing the title-screen input handler.
+
+## 2026-10-13 Member-call descriptor batch (~3863M stop); reverb now audible somewhere
+
+User played ~64 minutes (3,863M slices) on EXE `d80e8252…` before `EE stopped at 0x15b660: address has no static translation` (ra 0x168160: helper 0x100b40 called with t9 = object+0xf35d0, a descriptor copied from table 0x3b1f18). New scratchpad `desc16_scan.py`: every 16-byte `{target,0,0,-1}` record in the ELF (1,024 records, 783 targets, 66 uncompiled); same entry/body checks with 65,536 limit accept **14** (incl. 15b660), rooted as `desc16_batch_*`; 52 rejects lie in data (0x3ee580+). Rescan: 0 accepted; vtable/any-offset/address-taken/member scans also 0; reachable EE words 648,216 to 649,430. Translation tests pass. No full repro (40+ min replay); the change only adds roots. EXE `a5e93d4b…`. Config backup `%TEMP%\haunting-toc-probe\desc16-batch\preedit`.
+
+**HG-DIAG-119 fired** in that session: `SPU2 core 1 effect return volume nonzero (EVOL 2300/2300)` — some later area turns reverb on, so reverb is now audible on hardware there and missing here. Next audio task: implement the reverb network (registers/order confirmed; see DIAGNOSTICS HG-DIAG-119).
+
+## 2026-10-13 IOP interrupt delivered inside a masked worker (~448M SIF0 stop)
+
+User stop: `IOP stopped at 0x9c7b0: active IOP SIF configuration mutation unsupported`. Headless repro `%TEMP%\haunting-toc-probe\stop-sif-448m\` (session inputs + unchanged card) with new fault detail: BCR halfword store while SIF0 CHCR=0x01000701, armed by SIFMAN's SIF0 DMA-completion handler (pc 0x9c498, ra 0x1f0010 = native IRQ return) while thread 8 sat in SIFMAN's internal SetDma (0x9c610; caller holds CpuSuspendIntr) with interrupts masked. Root cause: `service_iop_thread` ends quanta on instruction boundaries and restores the idle context; `locked_thread` already kept a masked runnable worker as the CPU owner for scheduling, but `iop_interrupt.hpp` delivery checked only the restored idle `interrupts_enabled`, so the completion IRQ ran inside the critical section between the CHCR test (0x9c750) and the descriptor writes. **Fix:** `iop_cpu_interruptible(s)` = `interrupts_enabled && !locked_thread` gates all four IOP delivery paths (DMA, CDVD, SIO2, timers). iop_tests pass; repro passes 448M to the 456M budget. Pinned 180M replay: display/GS VRAM/VU captures identical, EE RAM and state.json differ (interrupt timing is now correct), no unexpected writers/lost trace/caller mismatches; concurrent-run rate 42.2 (0 below 29.9, not comparable). The pinned control predates this timing fix; future byte-exact comparisons need a refreshed control. Also new: SIF-mutation faults now print register/value/CHCR/arming pc/interrupt and thread state. EXE `d80e8252…`. Backup `%TEMP%\haunting-toc-probe\iop-masked-owner\preedit`.
+
+## 2026-10-13 User confirms gameplay sound effects
+
+User listening test on EXE `5fe1649a…`: gameplay sound effects play and sound fine (game relaunched after an accidental close). Reverb is not synthesized (HG-DIAG-119), but the game holds EVOL at 0 in the traced span, so none is expected there; a one-time nonzero-EVOL report was added to source (included in the next build). **Next:** implement reverb only if that report fires; keep fixing user-reported stops.
+
+## 2026-10-13 SPU2 voice synthesis (gameplay sound effects); negative SQRT; long-session stops
+
+User report after the gamepad check: cutscene audio fine, gameplay only music. Cause: the speaker carried only core-0 sound-data input (streamed music); the 48 SPU2 voices (all sound effects; core 1 in this game) were register storage only. New `runtime/include/hg/spu2_voices.hpp` (`Spu2Voices`, owned by `IopState`): per-Ts (48 kHz, guest IOP time) KON/KOF latching, SPU-ADPCM decode (filters 0..4; 5..7 fault), pitch counter with PMON, 4-point Gaussian interpolation (hardware table), ADSR (attack/decay/sustain/release per the envelope step algorithm), VOLL/VOLR/MVOL direct and sweep, noise generator, loop start/end/repeat, ENDX, and guest-visible ENVX/VOLXL/R/NAX/LSAX/ENDX/MVOLX write-back; VMIX/MMIX routing; core 0 output feeds core 1 external input (AVOL); sound-data input via BVOL. The speaker now plays the final core-1 mix. Register offsets confirmed from the game (HG-DIAG-118). Reverb/output areas are HG-DIAG-119. Voice IRQ hits with ATTR IRQ enabled fault (the game leaves IRQ off). Tests: new `spu2_voice_tests` (ADPCM, envelope rates, loop/ENDX/LSAX, key-off release, one-shot mute, IRQ fault) and existing `spu2_tests` pass. Pinned 180M replay with HG-DIAG-120 (`--spu2-mix-wav`): all EE/GS/VU/frame captures identical to control, heavy median 51.9 (0 below 29.9); the mix equals the music input where only music plays (peak 4785 = 4785) and adds voice content where the input is silent (e.g. 80–100 s, 150–170 s peaks 6–15k). User listening test pending. EXE `5fe1649a…`. Backup `%TEMP%\haunting-toc-probe\spu2-voices\preedit`.
+
+**~814M stop** `EE FPU SQRT operand requires validation` (EE 0x1f11c4): negative operand. EE Core User's Manual v6.0 Table 8-4 (p162): square root of a negative number = square root of the absolute value, I=1 (SI sticky, as for 0/0 in Table 8-5). `fpu.hpp` now does that; exponent 255 is an ordinary normal (EE has no Inf/NaN). `fpu_tests` updated and pass. The user then played to 976M+ without a stop.
+
+Regression: pinned 180M replay on the per-entry-identity/roots/SQRT/64-bit-slices build is byte-exact (heavy median 52.1, 0 below 29.9).
+
+## 2026-10-12 Long-body table method (~215.7M after loading the save)
+
+EE `0x2c6650` (slot +0xc of table 0x46ec80; installers 2c6574/2c65d8/39721c/397b94/3982ac) passed the entry check, but `body_ok` stopped at 2,048 linear instructions (frame 0x320, long body). Scratchpad `verify_tables.py` now takes `BODY_LIMIT`. Rerun with 65,536 over refreshed triage: only 2c6650 was a limit reject; three newly reachable +0xc methods (100650/102310/1029b0) also pass. Rooted as `vtable_batch_*` (third pass); iteration converged (0 accepted; any-offset and address-taken scans add nothing). Reachable EE words 646,123 to 648,216. Translation tests pass; headless repro `%TEMP%\haunting-toc-probe\stop-2c6650\` runs past 215.7M to 220M+. EXE `fe6c7238…`. Config backup `%TEMP%\haunting-toc-probe\big-body-batch\preedit`. Pending: pinned 180M regression replay.
+
+## 2026-10-12 Save/load qualified; run-length cap removed; VU1 per-entry program identity
+
+**Save correction.** The earlier "save completed" note was wrong: the card held only the game's freshly created `BASLUS-21075HG` file with 12 identical blank slot templates (the slow-write session ended before a slot was written), so Load correctly said "No save data present". The user re-saved from the 527M F5 checkpoint on the fast build; slot 1 now holds real data (header record and slot bytes differ from the template) and a fresh boot loads it. Card backups: `memory-card-slot1.ps2.template-only-20261012.bak`. Read-only card lister: scratchpad `mcfs.py`.
+
+**"Freeze" after checkpoint resume** was the launcher's `--slices 600000000` run limit (slice counter was 32-bit, capped 3e9). `system_diagnostic.cpp` now uses `std::uint64_t` for slices, input-event stamps, checkpoint history and the main loop (`max_run_slices` = 1e12); both launchers pass `--slices 1000000000000`.
+
+**~325M stop after loading the save**: `VU1 AOT entry/program identity has no static translation; entry=0`. Headless repro `%TEMP%\haunting-toc-probe\vu1-stop-325m\` (session input log + card copy, `--fast-replay --dump-iop`). The new area's MicroMem composite differs from every configured composite somewhere, but every entry's executable code (0, 0x58, 0xae8, 0xb70) equals `scene14_mscal0_composite`. **Fix (`tools/hgtool/vu_emit.py`)**: identity is now checked per activation entry over exactly the pairs that activation can execute (`_entry_ranges`: `_reachable` from the entry plus branch/END delay pairs; JR/JALR stay rejected, so reachability is exact), dispatched by `switch(entry)`. Unrelated MicroMem uploads no longer invalidate proven programs; any changed reachable pair still fails explicitly. Repro passes 325M to the 345M budget. vu_readiness (81,920 + 262,144), translation tests and Python VU/tool tests (`PYTHONPATH="tools;tests"`) pass. EXE `1263413b…`. Backup `%TEMP%\haunting-toc-probe\vu-entry-identity\preedit\vu_emit.py`. **Pending:** pinned 180M byte-exact regression replay (not yet rerun; run while the user is not playing).
+
+## 2026-10-12 First real save written; card write speed fixed
+
+The user's save completed on EXE `4f2ea2cd…`: the card holds `BASLUS-21075HG` with `icon.sys` (plus the backup copy). But saving ran at ~2–3 updates/s, because `VirtualMemoryCard::write_through` reopened the image for every 128-byte chunk (thousands per format/save; Windows open/close plus antivirus scanning). It now keeps one persistent `std::fstream` and flushes at the card commit points (0x12, 0x81, erase) and on destruction; the class is non-copyable and shared through `shared_ptr`. The faithful format repro on EXE `f3b81d71…` stays at 39.8–51/s through format and save. The card image is identical to the previous repro except the 120 RTC-derived timestamp bytes (directory entry creation/modification times + their ECC, in the entry pages and backups); the RTC comes from host UTC at boot. Next: verify loading the save from the title screen (`RUN_MANUAL_AUTHENTIC_TOC.cmd`, card present from boot).
+
+## 2026-10-12 Memory card format verified end to end; address-taken function batch
+
+The user's first format attempt stopped on EE `0x110bb8`: a SIF RPC completion callback invoked through request+0x1c at `0x26facc`, materialised by LUI/ADDIU and present in no table. New `address_taken.py` (scratchpad) roots every LUI/ADDIU|ORI literal inside executable code that passes the epilogue entry and body checks: 4,963 candidates, **121** accepted (mid-function labels and embedded data fail entry). All scans converge; the generated shards grew 26 → 30 (CMake GLOB re-run). New repro option `--memory-card-insert-at <slice>`. A faithful headless repro (checkpoint 527M + live log, blank card inserted at 527M) on EXE `4f2ea2cd…` completes the game's own format without fault: 298 block erases, 3,390 page writes, 17,325 page reads. Page 0 superblock = "Sony PS2 Memory Card Format 1.2.0.0", 512-byte pages, 2 pages/cluster, 16 pages/block, 8,192 clusters. The user's partial card from the failed attempt was kept as `memory-card-slot1.ps2.partial-format-20261012.bak`. Saving itself (writing game data) is not yet observed.
+
+## 2026-10-12 Virtual memory card (slot 1) — detection and reads verified; writes awaiting the user's first save
+
+The user asked for a card so in-game saves work. New `runtime/include/hg/memory_card.hpp` (`VirtualMemoryCard`) is an 8,650,752-byte raw image (16,384 pages × (512+16 ECC)), 16-page erase blocks, erase to 0xFF, write-through to the backing file. Protocol per the project's SIO2 reference (ps2tek "Memory Cards"): 11/12/BF/F3/F7/81 ack tail; 21/22/23 page address; 82 erase; 26 specs `00 02 10 00 00 40 00 00`, XOR 0x52; 27/28 terminator (default 0x55); 42/43 write/read ≤128 bytes with XOR checksum. Unknown commands fault. SIO2 (`iop_sio2.cpp`): with a card present on port 2, the FIFO and DMA paths exchange each SEND3 transfer through the card (RECV1 0x1100). **Observed MCMAN DMA layout:** each queued transfer occupies whole DMA blocks in both directions (BCR 0x00070024, second request at +0x90). Native SECRMAN `authenticate_card` returns success for a present slot-1 card and failure otherwise; no MagicGate crypto is modelled, since the BIOS module is unavailable (IOP bundle regenerated, 28 modules). Absent card: the original disconnected behaviour, byte for byte. **Bug fixed during bring-up:** the IOP reboot builds a fresh `IopState`, so the card pointer is now carried across like other peripherals. Host flags: `--memory-card <file>`, `--memory-card-after-replay` (unplugged during checkpoint replay, inserted at its end). Evidence: a headless boot with a blank card runs 11, F3, 28, 27, BF, 26, 23, 43 (134-byte page reads), 81 without fault, and the blank card reads as unformatted. Pinned 180M without a card is byte-exact (aggregate 44.6). Not yet exercised: format/write (22/42/82/12). The user's save attempt is the first test. Launchers use `%USERPROFILE%\Documents\Haunting Ground Saves\memory-card-slot1.ps2`. EXE `ae752487…`. Backups `%TEMP%\haunting-toc-probe\memcard\preedit`. **Determinism note:** a session that used the card can't be reproduced by a card-less checkpoint replay past the insertion point. Prefer in-game saves from now on.
+
+## 2026-10-12 Vtables installed at non-zero object offsets (~531M stop)
+
+EE `0x2e25f0` = table 0x46fc00 slot +0x10. Installers (0x16ca64, 0x2d0e10, 0x2d14a8) store 0x46fc00 with `SW v0,0x28(a0)` (embedded sub-object vptr). The triage scan only recognises slot-0 installs, so these classes were invisible. New `vptr_any_offset.py` (scratchpad): any LUI/ADDIU-formed address that is then stored (SW within 8 instructions), with vtable shape (two nulls, then executable pointers until null) → 586 tables, **50** new targets passing entry/body checks (1 rejected). All five scans (slot-0 tables, truncated-table extension, any-offset tables, member descriptors, switch tables) converge to 0. EXE `11b3ab5b…`: translation tests pass, and the repro runs past 531M to the 538M budget. Checkpoint at 527M. Pending: interleaved speed A/B (43 vs 54 question) while the game is idle.
+
+## 2026-10-11 Switch-table batch (~412M stop) and large-table extension (~413M)
+
+(1) ~411.7M EE `0x1768f0`: a bounded switch (`andi; sltiu at,v0,7; beq → default`, LUI/ADDIU table 0x44fa00, SLL 2, ADDU, LW, `jr v0` at 0x1768e8). New `switch_tables.py` (scratchpad) scans every non-RA JR for this compiler shape and requires every table entry to be executable within 64 KiB of the site. **Validation: it reproduces all 121 hand-configured switch sites exactly** (table base and case count). It added **78** new `[[indirect_targets]]` sites. (2) The repro then stopped at ~413M on EE `0x2fc8e0`: slot +0x2c0 of table 0x470a90. The triage scanner caps tables at 64 words (38 tables hit the cap). `extend_tables.py` reads on to the first null/non-code word: 5,286 extra slots, **208** new targets, all passing entry/body checks. All scans have converged (0 new). Reachable EE words ~639.6k. EXE `d438d912…`: translation tests pass, and the repro runs to the 420M budget. Pinned 180M is byte-exact, but **aggregate 43.23 vs 54.28 after HG-PERF-120**. This is unexplained (host variance vs code growth / i-cache from ~30k extra roots); it needs an interleaved A/B with `940fa28d…` while the user isn't playing. Checkpoint created at 408M.
+
+## 2026-10-11 Later user-play stops: VU1 program at ~334M, second table batch + member batch at ~352M
+
+(1) ~334.1M entry-zero VU1 identity miss. The repro needed the scheduled-input cap raised (2,048 → 1,000,000 in `system_diagnostic.cpp`; analog play produced ~3,800 events, which would also have broken F5 checkpoint loads). `late_area_mscal0_composite` was added from eight original-ELF ranges (MicroMem SHA 2713d2f0…), with END pairs giving entries 0/0x88/0x438/0x6c0/0x8d8/0xb70/0xec0/0x1300. Replay passes to 340M. (2) ~352.6M EE `0x2d3a50` (table 0x46f430 slot +0x20). The first batch had rejected it as "no-epilogue": the preceding function ends in `jr t9` (indirect tail call). The checker now accepts JR through any register: second batch **185** targets from 133 tables. Triage then exposed `missing_member_targets` ({0,-1,target} descriptors via helper 0x100b40). The same checks rooted **51** in iterative passes until 0 remained (`member_batch_*`). The table scan has converged (only 25 data-like/zero-run rejects remain). Reachable EE words 606,009 → ~626k. EXE `b55c6c7f…`: translation tests pass, the repro runs past 352M to the 356M budget, and the pinned 180M replay is byte-exact (concurrent run, so its rate is not comparable). Checkpoints created at 330M and 348M from session logs.
+
+## 2026-10-11 HG-PERF-120 RESULT — own-pixel PSMT8H feedback on GPU fixes the Debilitas slowdown (retained)
+
+The user reported controls "slipping" near Debilitas. A headless repro (F5 checkpoint + live log, `%TEMP%\haunting-toc-probe\debilitas\`) showed the 200M–240M window at 16.9–25 updates/s unpaced (40 of 40 intervals below 29.9): slow motion. HG-DIAG-091: stage C 100% busy, EE join wait 59%. HG-DIAG-115 + a temporary rejection census (HG-DIAG-117, removed) found 88.9% of triangles accepted and every refusal (882k in the window) to be one class: PSMT8H texture == frame base, i.e. identity own-pixel feedback (a full-screen palette effect). The scalar path is exact, but each such triangle forced GPU readback, CPU pixel work and re-upload. **Change:** `gs.cpp` runs the existing exact identity detection before the GPU attempt and tags `GsTriangleJob::self_feedback_flag` (2048). `gl_triangle_shader.hpp` reads `palette[frame_word(x,y)>>24]` (own pixel, per-pixel submission order in tile lists), then the normal texture function and pipeline. `gl_gs.cpp` treats those reads as non-hazards; all other hazards stay. HG-FAIL-053's earlier GPU attempt was flat where this class was rare; here it dominated. **Evidence:** 16 new differential variants (overlap, TFX, TCC, FBMSK, ABE) reach the GPU and match the CPU; gs_gpu 1,159/1,385 resident and non-resident; runtime/translation/VU readiness/device-thread pass. Debilitas window median 22.0 → **40.2**, min 16.9 → **37.8**, 0 of 40 below 29.9. Captures at 245M are byte-identical to the pre-change build (frame, EE RAM, GS VRAM/state, VU1, console). Pinned 180M threaded: aggregate **54.28** (was ~42), wall 90.6 s, byte-exact. Production EXE `940fa28d9c33e3590240d82da55d6a067cf77edaabc41270de0cf3e720f3b295`. Backups `%TEMP%\haunting-toc-probe\debilitas\preedit`.
+
+## 2026-10-11 VU1 SQI same-pair snapshot bug fixed (post-door area, ~165M)
+
+User play stopped at ~165.4M with an entry-zero VU1 identity miss. The headless repro (`%TEMP%\haunting-toc-probe\vu1-stop-165m\`: F5 checkpoint + live input log merged) dumped MicroMem. Five original-ELF ranges cover 0x0000..0x1318 (SHA 91f286f3…). `[[vu1_programs]] post_door_mscal0_composite` was added (entries 0/0xb0/0x990/0xec0/0x1300 from END pairs 0xa0/0x980/0xeb0/0x12f0). Then `VU1 XGKICK packet exceeds VU1 data memory` appeared, identical with `HG_SYNC_DEVICES=1` and `HG_VU_WORKERS=0`. New HG-DIAG-116 VIF trace (`HG_VIF_TRACE=1`, ring printed with EE faults) plus the detailed fault (`start=768 … entries_remaining=118529`) showed the input header at VUMem[0x200] was a valid tag (NLOOP 48, EOP, NREG 3). VUMem[768] instead held ITOF12(VF22). **Root cause:** pair 0x00e0 `ITOF12 VF19,VF22 (xyz) | SQI VF19,(VI4++)`. SQ already stored the pair-start VF (concurrent upper/lower issue), but SQI used live state and stored the new upper result as the GIF tag. **Fix** (`tools/hgtool/vu_emit.py`): SQI joins the same-pair snapshot path, storing from the snapshot and then applying the VI post-increment to live state. Exactly one emitted site changed (post-door 0x00e0); none of the 16 earlier programs had the pattern. The headless repro now runs past 165.4M to the 172M budget with no fault. VU readiness tests pass; pinned 180M threaded replay is byte-exact (aggregate 41.62, 0 of 28 below 29.9). EXE `196ae57e…`. Backups `%TEMP%\haunting-toc-probe\sqi-snapshot\preedit` (vu_emit.py 9248b876…) and `xgkick-wrap\preedit` (vif.hpp b52de992…, vif.cpp, system_diagnostic.cpp). Note: UNPACK/XGKICK destinations ≥1024 still fault rather than wrap; hardware wrap is unverified (the VU manual is silent).
+
+## 2026-10-11 Systematic fix for virtual-method stops + replay checkpoints (user play session)
+
+**Stops fixed during user play:** (1) EE `0x2abf60` (door table `0x46df00`, entry below); (2) IOP `0x27b70` at the door kick, from dbcman's second SIF RPC server: `config/iop_modules.toml` roots `+0x1b70` and `+0x1bcc`. Both are formed by relocated LUI/ADDIU before the RPC register/loop import calls. The IOP bundle is regenerated with the 28-module set (rom_romdrv excluded); with unchanged config this reproduces the old bundle exactly, with identical case bodies and only lookup-line order differing. (3) EE `0x2e9ae0` (table `0x46ff40`, constructor `0x208ed0`; site `0x204de0`). (4) EE `0x2ae3f0`, again site `0x209574` with another door class. **User asked for a systematic fix instead of one door at a time.** `hg.py analyze --triage` lists 504 installer-proven tables with 2,854 uncompiled targets. `verify_tables.py` (scratchpad; evidence `%TEMP%\haunting-toc-probe\table-batch.json`) accepted **2,720** targets from 411 tables (executable, entry right after a JR ra/J terminator + delay slot, body reaches a return without invalid R5900 opcodes or zero runs) and rejected 134 (122 no-epilogue, 12 zero-run). These are appended as `vtable_batch_*` roots (scoped exception to the never-auto-root rule, user-authorized; see AGENTS.md). Reachable EE words 511,728 → 606,009. Build `403c09f3…` passes translation tests, and the pinned 180M threaded replay is byte-exact at the same speed (aggregate 42.56, 0 of 28 below 29.9). Config backup `%TEMP%\haunting-toc-probe\vtable-batch\preedit`.
+
+**Replay checkpoints (user chose this over disk save states):** F5 in-game writes every applied input plus a marker at the current slice to `%TEMP%\haunting-toc-probe\checkpoint.txt` (`--checkpoint-file`). `RUN_FROM_CHECKPOINT.cmd` replays it with `--fast-replay` (no host pacing and no host speaker output while replaying; guest work, SPU2 state and timing are unchanged), then pauses at the checkpoint (`--input-replay-wait-live`) until a key is pressed. A 124M-slice resume takes about 55 s (114 s before the speaker fix: `HostAudioOutput::append` blocks on WinMM buffers). Launchers now play a copy in `%TEMP%\haunting-toc-probe\play\` so rebuilds don't collide. True disk save states were scoped (serializers for every EE/IOP/device subsystem plus many run-loop locals) and deferred by the user.
+
+## 2026-10-11 Door-section stop at 2abf60 — object family 46df00 rooted; awaiting user retest
+
+User manual play (EXE e053f17b…) froze entering the next door section, at about 230M slices. The log shows an explicit stop: `EE stopped at 0x2abf60: address has no static translation; a0=0x17f3550 ra=0x20957c`, from the existing generic virtual call JALR 209574 (slot+0c), previously configured only for the stairs table 46dfc0. Own ELF scan: word 2abf60 occurs once, at 46df0c, i.e. slot+0c of the 64-byte table 46df00 (installers 20a6c8/cc and destructor 2abf18/1c). Following the 46dfc0 family workflow, `config/haunting_ground_us.toml` adds 2abf60 to site 209574 and roots all 12 uncompiled methods (2abf00/60/70/80/90/a0/b0/c0/e0/f0, 2a8950, 2ac010). 2097f0 and 128080 were already roots. All bodies were decoded and bounded by our own decoder; shared HG config bounds agree (corroboration only). `hg.py emit` changed 1 shard (511,089 reachable words). Rebuilt EXE `276e7c570364aab3d3791d7d92c3b3d123691658fe65aad58433b0613e53c7d8`; translation tests pass. Config backup `%TEMP%\haunting-toc-probe\door-2abf60\preedit` (19ca6c5c…). Relaunched for the user. **Pending:** user retest past the door, and a pinned 180M regression replay (not yet rerun; the change only adds roots).
+
+## 2026-10-11 MILESTONE — heavy gameplay holds 30 FPS at native pacing in the default configuration (HG-PERF-119)
+
+**Change (HG-PERF-119):** `runtime/device_thread.cpp` now enables speculative VU1 workers by default: 3 with ≥8 host threads, 2 with ≥6, otherwise 0. `HG_VU_WORKERS` still overrides (`0` disables), and the log prints `Host VU1 speculation workers=N`. They commit in original order and re-execute exactly on any mismatch (HG-LEARN-077). Without them the same build measured 24.71 / 23.64 (stage B/VU1 limited). `device_thread_tests` passes with the default (9 pipelines start workers). Backup `%TEMP%\haunting-toc-probe\hg-perf-119\preedit` (`device_thread.cpp` 4d41ba7c…).
+
+**Final production build** (`HG_HOST_SYMBOLS=OFF`): EXE SHA-256 `e053f17bbb697fe28cd7b350c17c753d90d029e9dab273590bf71a244eb88240`, 164 provenance inputs. Pinned authentic 180M inputs, no environment overrides:
+- **Unlimited (throughput):** heavy aggregate **42.22 / 42.52**, per-interval p10 41.39 / 41.61, **0 of 28** intervals below 29.9.
+- **`--realtime` (actual paced play):** heavy aggregate **29.96**, median 30.00, 27 of 28 intervals at 29.91–30.08, one at 29.01 (a pacing catch-up interval).
+- Both have 5,270 writers, zero unexpected writers, lost traces or caller mismatches, and **byte-identical** frame/EE RAM/GS VRAM/GS state/VU1/console/metadata versus pinned control `20261011T043708Z-4f21…` (raw IOP RTC bytes differ as always).
+- Full regressions pass: `gs_gpu_tests` (four modes: 50,412 texel + 14 epoch + 1,159/1,369 cases), runtime, translation, VU readiness, device thread.
+
+**What got it there (this session):** threaded benchmark contract + `--frame-rate-probe` (HG-PERF-114/HG-DIAG-114); host stack sampler + optional PDBs (HG-DIAG-115); deferred resident GL error polling (HG-PERF-115, provisional, +3.7%); all ATST modes on GPU triangles (HG-PERF-116, ~+11%); preview file writes off stage C (HG-PERF-118, heavy p10 29→41); VU workers by default (HG-PERF-119). Rejected: HG-PERF-117 GIF qword coalescing (flat). Synchronous `--profile` figures (~13–15/s) never represented threaded play.
+
+**Limits / not claimed:** measured on one host (Ryzen 7 9800X3D, RTX 5070, NVIDIA 617.42, Windows, Balanced power plan) and one pinned heavy route (to 180M slices). Other scenes, weaker CPUs (<8 threads) and Linux are unmeasured. Hosts with fewer threads get fewer or no workers. Audio, saves and full playability remain separate milestones. Interactive play via `hg_game` uses the same threaded device path; the realtime result above is from the hidden host with recorded input.
+
+**Next:** (1) broaden qualification to other heavy scenes and a weaker/8-thread host if available; (2) re-judge HG-PERF-115 now that stage C has headroom; (3) remaining stage-C costs, if needed: readback `download` (~17%) and CPU triangle setup.
+
+## 2026-10-11 HG-PERF-118 RESULT — retained: heavy scene sustains >40 updates/s (0 of 28 intervals below 29.9)
+
+**Evidence:** an HG-DIAG-115 profile of HG-PERF-116 showed a posted stage-C closure at 13.2% of stage C: the `--preview-file` publisher. With a host it runs at up to 60 Hz (every vblank after 16 ms). Each call did the ordered committed-VRAM readback (`display_image`), then a synchronous PPM encode, open/write, remove and rename on stage C. **Change** (`runtime/system_diagnostic.cpp`): readback and host presentation stay at the original ordered point. The file encode/write runs on a host writer thread that keeps only the latest frame (the preview is a sampled diagnostic). The writer is declared before `device_owner`, so posted closures cannot outlive it, and it stops without writing. The fault/budget dump publication is synchronous (drain, then write), so the retained file is exact. Interactive play without `--preview-file` never paid the file cost. **Result**, three interleaved pairs vs HG-PERF-116, threaded + VU3, symbol build: candidate `80033d55…` aggregate **43.10 / 42.11 / 42.34**, per-interval p10 42.39 / 41.19 / 41.80, **0 of 28** heavy intervals below 29.9 in every run. Control `0d7a06a4…`: 36.45 / 37.72 / 35.58, p10 29.71 / 29.91 / 28.52, with 5 / 2 / 6 below 29.9. All captures, including the final `frame.ppm`, are byte-identical with 839 writers. Backup `%TEMP%\haunting-toc-probe\hg-perf-118\preedit` (`system_diagnostic.cpp` 978479fa…).
+
+## 2026-10-11 HG-PERF-117 RESULT — rejected (GIF qword coalescing on stage B, flat)
+
+Coalescing consecutive forwarded GIF qwords into owned `gif_words` blocks (flushed before every other C-bound command, job marker and publish) passed `device_thread_tests` and kept captures byte-identical. It measured aggregate 34.66 / 34.14 / 33.53 vs HG-PERF-116's 34.81 / 33.94 / 35.78 (flat to −2%). `device_thread.cpp` was restored byte-exact (`4d41ba7c…`, fresh mtime). Per-qword ring overhead is not the stage-C cost; the packet application it feeds is.
+
+## 2026-10-11 HG-PERF-116 RESULT — retained: heavy-window aggregate crosses 30
+
+Three interleaved pairs against the HG-PERF-115 build, threaded + VU3, all byte-identical captures with 839 writers. Candidate `0d7a06a4…` heavy aggregate **33.24, 31.83, 30.63** (mean 31.90). Controls `0b0ecf04…`: 26.49, 21.37 (disturbed run, 184 s wall), 31.00. **But sustained 30 is not yet met:** per-interval medians are 29.69 / 30.37 / 29.62, and 13–17 of 28 heavy intervals stay below 29.9 (worst 21.6–26.6). Fast intervals up to 44/s lift the aggregate. Next: HG-PERF-117 GIF qword batching on stage B, then re-profile the slowest intervals. Host variance between runs is large (one control median 21.7, another 31.5), so decisions use several interleaved pairs.
+
+## 2026-10-11 HG-PERF-116 written plan — all GS ATST modes on the GPU triangle path
+
+Submission (`gs.cpp` triangle `submit`) rejected any alpha test except ATST=NOTEQUAL, so GEQUAL-tested triangles (≈1.36M PSMT8 + 0.22M PSMT8H on the route, HG-DIAG-112) ran the scalar CPU loop on saturated stage C. Change: carry ATST in the free job word 27 (`GsTriangleJob::ALPHA_TEST`), evaluate all eight `gs_compare_test` modes in `gl_triangle_shader.hpp`, and keep AFAIL≠KEEP rejected. The CPU reference (`draw_depth_frame_pixel`) writes nothing for AFAIL=KEEP failures, so ordering relative to the Z test is irrelevant. The test fixture now covers every ATST mode with varied AREF, and untextured variants must reach the GPU, which proves activation. GPU matrix and runtime suites pass. Backup `%TEMP%\haunting-toc-probe\hg-perf-116\preedit` (`gl_triangle_shader.hpp` 3068b1af…, `gs.cpp` aac4fbc4…, `gs_gpu_tests.cpp` 14efc4c9…). Candidate EXE `0d7a06a4…`.
+
+## 2026-10-11 HG-PERF-115 RESULT — provisionally retained (+3.7% mean / +5.0% median heavy window)
+
+Five interleaved threaded-VU3 pairs, all byte-identical captures with 839 heavy-window writers. Candidate `0b0ecf04…`: 28.97, 27.22, 24.90, 29.62, 29.76 (mean 28.10). Control `0950ebd3…`: 24.90, 27.53, 27.59, 27.77, 27.63 (mean 27.09). Mean wall 139.2 s vs 142.4 s. Three of five candidate runs exceed every control. The deterministic mechanism is the removal of the 14.5% stage-C driver block, but variance keeps the gain at the gate boundary. Retained provisionally; it will be re-judged in a stacked comparison. GL errors still fault explicitly at download/finish/owner switch/teardown (HG-ARCH-009 case updated to require the fault by `finish`).
+
+## 2026-10-11 HG-PERF-115 written plan — resident GL error checks at coherence points only
+
+**Evidence (HG-DIAG-115 sampler + PDB, threaded VU3, 150M–179M, stage C):** `gl_gs.cpp:439`, the post-`glFlush` `glGetError()` in resident `flush()`, is **14.5% of all stage-C samples**. The NVIDIA driver blocks in a kernel wait there. `download()`'s `glGetBufferSubData` is 7.3% (an inherent sync). Stage C is saturated in the heavy scene (HG-PERF-114). **Change:** resident mode only. `flush()` sets `gl_errors_unchecked` instead of polling. `glGetError` runs at every coherence point where GPU output can become CPU/guest/presentation visible: `download()` (already checked), `finish()`, `select_memory()` owner switch, and teardown. Any error still throws the explicit `GS compute …` fault and revokes native epochs before CPU visibility. Nonresident mode is unchanged (it reads back every flush). Unlike HG-FAIL-067, which only moved the poll before `glFlush` and was judged under synchronous `--profile`, this removes the per-flush poll and is judged where stage C is the critical path. **Validation:** GPU matrix (the HG-ARCH-009 GL-error case now expects the fault at the next coherence point), runtime suites, then adjacent threaded-VU3 control/candidate/control on the heavy-window metric (`heavy_150_179_hz`) with byte-identical captures. Gate: ≥5% over adjacent controls. Backup: `%TEMP%\haunting-toc-probe\hg-perf-115\preedit`.
+
+## 2026-10-11 HG-PERF-114 RESULT — normal-threaded authentic 180M baseline established; stage C is the critical path
+
+All runs used identical pinned inputs and finished with 5,270 writers, 0 unexpected writers, lost traces or caller mismatches. Frame/EE RAM/GS VRAM/GS state/VU1/console/metadata are **byte-identical** to pinned control `20261011T043708Z-4f21…` (raw IOP RTC bytes differ as always). EXE `abb8ed5a…` (`6c139d82…` after adding HG-DIAG-114 `--frame-rate-probe`, which only gates the existing writer probe):
+
+| Mode | Wall (180M) | Qualified 30-writer checkpoint rate, 174M→179M |
+|---|---|---|
+| `--profile` synchronous (control rerun) | 296.1 s | 12.67, 13.15, 12.96, 13.73, 15.41, 15.94 (pinned control earlier: 14.82 final) |
+| threaded (`--frame-rate-probe`) | 168.6 s | 24.12, 24.30, 24.35, 24.76, 24.60, 25.48 |
+| threaded + `HG_VU_WORKERS=3` | 143.4 s | 25.23, 25.27, 26.47, 27.26, 29.72, 28.86 |
+| same + `HG_DEVICE_STATS=1` | 142.8 s | 27.91, 27.42, 26.39, 26.88, 29.42, 28.65 |
+
+The threaded `budget` line (~2.2/s) includes shutdown/dump time after the loop, so it is not a gameplay interval; use checkpoint intervals. **HG-DIAG-091 stage stats (150M–170M heavy section, VU3):** stage C idle **0%** (saturated); EE thread join wait ~47%; stage B blocked on full C ring ~38%; B stealing VU jobs ~16%. Whole-run totals: C idle 12.0 s of 142.8 s. **Conclusion:** normal threaded play with 3 VU workers is already at ~25–30 qualified updates/s in the heavy scene. The remaining gap to 30 is stage C (GIF assembly + GS register/draw construction + GL submission/coherence), which needs roughly 10–20% less per-frame work. The ~14/s synchronous `--profile` figures understated real threaded throughput by about 2×. Next: HG-DIAG-115 opt-in stack sampler for stage threads to rank stage-C cost before any optimization.
+
+## 2026-10-11 HG-PERF-114 written plan — Phase 0 normal-threaded fixed-input benchmark (no source change)
+
+**Why now:** HG-ARCH-011 as drafted (shadow native PSMT8 triangle pass) would mostly duplicate the existing exact compute triangle path. That path already admits PSMT8 with integer STQ, and rejects only ATST≠NOTEQUAL (GEQUAL ≈1.36M of 52.5M PSMT8 triangles per HG-DIAG-112). The native plan's Phase 0 (a normal-threaded benchmark) is still missing, so every 180M number is synchronous `--profile` (HG-DIAG-110). **Contract (`gameplay180m_threaded`):** identical pinned inputs to `gameplay180m_authentic` (`toc.bin`, `input-events.txt`, 180,000,000 slices, `--clock-profile issue-slots`, `--gpu-sprites --gpu-resident --gpu-triangles`, hidden host, `--unlimited`, `--no-host-input`), with **only `--profile` removed**, so `system_diagnostic.cpp` creates the VIF1/VU1 and GIF/GS `DeviceThread`s (exactness: HG-LEARN-076, `device_thread_tests`). Optional variant `HG_VU_WORKERS=3` (HG-LEARN-077). **Acceptance:** 5,270 `0x1BEF84` writers, zero unexpected writers/caller mismatches/lost traces, and byte-identical frame/EE RAM/GS VRAM/GS state/VU1 data/defined/micro/state/console versus pinned control `project-link-runtime/20261011T043708Z-4f21ae1591ba4154b82278f8180599f4` (raw IOP RTC bytes excluded as before). **Runs:** sequential, current build EXE `abb8ed5a…` copied into each run directory: (a) exact `--profile` control rerun, (b) threaded, (c) threaded + 3 VU workers. Metric: final `interval_hz` (30 writers) plus 175M/180M checkpoint intervals, and wall time. These are labeled host update rates, not console FPS.
+
+## 2026-10-11 HG-ARCH-010 — native GL_R8UI indexed texture + palette residency VERIFIED (shadow sampling only)
+
+New `runtime/gl_native_indexed.{hpp,cpp}` (`NativeIndexedGlResidency`, linked into `gs_gpu_tests` only) uploads epoch-verified staged PSMT8 indices as immutable `GL_R8UI` textures and CT32 palette snapshots as SSBOs. Both use bounded 8-entry LRUs keyed only by the new process-wide identities `NativePsmt8LinearTexture::content_id` (minted by `NativePsmt8TextureCache` on staging) and `NativePaletteSnapshot::identity`. A test-only compute shader point-samples through the GS CLAMP modes, then texelFetch → palette. **50,412 exact GPU-vs-`point_sample_tex0` comparisons pass** on RTX 5070 / NVIDIA 617.42. Coverage: 10 TEX0/CLAMP fixtures (HG-ARCH-005 set plus mixed per-axis modes), TBP0 0x3fff/8191 physical wrap, 1024² texture, coordinates −70000…70001, and full nominal envelopes for textures ≤128². Reuse: a cache hit keeps the identity and causes no upload. A CPU write to a source texel restages a new identity, and the GPU follows the mutated byte. A palette reload mints a new identity and uploads once (clean run counters: texture uploads=12, hits=11, palette uploads=2, hits=21, 2,109,855 bytes).
+
+**Mutation evidence:** a wrong REPEAT wrap (`abs`) fails at u=v=−70000. Keying residency by TEX0 was **initially not caught**: the 10-fixture loop overflowed the 8-entry LRU and evicted the stale entry. The test now makes the pre-mutation content resident right before the write and requires the sampled colour to change. The same mutation then fails ("restaged content was not uploaded"). The source was restored byte-identically (diff clean) and rerun clean.
+
+**Validation (clean):** `gs_gpu_tests` nonresident 50,412+1,159, `--triangles` 50,412+1,369, `--resident` 50,412+14+1,159, `--resident --triangles` 50,412+14+1,369; runtime/translation/VU pass. Provenanced `hg_game` EXE SHA-256 `abb8ed5a70b4b28acea162468faaef232efa9581f668fd3af4dbc6570470e06a`, 162 inputs, inputs SHA `8c9aa982…`. The game only sees the passive header fields/counters (`content_id`, `identity`), so its behavior is unchanged. Source SHA-256 prefixes: `gl_native_indexed.cpp` 7b27d1e1…, `.hpp` 4b1135a9…, `native_psmt8_texture.hpp` a8d7df0f…, `native_psmt8_cache.hpp` 17df8015…, `native_indexed_draw.hpp` 67a3a008…, `gs_gpu_tests.cpp` fb6adf03…, `CMakeLists.txt` 68803504….
+
+**Limits:** point sampling only. Not covered: bilinear (GS bilinear over 4 CLUT colours), TEXA, CT16 CLUT/CSA/CSM2, texture function, alpha test, depth, coverage, or frame writes. The residency is not connected to the resident accelerator's GL context lifetime or game. No FPS claim. `v1/` untouched.
+
+**Next gate (HG-ARCH-011):** a shadow native **triangle** pass into a private GL target, with no guest-visible effect. Take one PSMT8 `NativeIndexedDraw` (from `prepare_native_psmt8_draw`), render coverage + STQ/UV perspective texture lookup + texture function + ATST NOTEQUAL/GEQUAL + ZTST into renderer-private CT32/Z32 buffers seeded from the same VRAM. Compare every pixel/Z against the CPU rasterizer on synthetic draws. This is the first real pixel-parity gate; exact GS edge/STQ rules come from the first-party `gs.cpp` rasterizer.
+
+## 2026-10-11 HG-ARCH-010 written plan — native indexed texture/palette GL residency + shadow point-sample parity
+
+**Goal:** the first native-GPU texture step after HG-ARCH-009, with no frame/depth writes. New `runtime/gl_native_indexed.{hpp,cpp}` (linked into `gs_gpu_tests` only, not `hg_game`): bounded GL residency of staged PSMT8 indices as immutable `GL_R8UI` textures, plus CT32 palette snapshots as 1 KiB SSBOs. Reuse is keyed **only** by identities minted when content is created: `NativePsmt8LinearTexture::content_id` (assigned by the epoch-verified `NativePsmt8TextureCache` when it stages; 0 = uncached, always re-uploaded) and `NativePaletteSnapshot::identity` (assigned in `native_psmt8_palette_snapshot`). Both come from process-wide monotonic counters, so pointer or address reuse cannot alias. A test-only shadow compute shader point-samples given (u,v) through the GS CLAMP modes (REPEAT via power-of-two mask, CLAMP, REGION_CLAMP, REGION_REPEAT), then `texelFetch` index → palette, and reads the results back.
+
+**Correctness source:** the first-party `gs_wrap_texture_coordinate` / `GsRegisterState::point_sample_tex0` CPU renderer (CT32 CLUT, CSM1, CSA=0), with no external renderer material. **Validation:** in `gs_gpu_tests` (always run, plus `--native-texture` alone), compare GPU vs `point_sample_tex0` across the HG-ARCH-005 TEX0/CLAMP fixtures (unaligned/last-page wrap, 1024² texture), negative/large/out-of-nominal coordinates, and full nominal envelopes for small textures. Prove reuse: a second lookup gives no upload, a CPU source write restages to a new content_id and the GPU result follows it, and a new palette load gives a new identity. Headers touched by `gs.cpp` (passive) require the provenanced game rebuild; behavior is unchanged. Backup: `%TEMP%\haunting-toc-probe\hg-arch-010-native-indexed-residency-20261011\preedit`. No FPS claim; `v1/` untouched.
+
+## 2026-10-11 HG-ARCH-009 — resident GL page-epoch hooks QUALIFIED on live OpenGL; still inactive in production
+
+New `native_epoch_gate()` in `tests/gs_gpu_tests.cpp` (runs in every `--resident` run; `--native-epochs` runs it alone) drives a separate resident sprite+triangle accelerator with a shared `NativeVramPageEpochs` on the real RTX 5070 / NVIDIA 617.42 GL 4.3 context: **14/14 cases pass**. Proven at real GL boundaries: no trust before first resident use; queued sprite output pages pending and stamp-refused while unwritten texture page 256 stays stampable; `flush()` submission + `glFlush` does **not** complete; a disjoint CPU word write ticks only its page; a one-page `read_span` readback completes only page 0; `finish()` completes all; requeue never revalidates an old stamp; masked upload into a submitted page pends; complete-page `write_discard_span` supersedes only that page; a CPU point primitive's raster scope orders and ticks page 0; an untextured GPU triangle (accepted count 1) pends frame but not ZMSK depth pages; owner swap rebaselines and rejects old stamps; destroying the resident owner, a deliberate `GL_INVALID_ENUM` flush fault (which still throws) and accelerator teardown each revoke trust. Every step compares VRAM with the scalar renderer.
+
+**Defect fixed:** `discard_write` left epoch pending counts on discarded pages (conservative but permanently untrusted until an unrelated readback). Added `NativeVramPageEpochs::gpu_superseded_pages` and one call in the resident discard path (generation still ticks via `cpu_mutable_pages`), plus a synthetic `runtime_tests` check. **Mutation evidence:** removing the fix fails with "discarded page still pending"; marking writes complete at `glFlush` fails with "glFlush submission treated as GPU completion". Both mutations were restored. Pitfall during this check: restoring with `cp -p` kept an old mtime, so MSBuild skipped recompiling, and the first full-matrix `--resident` run used the mutated binary. After `touch` + rebuild, all results below are from the clean binary.
+
+**Stale fixture fixed:** the HG-PERF-106 wide-STQ fixture now follows `accepts_native_float_stq()`. While the capability is disabled (HG-FAIL-063), it requires no backend submission and CPU equality. `--resident --triangles` therefore runs to completion for the first time since that disposition.
+
+**Validation (clean binaries):** `gs_gpu_tests` nonresident 1,159, `--triangles` 1,369, `--resident` 14+1,159, `--resident --triangles` 14+1,369, `--native-epochs` 14 — all pass; `runtime_tests`, `translation_tests`, `vu_readiness_tests` pass. Provenanced `hg_game` built: 160 inputs, inputs SHA `f3d44b00…`, EXE SHA-256 `9b2d4bba88f46dbacf6fd2e9597d3a5f3eae90f9561fff5f3beee0a8c481f6c7`. Source SHAs: `gl_gs.cpp` 8900df3e…, `native_psmt8_cache.hpp` 3f724998…, `gs_gpu_tests.cpp` d4067ba2…, `runtime_tests.cpp` 994a81fb…. Logs: `%TEMP%\haunting-toc-probe\hg-arch-009-resident-epoch-gate-20261011\`. Builds used a plain Git-Bash `cmake --build build --config Release --target … -- -m:1` (`MSYS_NO_PATHCONV=1` is required so `-m:1` is not path-mangled). The harmless MSBuild `'pwsh.exe' is not recognized` post-step note is not from project CMake.
+
+**Limits:** production callers still pass null epochs, so there is no gameplay behavior change, no replay and no FPS claim. No native pixels. `v1/` untouched.
+
+**Next gate:** native indexed-texture GPU residency. Upload `native_psmt8_stage_texture` bytes as `GL_R8UI` plus a CT32 palette texture keyed by `clut_load_count`, reuse them only on matching epoch stamps, and add a shadow sampler parity test: a GPU shader fetches indexed texel → palette and compares exactly against `GsRegisterState` sampling for the HG-ARCH-005 variants. Still no frame writes.
+
+## 2026-10-11 HG-ARCH-009 written plan — live resident GL page-epoch qualification gate
+
+**Problem:** HG-ARCH-008's optional `NativeVramPageEpochs` wiring in `runtime/gl_gs.cpp` is compile-checked only; no test drives real resident OpenGL queues/readbacks with a tracker attached. Baseline evidence (this session, current source rebuilt): `gs_gpu_tests` nonresident and `--resident` each pass 1,159 cases; `--resident --triangles` stops at the HG-PERF-106 wide-STQ fixture ("not submitted to native-relaxed triangle backend") because `Accelerator::accepts_native_float_stq()` is deliberately `false` (capability disabled per HG-FAIL-063). The pre-existing `build/Release/gs_gpu_tests.exe` was a stale probe build and was rebuilt before measuring.
+
+**Source review finding (hypothesis to test):** `discard_write` clears `gpu_dirty` for complete-page replacements but leaves epoch pending-writer counts, so a discarded page stays untrusted until an unrelated later readback. Conservative (never stale) but a liveness defect. Proposed fix: new `NativeVramPageEpochs::gpu_superseded_pages` clears pending counts only for pages whose CPU shadow became authoritative after ordering queued users (generation still ticks via the existing `cpu_mutable_pages`).
+
+**Change:** (1) `tests/gs_gpu_tests.cpp`: new resident fixture (always in `--resident`; `--native-epochs` runs it alone) using a separate accelerator with a shared tracker. Assert: no trust before first GPU use; queued sprite pages pending and stamp-refused; texture page not pending; `flush()`/`glFlush` does NOT complete; disjoint CPU write ticks only its page; single-page CPU read completes only that page; `finish()` completes all; requeue invalidates old stamp; masked write while GPU-dirty pends; discard-write supersedes; CPU raster scope; untextured GPU triangle pending/completion; owner swap rebaselines and rejects old stamps; owner destruction and accelerator destruction revoke trust; deliberate `GL_INVALID_ENUM` flush fault revokes trust. Every step compares VRAM with the scalar CPU reference. (2) Make the wide-STQ fixture follow the backend's `accepts_native_float_stq()` (expect no submission and CPU equality while disabled). (3) Add the `gpu_superseded_pages` method + one call in `discard_write`, plus a synthetic runtime test.
+
+**Validation:** rebuild `gs_gpu_tests`, `runtime_tests`; run nonresident, `--resident`, `--resident --triangles`, `--native-epochs`; runtime/translation/VU suites; provenanced game build. Production epochs stay null, so no replay/FPS claim. Backup: `%TEMP%\haunting-toc-probe\hg-arch-009-resident-epoch-gate-20261011\preedit` (+`MANIFEST.sha256`; `gl_gs.cpp` 50d1c9ea…, `gs_gpu_tests.cpp` e317ba6e…, `native_psmt8_cache.hpp` fc2c8283…, `runtime_tests.cpp` a141918e…). `v1/` untouched.
+
+## 2026-10-11 HG-ARCH-008 — opt-in resident epoch hooks BUILT, synthetic tests pass; live GL UNQUALIFIED
+
+Added an optional fourth shared `NativeVramPageEpochs` argument (default null, no production enabling) to `runtime/gl_gs.hpp`/`gl_gs.cpp`, preserving the original resident `GsMemoryObserver` and all GPU/CPU ordered flush, download, stencil/masked, pixel and fault paths. With non-null epochs in a resident host, `Accelerator` now forwards single/bulk CPU mutable and discard pages, queued masked/sprite/triangle GPU writes, memory-owner forgetting, and coherent new-memory baseline. On actual successful `get_data` readback it calls new `NativeVramPageEpochs::gpu_completed_visible_pages` to retire **all** pending writes for requested pages. Submission-only `glFlush` **does not** mark GPU writes complete. Explicit resident-readback and dispatch error paths invalidate trust. The existing default-null rendering path should be behavior-identical apart from inactive pointer branches, but this has **not** been newly demonstrated by authentic replay.
+
+**Validation:** build_tests `12822a86479d43c28451d74d7524b458`, runtime `d8f6f299eca24b72a2fe9a44f993b631`, translation `126d8adf5c7f4639a1db1be7894fad27`, VU `a06c8c30e8c849e99991b944d488d220`, and full linked game `8dd8885925f94206bf0a63eecc7c04a4` all **succeeded**. Final EXE SHA256 `628e9c217667295d03ed5df5392599329678871fcb3f92e871eb1a4dae52f3ce`, 160 provenance inputs. Synthetic test proves disjoint CPU page invalidation keeps unrelated stamps, two queued GPU writes cannot preserve an old source, a *completed* page readback clears both producers, and impossible repeat completion revokes all trust. 21,292 PSMT8 texel comparisons and all prior runtime gates remain passing.
+
+**Explicit qualification limit:** Project Link currently has no configured direct `gs_gpu_tests --resident --triangles` task. Therefore the optional live GL callback wiring is compile-checked but not exercised against real resident OpenGL queues/readbacks; **do not enable it in the production game or promote to native draws yet**. No source shader/FBO pixel replacement, actual gameplay FPS change, or new 30 FPS verification. All files backed up externally by Project Link: epochs `187610ca555b467cb67c01ff9ebb3ee0`, GL header `e1a93caf79b84730a805a64d80ee1a77`, GL source `aba75ea1119e4b1a80d53e4f6a2667aa`, tests `31d537bc29cb4b8d8976225b1db3ee4e`. `v1/` untouched.
+
+**Next executable gate:** add a bounded, project-configured resident GPU synthetic test runner that explicitly passes a shared page tracker to the live accelerator, then asserts page stamps around accepted GPU queue, `flush` without readback, completed `finish`/targeted CPU readback, CPU raster scopes, masked/discard writes, context faults and memory-owner swaps. Run synthetic resident and nonresident baseline, then authorize native integer texture upload/parity prototype only after trusted source/CLUT generations and correct alpha/Z/coverage. Do not replay unchanged synchronous 180M just to claim FPS.
+
+## 2026-10-11 HG-ARCH-008 written plan — optional resident GPU epoch event composition (completed; original plan)
+
+Goal: attach the verified `NativeVramPageEpochs` state *in addition to*, never instead of, the preexisting resident OpenGL `Accelerator::Observer`. Add an optional host-only fourth `make_gl_sprite_accelerator` parameter (nullptr by default), inactive for existing production call sites. After a coherent old-owner flush/readback and before the first new enqueue, reset the tracker baseline for the current memory. Notify CPU writes at both `cpu_access` and bulk `cpu_scope`/whole-page discard paths, GPU writes **when queued** (sprite, masked transfer, triangle), mark *completed* only after successfully synchronized actual `glGetBufferSubData` pages, never at `glFlush`; invalidate on forgetting memory or explicit GL sync/error fault. Track multiple queued writes to the same page via a new aggregate completed-readback method; reject mismatched completion and stale stamps. Keep readback, ordering, CPU/GPU coherence, shader output and guest state unchanged. Never attach the test-only memory observer over GL. Preserve v1. No native GL rasterization yet.
+
+Test the tracker synthetic multi-producer aggregate-completion/readback contract in `tests/runtime_tests.cpp`, ensure all existing tests build/execute, rebuild linked game; if no accessible configured resident GL test runner, **do not claim actual GPU event wire behavior is runtime-proven**. Since activation is null in production, no gameplay FPS claim, no redundant exact 180M replay. Automatic local byte backup/SHA for each source edit.
+
+## 2026-10-11 HG-ARCH-007 — page-scoped PSMT8 staging VERIFIED, inactive in gameplay
+
+Changed `runtime/include/hg/native_psmt8_texture.hpp` to request CPU-visible GS data only by first-touch physical 2048-word/8 KiB pages using `GsLocalMemory::read_span`, caching const pointers for the duration of one original PSMT8 unswizzle. The existing GL resident observer and flush/readback contract is preserved; no direct raw pointer bypass and no per-original-draw runtime installation. All original TEX0/CLAMP, coordinate envelope, original addressing and conservative source footprint remain unchanged. Added an instrumented `GsMemoryObserver` fixture in `tests/runtime_tests.cpp`: simple 128x64 PSMT8 source sampled **one 8 KiB page vs prior all-4 MiB request**; page-511/0 physical wrap sampled exactly two 8 KiB pages; no repeated or unaligned/full-image staging read. Reference GS `pixel8` matched. These are *synchronization spans*, not observed GPU transfer bytes or timing.
+
+**Validation completed:** `build_tests` e06f98b5d83c44549a6a5b5a6c16a202, `run_runtime_tests` 219c7d456a7d4e29833742dbf0c5b1db, `run_translation_tests` 80d24f16b7d74093bdb8f5ced38f673e, `run_vu_readiness_tests` 4601f528ab4d4a2e95eb6142510650dd, and provenanced `build_game` 4ad9b20b61474dbeb6c16a7198588173 all **succeeded**; 160 build inputs; linked EXE SHA256 `46a1bc3335ed50da6b4f0ef3ffcae5dea6c52371b31c5d72300230e5201c3313`. Runtime validates 21,292 exact original indexed texels, 38,400 original address memberships, epoch-cache and CPU/GPU invalidation synthetic suites. Source automatic backups: staging header `475fb4948c0a4ca4a9473152e9ee3137`, tests `61f97323fe9748cd8970e4085643cb79`. No native output or normal-threaded gameplay FPS evidence. Off-path only: repeated 180M same-render replay not warranted. Frozen `v1/` untouched.
+
+**Next gate:** integrate conservative opt-in CPU/GPU write notifications into the existing resident `Accelerator::Observer` and actual GPU enqueue / *completed readback* boundaries without replacing `GsMemoryObserver`; prove that `glFlush` submission is not confused with GPU completion, and that texture cache never hits untracked or pending producer pages. Only then start native GL pixel/alpha/Z parity work.
+
+## 2026-10-11 HG-ARCH-007 written plan — page-scoped indexed texture staging (completed)
+
+Problem: HG-ARCH-005/006 staging uses a full-4MiB `GsLocalMemory::data() const` observer read, forcing every GPU-dirty page visible on a cache miss. Implement narrowly scoped physical VRAM page reads in `runtime/include/hg/native_psmt8_texture.hpp`, caching each requested page pointer during one immutable 8-bit staging operation; leave original PSMT8 address/lane arithmetic, exact CLAMP envelope, conservative source-page bitmap, and epoch before/after checks unchanged. Every first page touch uses the existing `GsLocalMemory::read_span(page*2048,2048)` coherence path, rather than bypassing the live GL observer. Do not change guest-visible pixels, clocks, fences, queue operations, renderer activation, or frozen `v1/`. Off-path only; no FPS gain asserted.
+
+Validation: add an instrumented synthetic `GsMemoryObserver` fixture to `tests/runtime_tests.cpp`, verify one read per unique source page, exact staged bytes versus original `GsRegisterState::pixel8` across the existing 21,260 checks and unaligned TBP0 511/0 wrap, and prove the same small valid texture requests strictly less than full VRAM. Preserve old fixture result and cache eviction/invalidation tests. Automatic byte backups and SHA checks on existing header/test; build_tests, run_runtime_tests, run_translation_tests, run_vu_readiness_tests, build_game. Full authentic 180M replay is redundant while feature stays off-path, so do not claim normal-threaded gameplay FPS. If evidence fails, restore only HG-ARCH-007 changes.
+
+## 2026-10-11 HG-ARCH-006 — bounded source-page epoch and indexed-texture cache VERIFIED, inactive in production
+
+Created `runtime/include/hg/native_psmt8_cache.hpp`: a 512-page `NativeVramPageEpochs` tracker with all-page coherent initialization, conservative pre-CPU-mutation generation invalidation, pending-GPU-write counts with generation invalidation on **enqueue** (not just completion), explicit unknown-state invalidation on faults/unsupported transitions and exact page-generation stamps. A bounded 4-entry `NativePsmt8TextureCache` uses exact TEX0/CLAMP staging layout + physical read page generations to avoid stale indexed texture uploads. Cache staging remains via existing exact original-GS `native_psmt8_stage_texture`, with epoch stamp checked before/after and source page membership checked. A later design tightening bound cache to a single `GsLocalMemory` and made an unchanged-coherence-epoch hit O(1) rather than recomputing up to 512 page masks per original triangle; changed/unrelated generations use a full page-stamp comparison before reuse. Test-only `NativeEpochTestMemoryObserver` proves CPU write invalidation, **must never replace the production GPU resident observer**.
+
+**Validation:** game `build_game` job `41cb0f52f0594688a4995ba358194f44` succeeded with 160 provenance inputs and EXE SHA `98b486050e8bb211a4ae335f6188f9a039a954175b3090f3be733ccbbf9974b7`. Tests build `1d76b7d1c2ea449a81266ac6b7ae8ed5` passed. Runtime suite `88cbd4a4ea34470398d2960145d3aabb` passed, testing coherent baseline rejection, same-epoch O(1) hits, unrelated-page writes, CPU source mutations + actual restaging, two overlapping pending GPU writers, partial completion refusal, unknown completion/fault invalidation, rebaselining, no cross-GS-memory reuse, TEX0/CLAMP changes, 4-entry LRU bound, page 511/0 wrap, malformed clamp rejection and observer forget. Translation suite `6c43a3adccfd4d59b60d441aac5afe58` passed; VU suite `6939c77d356d4aab9868137dfb38e346` passed. Existing 38,400 original page-address memberships and 21,260 exact staged indexed texels also pass.
+
+**Limitations and next gate:** No production GS state or GPU draw behavior changed: only a passive `#include "hg/native_psmt8_cache.hpp"` in `runtime/gs.cpp` to bind source-provenance input, plus header and tests. The only cache observer is explicitly test-only and disallowed as a replacement for the existing GL resident `GsMemoryObserver`. Live correctness requires composed CPU/GPU notifications at actual already-ordered GL enqueue/completion/materialization fences, plus pinned normal-threaded real gameplay benchmark and *independently proved native GS pixel/depth/alpha parity*. Cache hot-hit bound is a design and test milestone, **not an FPS measurement or 30 FPS claim**. A full gameplay replay of off-path-only helpers would be redundant to exact completed HG-ARCH-003; do not repeat unchanged 180M runs. Frozen `v1/` unmodified.
+
+## 2026-10-11 HG-ARCH-006 cache review — complete off-path epochs; tighten hot lookup and memory ownership
+
+Initial new `runtime/include/hg/native_psmt8_cache.hpp` staging-cache and epoch tests compiled and passed runtime, translation, VU and clean provenanced game build (job `38643d97e3944330b8ac3a7750c0a4e3`, EXE SHA `df0ff4be6c139ac4e9358e721334849fa7d5295997ac220f2d5376a1c0fb818c`, 160 provenance inputs). Runtime suite job `b808487127eb477e8824141e49b82a28` verified CPU mutable-write invalidation, disjoint page reuse, nested pending GPU writers, genuine source-byte restaging, 4-entry LRU eviction, physical page 511/0 wrap and no use without a baseline or after observer teardown. **Review finding:** initial cache lookup recomputed full texture page footprint and a 512-page stamp on every cache hit; this would be expensive if naively attached to every original triangle. Further, cache constructor was not bound to a specific GsLocalMemory, allowing accidental cross-memory reuse if caller supplied a second memory instance. Before retaining as a future fast path, bind cache to a fixed memory object and add an O(1) same-epoch generation fast hit before the cold page-footprint/512-page verification. Full epoch increment happens before each relevant tracked CPU/GPU write enqueue, so same-epoch shortcut is only safe while `tracking_complete` remains true; any unrelated write triggers the slower page-mask check, GPU enqueue increments epoch before pending, unknown clears trust, and new baseline increments epoch. Tests verify both fast/slow paths. This is host staging design only: no production memory observer hook and no native GPU drawing, so no real FPS claim or functional replay needed. Freeze v1.
+
+## 2026-10-11 HG-ARCH-006 planned — bounded source-page epoch and PSMT8 staging cache
+
+HG-ARCH-004 proves conservative source/FRAME/Z page footprint; HG-ARCH-005 proves 21,260 original PSMT8 indexed-byte comparisons and makes a reusable row-major staging object. **Problem:** this stage currently calls `const GsLocalMemory::data()`, which can materialize the full 4 MiB VRAM. A naive call per original triangle would destroy performance and could sample stale CPU memory while GL has pending producer writes. Implement an original, header-only `NativeVramPageEpochs` tracker and bounded `NativePsmt8TextureCache` in `runtime/include/hg/native_psmt8_cache.hpp`, off by default, with precise conservative invalidation of every touched 2048-word physical VRAM page. Notify CPU *mutable access* before the write (as `GsMemoryObserver` does); notify GPU writes on **enqueue** before visible completion, keep per-page pending counts until GPU completion; reject all reuse while pages are pending; explicit coherent-baseline establishment and unknown/fault invalidation; epoch stamps capture physical page generations, not a hash. Cache key is exact TEX0/CLAMP plus physical read pages/epoch, max 4 textures; miss may call the existing full VRAM stage once, immediately revalidate epochs afterwards; never stage while any source page has unresolved GPU writes. Unit tests prove CPU-write invalidation, disjoint write reuse, multi-producer pending counts, byte-identical restage after source mutation, wrap-page coverage, changed TEX0/CLAMP misses, cache capacity bound, and conservative rejection without coherent baseline. No observer is installed into production GS: its existing GPU observer must not be replaced/bypassed. Integration with GPU resident enqueue/flush and exact guest readback is **future work**, not implied by the off-path cache's synthetic tests. Register passive header include in `runtime/gs.cpp` only to satisfy strict 159-input provenance; no native GPU draw/functional reroute, no replay needed unless an active path changes, no performance claim. Before source edits retain external Project Link backups and expected SHA; test build/runtime/translation/VU/game. Frozen `v1/` unchanged.
+
+## 2026-10-11 HG-ARCH-005 — indexed texture byte staging proven off-path
+
+Implemented original `runtime/include/hg/native_psmt8_texture.hpp` (SHA `d73e4c341039600501bb432f85a13d1c11d4e800a549f32f5d6eb26448772d37`) containing a pure PSMT8 indexed-byte stage into bounded row-major `NativePsmt8LinearTexture` for a future `GL_R8UI` texture. The stage uses the project's first-party exact PSMT8 address and 8-bit lane mapping, supports physical 4MiB VRAM wrap, odd TBW and REGION_CLAMP/REPEAT coordinates **outside nominal texture TW/TH** by staging the complete maximum physical coordinate envelope, and retains a conservative source-page mask. The immutable palette is a separate `NativePaletteSnapshot` via HG-ARCH-002. Both `requires_texture_epoch_proof` and existing native draw pixel parity/hazard proof remain mandatory: the helper's const VRAM accessor can trigger **full current CPU/GPU materialization** and thus this test-only API must never run once per original gameplay draw.
+
+New deterministic `tests/runtime_tests.cpp` HG-ARCH-005 regression compared **21,260** exact staged raw 8-bit indexed texels against independently validated original `GsRegisterState::pixel8` across TBP0/TBW/TW/TH/CLAMP variants (including unaligned/last-page wrap), checked each physical source-page membership and invalid mode rejection; job `01208f0a241b444a9b8b63dc33ef63eb` **succeeded**. Existing HG-ARCH-003 callback test, HG-ARCH-004 38,400 exact physical-address memberships and all wider runtime tests remain passing. `build_tests` `63535db5e75f4ddfab48a780f12c6dc2`, translation `9eb0cd4848e0434b934119c13cff5885`, VU `dccdb8d731bd462cbb6703acbe3e7054`, and `build_game` `7ab1697b311a46898f31ad8d271b795d` all succeeded; linked game EXE SHA `f978e3dfa0d34484c2134fe92c6361948310a52500b7b7e8f0a202c6ec166aa2`, provenance inputs=159. Production raster execution untouched by HG-ARCH-004/005 (their only `runtime/gs.cpp` change was passive includes to satisfy strict provenance). No FPS gain claimed; `v1/` remains frozen.
+
+**Next performance-critical step:** integrate an opt-in, bounded per-page VRAM generation/source-epoch tracker at existing CPU/GPU coherence callbacks and resident compute enqueue/flush fences, then cache `GL_R8UI` snapshots by *texture layout + physical read page generations* and palettes by `clut_load_count`. Only after verifying correct invalidation, texture feedback hazards and real first-party GS pixel/depth equality should the new native GL raster work actually replace eligible existing draws. Do not use the proof-only full-VRAM stage per frame; avoid repeated unchanged whole-route profiling.
+
+## 2026-10-11 HG-ARCH-004 — conservative indexed VRAM page footprint complete; tests passed
+
+Added new inactive helper `runtime/include/hg/native_psmt8_pages.hpp` (SHA `dbbb83d60ae3cb1ee897ff34ac0e38a88982365913600a23bdd1200b0887c4b8`) and passive source registration in `runtime/gs.cpp`, plus focused original-address reference tests in `tests/runtime_tests.cpp`. It conservatively marks PSMT8 source pages under all TEX0 CLAMP/wrap modes and PSMCT32/Z32/Z24 FRAME/TEST destination pages over the triangle's clipped integer bounding rectangle; unknown formats reject. Importantly a TBP0 in 64-word units can straddle a physical 2048-word VRAM page boundary: this helper marks both physical pages, including wrap between page 511 and page 0, rather than incorrectly assuming all texture pages are 2048-word aligned. `source_disjoint_from_destinations` is a **screen only**, not permission to skip texture-page epoch/coherence barriers or substitute native pixel output. Runtime regression job `3ffc2949d257438faa2e4cc7a9501f25` passed **38,400** actual original PSMT8 word-address membership cases and original framebuffer/Z tile checks, plus alias and clipping tests. Translation `260b95f82f864dd5a8fa7932e4dc8af8`, VU `011a70022e6f4f59bd639c5eb523be2c`, and provenanced game build `e6a6bfdab8e9495292c959ab72e529f3` succeeded. Production hot path only has passive header includes and prior default-null draw observer; no GPU bypass or FPS claim. Frozen `v1/` unchanged.
+
+## 2026-10-11 HG-ARCH-005 plan — original PSMT8 source linearization for a future integer native GL texture
+
+Direct indexed textures dominate original gameplay. Design a **test-only/uninvoked** packed eight-bit texel staging object in new `runtime/include/hg/native_psmt8_texture.hpp`, populated from the actual GS local-memory source by existing independently derived `GsRegisterState::psmt8_word` and byte-lane functions. Output row-major 8-bit indices suitable for a future integer `GL_R8UI` native texture; keep immutable palette separate (HG-ARCH-002) and provide exact texture read page mask (HG-ARCH-004). Decode the full **actual possible CLAMP coordinate envelope**, not only nominal `TW/TH`, since REGION_CLAMP/REGION_REPEAT may sample texels beyond nominal dimensions. If invalid TEX0/CLAMP or missing physical 4MiB VRAM, reject explicitly without any guest side effects. No texture write tracking or source-page epoch exists yet: mark the upload as `requires_texture_epoch_proof`, and note that extracting via `const GsLocalMemory::data()` can cause a full GPU materialization/readback and therefore cannot be installed per draw. Add focused synthetic comparisons of every staged byte against the project's validated original `GsRegisterState::pixel8` over varied TBP0/TBW/clamp/dimensions, including physical wrap. Register new header in the GS native object for strict build provenance; run tests/runtime/translation/VU/game build, and do not claim faster gameplay. The next step after successful byte-parity is a bounded persistent VRAM page version cache and native GL texture upload/equivalence gate.
+
+## 2026-10-11 HG-ARCH-003 — completed shadow seam, exact gameplay qualification
+
+Native contract and optional `NativeIndexedDrawObserver` post-raster seam (default null) built successfully as prov-enabled game `d0daa7c278c14b918b0eda8cb0ec0b30`; runtime, translation and VU readiness regressions all succeeded. The synthetic test in `tests/runtime_tests.cpp` confirms that the observer sees the original completed draw (sequence before counter advancement) and its palette generation, receives copied immutable state, and is NOT called when original GS rasterizer throws. Real pinned original-program 180M fixed replay job `55c8b8e9730341bdae60396a2c9d2d45` completed `budget_reached`, **5,270 expected original frame writers and zero unexpected writers/caller mismatches/lost traces**. Captures `project-link-runtime/20261011T070609Z-68c48ab1bc094df5a84950ac8ee68d8a` compare byte-exact for final image, input/TOC, EE RAM, GS VRAM/state, VU1 data/defined/micro/state, console and state metadata against pinned restored control `project-link-runtime/20261011T043708Z-4f21ae1591ba4154b82278f8180599f4`; raw IOP RTC bytes differ as in prior clean controls (masked IOP equivalence not independently established). Job's **14.7721 original writer updates/s** is synchronous `--profile` throughput, NOT real normal-threaded FPS and NOT demonstrated improvement. Retain production observer seam and header; **no native pixels, no FPS gain**; frozen `v1/` untouched.
+
+## 2026-10-11 HG-ARCH-004 written plan — original indexed texture/FRAME/Z page hazard preflight
+
+**Why:** HG-DIAG-112 identified 49.16M state-screenable PSMT8 original triangle draws, but texture/frame/depth overlap and texture page freshness remain unproved. Implement an independently derived, original GS-address-function based **pure page-footprint calculator** in a new `runtime/include/hg/native_psmt8_pages.hpp` for `NativeIndexedDraw`: conservative PSMT8 possible sampled read pages across all GS clamp/wrap outcomes, including physical page wrap and non-2K-aligned TBP0; conservative clipped vertex-bounding-rectangle PSMCT32 FRAME and PSMZ32/24 Z touched pages (reads/writes). Mark unknown formats, invalid/overflowed state or unsupported addressing as ineligible with explicit reason instead of assuming no overlap. Snapshot packet is immutable; calculator must **not** read live VRAM, modify GS, consult GPU or clear `requires_vram_hazard_proof`. Add synthetic `tests/runtime_tests.cpp` exhaustive page-membership check against the project's independently validated `GsRegisterState::psmt8_word` and frame/depth addresses across physical end-of-VRAM wrap, unaligned base and diverse TBW/CLAMP states; tests of conservative disjoint/alias outcomes, depth and unproven pixel parity markers. Only after tests pass may future texture-source epoch + GPU/CPU coherence gating treat a nonoverlapping draw as more credible; VRAM write versioning/faults and rendering pixel parity still separate. Automatic backups and exact SHA before modifying existing tests or header, build/test + replay if enabled production code changes; no active native pixels, no FPS claim. Frozen `v1/` unchanged.
+
+## 2026-10-11 HG-ARCH-003 plan — wire an optional post-raster draw observer to the real GS stream
+
+With HG-ARCH-002's exact copied-vertex/register and immutable palette-state packet unit-tested, add an **optional disabled-by-default thread-local observer** behind a new `NativeIndexedDrawObserver` interface in `runtime/include/hg/native_indexed_draw.hpp`. Call it in `GsRegisterState::rasterize_pending_draws()` *after the existing rasterizer returns without fault* but before advancing the queued-draw accounting, providing its original draw record, currently resolved `value` register environment and `GsRegisterState` read-only. Require `noexcept` observer method and no guest-visible state mutation. Default observer is nullptr, so normal input/GS/VU logic and pixels remain unmodified. This establishes an in-process observation seam for testing a future renderer without bypassing any PS2 VU/GIF state checks, and permits the test-only shadow implementation to make/verify the same `NativeIndexedDraw` representation on actual successful draw records. No live OpenGL rendering, page hazard bypass, or FPS claim. Tests install a tiny observer and exercise one original GS degenerate triangle through `rasterize_pending_draws()`, confirm callback order, copied palette epoch, and exact unchanged GS output. Build game/tests and run runtime/translation/VU regressions; preserve source backups. Retain only if zero-fault/no-side-effect checks pass, keeping frozen v1 untouched.
+
+HG-ARCH-002 build nuance: the first native contract header compiled and passed `runtime_tests` but `build_game` provenance refused it as a tracked source newer than the unchanged linked game EXE (`BuildProvenanceError: inputs newer than linked executable: runtime/include/hg/native_indexed_draw.hpp`, game build job `2aafe45765884a6d98c76c01e02679f2`). This is an expected strict manifest gate, not a C++ or gameplay failure. Adjust the planned file scope minimally: add a sole `#include "hg/native_indexed_draw.hpp"` to `runtime/gs.cpp`, without any invocation or guest-state mutation, forcing the native game object to recompile for a fresh provenanced executable. Preserve backup SHA of `gs.cpp` `88777a23f5254f8ed7a9dde129b8f0ffc844b0aaf91db45b79a68b26d3a3cf9d`. Do not relax provenance or move tracked sources outside the project. Finish full game build and record EXE hash.
+
+## 2026-10-11 HG-ARCH-002 implementation plan — independently owned PSMT8 draw + CLUT snapshot preflight
+
+HG-DIAG-112 observed 49.16M PSMT8 textured original draws satisfying broad ABE-off/DATE-off/frame-mask-off CT32 target flags, alpha compare NOTEQUAL/GEQUAL and AFAIL KEEP. This is an *opportunity upper bound*; actual safe source/dest overlap and native OpenGL coverage remain unproved. Implement a small **original first-party** host-only preflight module `runtime/include/hg/native_indexed_draw.hpp` containing an immutable `NativePaletteSnapshot` (256 RGBA8 entries generated from the *already validated* `GsRegisterState.clut/clut_valid` pair with `clut_load_count` as generation token), and a `NativeIndexedDraw` (copied 3 GS vertices and effective per-draw GS frame/texture/test/scissor/alpha/depth/CLAMP state plus immutable shared palette, sequence number and explicit `requires_vram_hazard_proof`). Preflight admits only original PSMT8 triangle cases with currently understood flag subset; its purpose is to define a future renderer-neutral data packet. Crucially, it **must not submit an OpenGL draw or claim page-hazard clearance or PS2 pixel equivalence**. CLUT generation does not prove texture VRAM state or prevent write alias; require a future source-page version and coherence fence check before actual GPU rendering.
+
+Add deterministic synthetic regression tests in `tests/runtime_tests.cpp` for palette snapshot value order/validity/immutability/version, native indexed indexed-draw vertex/register copy/immutability/sequence, PSMT8H rejection pending feedback support, ABE/DATE/FRAME mask/AFAIL/ATST exclusion, and test-time no mutation of source GS state. Only a new header and tests, **no production `gs.cpp`, GPU, guest or v1 code changes**; default runtime cost zero until a separately proven backend uses this module. Automatic original test file backup and SHA check, build tests+game, runtime/translation/VU native gates. If no safe regression implementation, remove new header and restore tests. No FPS gain claim.
+
+## 2026-10-11 HG-DIAG-112 — alpha/CLUT-aware native renderer eligibility PROVED IN SCENE, PROBE REMOVED
+
+The existing `gameplay33m` fixed task was attempted and **rejected prelaunch** (`5e6c1a6c2a094cf5ac581950be261cba`): its pinned TOC disagrees with the currently selected recording. Did **not** weaken the manifest or alter input. Used the known-good authentic `gameplay180m_authentic` 180M route instead: probe job `5a2e4d71d47946ddb66731ae5bc5b07f`, captures `project-link-runtime/20261011T064919Z-4162e6d624794c3c9738e286adf842a1`. Success `budget_reached`, 5,270 original frame-writer events, 0 unexpected writer/caller faults, no lost trace, 21,985,289 GPU-accepted triangles (unchanged). Exact byte-identical comparison against clean control `project-link-runtime/20261011T043708Z-4f21ae1591ba4154b82278f8180599f4` for final PPM, input/TOC, EE RAM, GS VRAM/GS state, VU1 data/defined/micro/state, console and metadata; raw IOP RAM differs by the established RTC variability. Instrumented 14.6649 host original-writer updates/sec is NOT FPS evidence.
+
+**Actual textured GS draw census:** `tri=68,565,026`, `textured=68,497,028` (all route). `PSMT8 0x13`: **52,473,068** textured tri, ATE on every draw, ATST=NOTEQUAL(7) in **51,114,452** and ATST=GEQUAL(5) in **1,358,616**; AFAIL 0, DATE off, 52,473,068 have Z testing, ABE on 3,128,974, FRAME mask 183,113, page-base-equal 0. An *inclusive pre-screen accepting standard ATST* admits **49,160,981 PSMT8 draws** with frame CT32, ABE off, DATE off, FOG/AA off, frame mask clear, no selected uncommon control; **46,236 identical-effective-register-state contiguous runs**, max 5,769 tri/run; this is an **upper bound, not verified native render safety or CLUT stability**. `PSMT8H 0x1b`: **15,961,608** textured tri; ATST=NOTEQUAL(7) in 14,282,553, GEQUAL(5) in 219,629, ATE off in 1,459,426 (reported in ATST=ALWAYS bucket). ABE on 2,858,442, FRAME mask 1,459,426, page-base-equal 1,459,426 (high risk of render-to-texture feedback), broad pre-screen **11,643,740**. Only 62,352 true textured PSMT4 0x14 records appeared, all with blending, and they were not included in the candidate screen. 60,804,721 of 68,497,028 total textured originals (about **88.8%**) pass the deliberately optimistic preliminary screen across 0x13 and 0x1b, with at most 5,769 same-key consecutive candidates. All screening is *upper bound* until texture alias/CLUT version/readback and native color/depth/coverage correctness are proved. Current accepted **GPU compute** job counts are not original GS draw totals.
+
+**Architectural choice:** prioritise a native **PSMT8 indexed + dynamically versioned CLUT + GS ATST NOTEQUAL/GEQUAL + depth** path, starting at the existing `GsDraw` boundary with scalar/compute fallback, rather than CT32/untextured-only. PSMT8H (source frame high alpha byte) requires explicit render-to-texture feedback and ordering analysis before native eligibility, no blind use of ordinary GL texture sampling. Key-run count is *not* safe batch count: palette can reload without TEX0 changes. Probe changed nothing game-visible; `runtime/gs.cpp` byte-restored SHA `88777a23f5254f8ed7a9dde129b8f0ffc844b0aaf91db45b79a68b26d3a3cf9d` with backup `2969fdcb4991422f928914d4f1dc08d0`. Frozen `v1/` untouched. Next: first-party native draw-state contract and exact CLUT-version/VRAM hazard gating; no unsupported FPS claim.
+
+## 2026-10-11 HG-DIAG-112 proposed — indexed texture alpha/feedback and contiguous draw-run screen
+
+Previous HG-DIAG-111 proved 68.50M/68.57M original triangle draws are textured and 99.9% textured jobs are indexed PSMT8 (52.47M) or PSMT8H (15.98M), but its alpha-off-only candidate gate admitted zero. This gate was too restrictive: actual TEX0/test profiles are needed before native OpenGL graphics code. On the existing bounded **gameplay33m** recorded input (avoid another uninformative full 180M run), temporarily add read-only aggregate observation after `GsRegisterState::rasterize_pending_draws()` resolves `value`, before executing the existing unchanged rasterization. Histogram per-format TEST.ATE/ATST, DATE, AFAIL, ABE and z modes; page-equal texture/frame (coarse alias indicator, not full overlap proof); consecutive *potentially compatible* indexed draws with identical effective register state, distinguishing PSMT8 and PSMT8H. The screen explicitly retains ATE and ATST; it is an **upper bound**, not a claim of native GS pixel equivalence or actual hazard-freedom. Aggregate-only logging at exit; never copy pixels/VRAM/payload, change original clocks, error/faults, queue, input, alpha blending or output. No external renderer source; v1 frozen. Source `runtime/gs.cpp` baseline SHA `88777a23f5254f8ed7a9dde129b8f0ffc844b0aaf91db45b79a68b26d3a3cf9d`, Project Link automatic backup. Validate build, runtime/translation/VU suites, original 33M recorded replay/writer state against recorded_control where available. **Instrumented rate is not FPS evidence.** After collecting counts byte-restore code, rebuild production, log evidence in `docs/DIAGNOSTICS.md`, `docs/NATIVE_RENDERER_PLAN.md` and this file. Native renderer implementation remains a separate subsequent gated stage.
+
+## 2026-10-11 HG-DIAG-111 native renderer textured eligibility census — COMPLETE, PROBE REMOVED
+
+Temporary aggregate-only resolved-GS-draw observer in `runtime/gs.cpp` (active source SHA `905c7a0baf69776f6463d1040e5ba7e9383375084a6ad7f99cc01530ac5a6a4c`) built and passed runtime, translation and VU readiness suites. Fixed authentic `gameplay180m_authentic` 180M replay job `f1e657b298744c76825bc54e639fb9f3` succeeded at `budget_reached` with **5,270 original frame writers**, 0 unexpected writers, caller mismatches, lost traces or native faults. Captures `project-link-runtime/20261011T063921Z-1e5cbbbe064a4e9f9a18e3f6716cef42` have byte-identical final frame, recorded input/TOC, EE RAM, GS VRAM/state, VU1 data/defined/micro/state, console and metadata versus clean restored control `project-link-runtime/20261011T043708Z-4f21ae1591ba4154b82278f8180599f4`. Raw IOP RAM differs (expected existing RTC variability; full masked-equivalence not separately proved). Instrumented 14.6357 updates/s is **not performance evidence**.
+
+**Direct original GS draw-record counts (all route, not just tail):** 70,435,512 rasterized draw records: 68,565,026 triangle records, 1,870,486 sprites. Triangles: 68,497,028 textured (99.9008%) and 67,998 untextured. Resolved triangle TEX0 PSM: **52,473,068 PSMT8 (0x13; 76.53%)**, **15,978,284 PSMT8H (0x1b; 23.30%)**, 64,470 PSMT4 (0x14), 48,604 CT32 (0x00), 600 other (0x31). Every triangle frame format is CT32 (0x00). 62,464,426 had no PRIM ABE/fog/AA, 66,897,929 had no FRAME mask, but only **1,473,952** had alpha testing disabled **and** destination-alpha testing disabled; the conservative opaque/no-alpha-test textured screen was **zero** for both CT32 and indexed, with no eligible key-run. 1,487,018 have equal frame/z vs texture *base page* (not a full texture-feedback alias proof). The stage's empty eligibility result is caused by an overly narrow baseline eligibility screen, **not proof that a native renderer is impossible**. Fragment-shader alpha test and indexed CLUT state must be evaluated as first-class features. Whole-route accepted GPU triangle count 21,985,289 is a different counter than these full GS draw records; do not conflate them.
+
+**Disposition:** Rejected *untextured or direct CT32-only native drawing as primary performance strategy*; retain native renderer design work focused on PSMT8, PSMT8H, CLUT and alpha-compare behavior. Temporary source restored through Project Link automatic backup `a75cb8cc48d64fd7926bdc8271305a6c` to original exact SHA `88777a23f5254f8ed7a9dde129b8f0ffc844b0aaf91db45b79a68b26d3a3cf9d`. No renderer change retained; no `v1/` edits. Next: narrow second-phase census of actual alpha test modes/ALPHA, effective sprite/triangle palette transitions, frame-feedback aliasing and compatible indexed draw runs, preferably on the pinned shorter 33M heavy segment first to save 180M replay time. This directly informs a native texture/CLUT shader and versioned-ownership backend; defer extensive FBO implementation until structural eligibility is proved.
+
+## 2026-10-11 HG-DIAG-111 — temporary native textured draw eligibility census
+
+**Hypothesis / gate:** a game-specific *native textured draw path* might remove meaningful renderer cost, but only if many original heavy-scene ordered draws share directly supported frame/depth/test/texture state and allow substantial consecutive compatible runs. Before writing any shader or renderer, add one **temporary, observation-only** census at `GsRegisterState::rasterize_pending_draws()` after resolving each draw's exact GS register environment and before invoking its existing rasterizer. Record (aggregate counts only) original draw primitive/textured split, CT32/PSMT8/4/8H texture modes and other format counts, frame format, blend/fog/AA flags, alpha and destination tests, frame masks, ztest/zbuf states, base-equality alias indicators, conservative opaque-CT32 candidate counts, eligible adjacent-run length, render target/texture state transitions. No per-frame per-draw dumps, no guest payload copies, no change to queue/readback/fault, no run-time interpreter or external renderer code. Reject a native opaque CT32 first step as a performance strategy if this counter's share/streak is too small; the full eligible-format census informs a broader native backend design.
+
+**Files:** `runtime/gs.cpp` only for code; `docs/DIAGNOSTICS.md` and this progress entry record activation, measured cost and restoration. Original SHA-256 `runtime/gs.cpp=88777a23f5254f8ed7a9dde129b8f0ffc844b0aaf91db45b79a68b26d3a3cf9d`. Project Link automatic byte backup required. Counter's extra host cost is unknown and **instrumented FPS is invalid as qualification evidence**. Collect one existing fixed authentic 180M replay (5,270 exact writer events, matching image/EE/GS/VU/console/input against pinned clean control) and read final counter log. It is a synchronous `--profile` route, not real threaded user-visible FPS; no throughput claim. Run builds/runtime/translation/VU regressions if needed, restore original gs.cpp and rebuild clean production immediately afterward. Keep `v1/` immutable.
+
+## 2026-10-11 native renderer research COMPLETE; clean production rebuilt
+
+Saved the independent source- and externally researched architecture plan to `docs/NATIVE_RENDERER_PLAN.md` (SHA-256 `134dfd4a14d1df75a7da72d8e7cb081b725cce0c5ecb54ac8c25e6f78c9a9e58`). No external renderer implementation was imported. The crucial current accepted-GPU-workload fact is **21,931,299 textured triangle jobs / 21,985,289 total (99.75%)**, so untextured-only native drawing is suitable as a correctness smoke test, not a throughput strategy. A safe textured-geometry coverage census is the first performance-relevant gate. Recheck current host job's normal *threaded* path before claiming a gain; the old fixed 180M `--profile` is synchronous and cannot by itself establish user-visible gameplay FPS.
+
+HG-PERF-113's unqualified header candidate was byte-restored to `runtime/include/hg/runtime.hpp` SHA `68bf7aae18ab7b6255783e3af876adcfbf0685ce739c2f32bbd1c7a4f02d130f`; **clean game build succeeded** job `60fa9e4e4bb5456cb1a44f91275ca47d`, fresh EXE hash `88c55a6e35c0d9f8b72d9a404bf2702848a18b03db1c6dde51bbdd2d3efacbd2`, 156-input provenance. Restored `runtime/gl_gs.cpp` SHA `5354e22bd...` and `runtime/device_thread.cpp` SHA `c9fee0ab...` verified. No active unqualified source changes remain; no native renderer prototype or new FPS proof is claimed; `v1/` untouched. Next action: Phase 1 read-only draw eligibility/texture-format/CLUT-feedback profile at `GsRegisterState::rasterize_pending_draws`, then a bounded opt-in native draw contract only if enough real heavy-scene textured work is eligible.
+
+## 2026-10-11 native renderer architecture pivot - independent research / design before implementation
+
+User reaffirmed permission to replace **renderer internals** provided guest-visible graphics output and behavior are preserved. Read project Markdown inventory (including archival v1, unchanged), active AGENTS/rules/skills/ARCHITECTURE/RENDERER_ROUTE_AUDIT/ROOT_CAUSE_AUDIT/DIAGNOSTICS/PERFORMANCE and current code seams. External **documentation-level** comparisons: OpenGOAL graphics and tfrag port docs, BT3-Recomp native-engine-seam docs, upstream PS2Recomp feature limitations, and PSXRecomp architecture, cited in `docs/NATIVE_RENDERER_PLAN.md`. No renderer code/config/mapping/algorithm is copied from the forbidden shared HG/PS2Recomp project, PCSX2, or any external source. The project-specific proposal will be independently derived from original game records, GS manuals, and native source. Critically, external BT3 engine-seam bypass of VU/VIF **does not** fit this project's CPU/EE/VU/VIF strictness: preserve those AOT paths. Reuse existing in-order GIF/GS draw-record boundary, separate host renderer-private state, strict readback/materialization/CLUT/SIGNAL/FINISH/fault order, and prove eligibility before batching. Existing 2026-09-27 audit rules out claiming standalone GS optimization can yield 30 FPS. Test the *combined* GPU path plus pipeline overlap and a correctly controlled threaded normal-game benchmark.
+
+HG-PERF-113 single-header DMA-quad memcpy experiment built (job `a2201de495bc484ba52e4961d0fddd72`, EXE `fca30de0...`) but was not correctness/performance qualified. Supersede without claiming an outcome; restore `runtime/include/hg/runtime.hpp` from exact Project Link backup `231a66be78ec4bf396aae8e64c6bcddb` (candidate SHA `96bfefe2...`, original `68bf7aae...`), then rebuild the clean game; do not reuse its transient EXE. This avoids stacking an unqualified optimization while a larger structural direction is designed. Performance gate for any prototype: preserve verified game identity, all original frame writers/recorded inputs, EE/GS/VU/IOP RTC-normalized evidence and fault order; no 30 FPS claim from synchronous `--profile` 180M. Frozen `v1/` remains untouched.
+
+## 2026-10-11 HG-PERF-113 written change: two EE DMA quadword LE load sites
+
+After HG-DIAG-110 proved that fixed authentic replay's dominant sampled `ee_vif_gif` phase is synchronous (not stage ring wait), try one narrow hot-path load transformation at the two validated EE VIF1/GIF DMA source readers in `runtime/include/hg/runtime.hpp`. Original QWord construction reads 16 individual source bytes and shifts each into the documented little-endian `SifLink::Quad{low,high}`; on compile-time-confirmed little-endian Windows/x86/Linux, replace these **two** constructions only with byte-preserving 16-byte `memcpy` to the same trivially copyable two-uint64 structure, falling back to the original byte loop for other targets. Do not change any source validation, special scratchpad addressing, DMA tag semantics, submission order, device threading, EE clock, fault or rendering. Existing 16-byte bounds check is retained. Pre-edit source hash `68bf7aae18ab7b6255783e3af876adcfbf0685ce739c2f32bbd1c7a4f02d130f`; take automatic Project Link backup. Rebuild game/tests, runtime/translation/VU, then authentic 180M correctness and qualified writer rate. Require >5% authentic heavy-tail gain against nearby restored control and identical retained frame/EE/GS/VU/console/input; otherwise byte-restore immediately. C++17 portable conditional and static assertion prevent unsupported layout assumptions. No effect on `v1/`. This is a hypothesis, not evidence of improved FPS; existing compiler may already optimize the old loops.
+
+## 2026-10-11 HG-DIAG-110 disposition — fixed replay is synchronous; cancelled, restored
+
+The authentic `run_game_replay` fixed-profile native argv contains `--profile` and `Host playback: unlimited`. `system_diagnostic.cpp` sets `profile_enabled=true` on `--profile` (line 379) and explicitly suppresses creation of `start_device_thread` when `(profile_enabled && !realtime)` (lines 1182-1195). Thus the otherwise dominant `ee_vif_gif` phase encompasses **synchronous** VIF1/GIF pump work in this replay, *not* asynchronous device-ring pressure. The restored-control 175M->180M differential of fixed sampling phases found `ee_vif_gif` 54,183,300 / 66,223,900 sampled ns = **81.8%** of observed main-thread phase time. This is a main-thread sampled proportion, not overall CPU time or normal threaded-game FPS. No `Host device thread: VIF1/VU1/GIF/GS` banner was present in the clean authentic replay.
+
+HG-DIAG-110 temporarily forced existing host-only `HG_DEVICE_STATS` reporting (`runtime/device_thread.cpp` source `c9fee0ab...` -> `7aa79931...`) and built successfully. Before the 180M replay passed 94M, source inspection proved the fixed runner never constructs a `DeviceThread` under these flags and no device-stage counters appeared. The uninformative job `6e4da1c40bd446a6bb21247b6551400a` was deliberately cancelled instead of burning the rest of the test. Source restored exactly using backup `4da275c6fd774e0db26985373331357a`, verified byte SHA-256 `c9fee0ab2ca9f99be5927d0e5da4d50cd2589ccb052db2d897437b7a9259a20f`, and restored game build `098f84c5546a467eac83f05005003a1e` succeeded with fresh EXE SHA-256 `796b4b7ac6b5a1703739d3e2432a020fbd4cb07f554ba6c27dd31009a2020177`. No diagnostic retained, `v1/` unmodified.
+
+**Performance-validation limitation:** the recent 14-15 qualified original-frame updates/s in 180M `--profile` replays are comparable to each other, but **do not establish FPS for normal threaded gameplay**. The previously cited ~20 FPS observed under different execution conditions cannot be called a regression without a matched threaded candidate/control route. For the 30-FPS real-gameplay objective, a future explicitly configured fixed authentic replay that does not force synchronous device mode (while preserving comparable input, frame writers, state captures and faults) is needed. Do not silently disable diagnostic checks or rewrite the approved task harness. Meanwhile, optimize the actually observed synchronous VIF/GIF transport cost only with independent source/code-level evidence; do not misattribute sampled phase-5 work to stage-B/C ring stalls. HG-DIAG-110 yielded a **disproof of measurement mode**, not an optimization failure.
+
+## 2026-10-11 HG-DIAG-110 temporary current-Windows VIF/GIF device-stage bottleneck proof
+
+Read-only comparison of preserved clean-control native 180M profile checkpoints: the 175M-to-180M phase deltas are `ee_vif_gif` +54,183,300 sampled ns out of 66,223,900 total (+81.8%), `ee_run` +3,367,600 (+5.1%), `ee_raster` +1,977,300 (+3.0%), remainder lower. These are selectively sampled **main-thread phase durations**, not an OS-wide thread CPU utilization measure or measured gameplay FPS. In `runtime/system_diagnostic.cpp` the stage covers `while(ee.pump_vif1())` and `while(ee.pump_gif())`; both enqueue device commands and may backpressure on stage B/C. It does **not** establish that byte unpacking rather than ring backpressure is the bottleneck.
+
+Before attempting another optimization, activate only the already-present HG-DIAG-091 `HG_DEVICE_STATS` host counters in one isolated authentically recorded 180M run via a temporary `runtime/device_thread.cpp` local `bool stats=true` diagnostic override. No behavior, queues, scheduling or guest state should change, though periodic log printing can alter host performance; **do not interpret diagnostic timing as a throughput comparison**. Capture `ring_full_waits`, `ring_full_s`, `join_wait_s`, B/C idle and sleep counts, command counts, transport reads and VU1 speculation counters (if active), especially the last progress snapshot and final. Verify same 5,270 original writer counts and byte-identical frame/EE/GS/VU captures with restored clean control. Restore original source via Project Link byte backup and rebuild clean production. Original `runtime/device_thread.cpp` SHA-256 `c9fee0ab2ca9f99be5927d0e5da4d50cd2589ccb052db2d897437b7a9259a20f`, no user code or `v1/` changes. Reject next-optimization guesses unsupported by measured stage-B/C pressure.
+
+## 2026-10-11 HG-PERF-112 authentic 180M qualification — REJECTED AND RESTORED
+
+Single bounded candidate doubled `runtime/gl_gs.cpp` triangle payload capacity guard from `1024*320` to `2048*320` uint32 words with fixed 4MiB payload storage; no other mechanism changed. Build game/tests plus native runtime/translation/VU checks succeeded. Candidate job `961182539b3e4d23bf35f6501f22aa94` (EXE SHA `ace68e9dfcb2cdce099dd301d25d0198d39c08c5544b2658ecf402c58a327b20`; external evidence `project-link-runtime/20261011T030627Z-64aad5ac06844913b9a61b88603e74dc`) completed 180M, all 5,270 qualified original writers, zero unexpected writers/caller mismatches/faults. It cut GPU triangle batches `36,047 -> 25,670` (**-28.79%**) and total GL flushes `58,247 -> 47,869` (**-17.82%**), but reached only **14.0522 qualified 30-writer updates/s** at the final 180M checkpoint; the 175M checkpoint interval was **7.57817 updates/s**, exposing notable host/load variance, not a reason to infer a new game fault.
+
+Candidate source was restored byte-exact to original `runtime/gl_gs.cpp` SHA-256 `5354e22bdfeed8932a6b856c7b6386d3c195bfc198ba19e60f9f59013a2bbc99` before comparison. Fresh adjacent restored-control `build_game` job `273b53b95968467286a823d39a431413` produced provenance EXE SHA `05b83408e85d35c94199cdb8b2f8e9189e895c35e912adb41387c8d62cc3b44b`. Exactly matched `gameplay180m_authentic` replay `5abc546a528c4592badf45b5a2fcf6b1` (evidence `project-link-runtime/20261011T043708Z-4f21ae1591ba4154b82278f8180599f4`) completed with 5,270 qualified writers, zero fault/mismatch, 36,047 batches and 58,247 flushes. Its final interval measured **14.8173 updates/s** (175M interval 14.4024). Candidate is **5.16% slower** at final checkpoint compared with the adjacent restored control, and not >=5% faster than either prior relevant controls (13.3947 and 14.8537). Full-route host time `282.100` candidate vs `270.743` control seconds; host load fluctuates, so avoid claiming deterministic causal regression. The candidate and fresh restored control had byte-identical final frame, recorded inputs/TOC, EE RAM, GS VRAM/state, VU1 micro/data/defined/state, metadata and console. Raw IOP RAM differed, consistent with previously documented host-RTC changes; unnormalized full IOP equality is not claimed.
+
+**Disposition: reject HG-PERF-112, retain original 1024-triangle cap.** Reduced batch count is proved but did not translate into the predeclared gameplay throughput gain. Do not retry identical cap extension. Next: isolate expensive GPU→CPU coherence/download, submitted command ordering and true final-window flush costs rather than assuming batch count is the bottleneck. The temporary HG-DIAG-109 probe is removed, all production source is restored, and frozen `v1/` remains untouched.
+
+## 2026-10-10/11 HG-DIAG-109 completed; HG-PERF-112 batch-capacity plan
+
+HG-DIAG-109's temporary `gl_gs.cpp` 16-reason census (`runtime/gl_gs.cpp` instrumented SHA `38cec721e8d1d57909b8409450ec03de61172989b7a66e9997d97968a9d56477`) passed game/test builds, runtime tests and the complete fixed authentic 180M replay (job `093861948b744a3bba8e3c28242d08f7`, evidence `project-link-runtime/20261011T025858Z-fad52a21180f44a2a1eb81d64142b547`). Exactly 5,270 writer events, no unexpected writer/caller/fault, and byte-identical final image, EE RAM, GS VRAM/state, VU1 data/defined/micro/state, metadata and console versus the restored control. Raw IOP RAM differs in host-RTC bytes as on prior equal-state controls; full masked IOP equivalence is not independently asserted. This diagnostic's host time is **not** FPS evidence. All 36,047 batches (21,985,289 triangle jobs; min 1 max 1024) were classified: **16,833 payload-capacity**, 10,985 sprite crossover, 4,863 external/unattributed, 3,366 CPU discard, zero other classified internal causes (including mappings, read/write hazards, frame/depth overlap, tile cap). Thus 46.7% of triangle batches hit the present 1,024-job cap; overall full-route GPU flush count was 58,247. This is a *whole-route* census, not yet a measured 175M--180M-specific reason count. The probe was removed through exact Project Link backup `932104e9833640bb9eeb67a67cc6afc5`; production `gl_gs.cpp` returned to SHA `5354e22bdfeed8932a6b856c7b6386d3c195bfc198ba19e60f9f59013a2bbc99`, with no diagnostic runtime cost.
+
+HG-PERF-112 proposed **single production mechanism**: raise only the triangle payload admission flush guard `triangle_data.size()>=1024*320` to `>=2048*320` in `runtime/gl_gs.cpp`, leaving mapping, texture aliases, CPU coherency, tile cap, shader, output, explicit faults, GL order and guest clocks untouched. Each admitted triangle's 320 uint32 words means 2048 triangles are 2,621,440 bytes, inside the existing fixed 4-MiB GPU job buffer; existing tile cap remains independent. Hypothesis: 16,833 capacity-caused flushes can be reduced without newly violating pipeline bounds, yielding a material native tail throughput increase; disproof is failure to activate, changed retained state/fault behavior, shader or allocation error, or <5% authentic final tail improvement against adjacent restored control under variable host load. First take byte backup via Project Link, then one-line source edit, build game/tests and run native regressions, then exact `gameplay180m_authentic` candidate; check lowered triangle batch/flush counts, 5,270 original writers, frame/EE/GS/VU/console output, faults and recorded input. Byte-restore immediately on any correctness failure or failed performance gate. Never stack the rejected HG-PERF-111 error-query relocation. Frozen `v1/` untouched.
+
+## 2026-10-10/11 HG-DIAG-109 planned temporary flush-reason classification
+
+Read-only aggregate probe in `runtime/gl_gs.cpp` only, activated temporarily for the existing exact `gameplay180m_authentic` replay and removed immediately after collecting evidence. Count every flush of nonempty triangle data, distinguish internal triggers (triangle admission capacity, mapping, texture/queued-page hazards, frame/depth overlap, sprite/masked crossover, memory owner switch, resident CPU scope/scalar access) from otherwise-unattributed external `gs_sprite_accelerator->flush()` calls; report batch-size distribution and reason totals at the existing accelerator destructor. No guest payloads, pixel contents, addresses, or unbounded per-draw records. The probe must never alter actual branch/flush decisions, guest clock, GL call/order, faults, or retained outputs. Check with native regression suite and exact authentic 180M capture against already pinned control before interpreting anything. Temporary counters add host work: *instrumented timing is not gameplay performance evidence*. Pre-edit byte hash `runtime/gl_gs.cpp` `5354e22bdfeed8932a6b856c7b6386d3c195bfc198ba19e60f9f59013a2bbc99`; automatic Project Link backup required. The 180M destructor totals supply a whole-run distribution, not an exact 175M--180M attribution; only add a checkpoint hook or separate 175M capture if the whole-run result does not distinguish structural causes. After restoration rebuild the original control and keep `v1/` unchanged.
+
+## 2026-10-10/11 HG-PERF-111 authentic 180M qualification — REJECTED AND RESTORED
+
+Direct fixed-profile replay via configured `run_game_replay(profile=gameplay180m_authentic, slice_budget=180000000, binary=current)` was callable despite the dedicated `run_gameplay180m_authentic` action not appearing in this client's MCP catalog. This executed the exact pinned 180M recorded-input route; all three jobs ended `budget_reached` (native exit 2, no unexpected runtime fault), exactly 5,270 original `0x001BEF84` writers, zero unexpected writers, lost traces, caller mismatches or invalid stacks, and equal original counter/vblank counts. Inputs and pinned TOC are SHA-identical across all runs. Clean-control EXE `2dd24b8984473136e5d353de66ecb9b2e6e683e3ade59eb3b5854cf6e3cbccad` preceded the candidate; candidate source was reproduced exactly at `runtime/gl_gs.cpp` SHA `fef589b14cf663ca5b158ddd33d416c65e8f26e32af18f3313d787f4b25a81c4` and rebuilt with the usual provenance (candidate EXE `d7b8d54f9e3a3af923de9ce322b25b2e303ab22aabf57849eeacba6687e462d3`). Candidate `build_game`, `build_tests`, runtime, translation and VU readiness all succeeded. Candidate source was restored byte-exact to `5354e22bdfeed8932a6b856c7b6386d3c195bfc198ba19e60f9f59013a2bbc99`; late-control game rebuild provenance EXE `995096863ecfa0e3fd8c6eb02b6f6b386b54559bc3c84a98d67948de8e7660c3` succeeded.
+
+Recorded authentic final 180M **30-writer** checkpoint rates (qualified updates/host second, not validated console FPS): early control `13.3947`, candidate `11.7817`, restored late control `14.8537`; candidate is -12.04% and -20.68% relative to those controls, decisively missing the predeclared >=5% gain threshold. The 175M 30-writer checkpoint rates were `11.8604 / 12.0715 / 14.4079` respectively; full 180M elapsed host profile `299.194 / 316.639 / 320.857` s, showing substantial run-to-run host variance rather than an isolatable universal speed regression. GPU sprite, triangle and bulk-scope counts are almost identical; VRAM download bytes/flush counts vary slightly from transient GPU residency choices without changing captured outputs. Do **not** infer the synthetic ~22% resident flush saving transfers to gameplay or that the candidate necessarily causes the entire observed tail slowdown. Disposition is **reject, no production retention**, for failure of the direct authentic material-gain gate; see HG-FAIL-067.
+
+Exact final-frame PPM, EE RAM, GS VRAM/state JSON, VU1 data/defined/micro/state, IOP/EE metadata, console output and recorded input logs were byte-identical between candidate and each control. Raw IOP RAM SHA differed; read-only bytes at established RTC payload `0xBFCD1..0xBFCD3` change with host clock across *both* controls and the candidate, so this is a documented expected variable, **not** a verified full masked-I/O-memory equivalence proof. Other retained state is byte-exact. No files under frozen `v1/` touched. Jobs: early control `7272e41e4ec54923ba6d2b94fe29cd74` capture `project-link-runtime/20261011T014933Z-e4badc0c20f14a75bd959953dc75c23c`; candidate `d4fb425c109948c1b2c99572f747bb66` capture `project-link-runtime/20261011T015538Z-c1de22bd2917413b9a1a8f7dfbe2c55e`; late control `7188691137964ba4a1a9e2994dec20ec` capture `project-link-runtime/20261011T020213Z-177732342f884bf5905066ce9bea2cdc`. Candidate automatic backup `f389b9afeb5441a78659010dbac9b12c`; frozen candidate file remains in external `hg-perf111-preflush-error-query-20261010/candidate`.
+
+Next priority: do not repeat HG-PERF-111 unchanged. Examine the exact `175M--180M` triangle producer/consumer flush distribution and batch-size ceiling from HG-DIAG-105/106/107 as a read-only first step, then write/backup/validate **one** materially different native-renderer optimization with a large enough measured removable cost for >=5%. Maintain guest-equivalent GPU/CPU synchronization and fault ordering, repeat authentic candidate plus adjacent controls before retention.
+
+## ACTIVE MILESTONE (2026-10-09): eliminate scene-specific renderer stalls
+
+HG-PERF-108 qualification status: **INCONCLUSIVE AND RESTORE**, not a measured
+performance failure. The exact primitive-4 fixed two-vertex carry is behaviorally
+bounded and its standalone focused cases pass ordinary strip carry, XYZ3/XYZF3
+non-drawing carry and PRIM reset. Production-shaped `build_tests`, runtime tests,
+translation tests and VU-readiness all pass. The monolithic `gif_tests` still stops
+first at its documented pre-existing `host_vu_stalled` overlap assertion after
+1,285 qword-equivalence cases, before the new block; that unrelated failure was not
+changed. Candidate sources are frozen under
+`artifacts/hg-perf108-strip-queue-20261009/candidate/`; `runtime/include/hg/gs.hpp`
+SHA-256 is `5eab3b3497bf4fdda968588227d865e328b3704af13f96ea3d3881659dabfbcf` and
+`tests/gif_tests.cpp` is `87597a8babd3875c10bb0d7aa283dc79604ab24b5be23d6a55075350749d6d93`.
+The clean linked candidate executable is
+`12d7d370dc7f3a0bf5bc0e14b0c7750d90bc7302a8f23207e400b49f501be0eb`; its
+156-input provenance records the candidate `gs.hpp` hash exactly.
+
+No 175M--180M retention result exists. Both the bounded `run_game_replay` probe at
+180M (`80e18039d67b45aab181af3ee551cc43`) and fixed frames verifier
+(`1bbae4a2f51a4ebeb7abad3b078ca61a`) fail **before native execution** with
+`TOC input differs from the imported recording`. This is the already-documented
+authentic-TOC/legacy-recording identity blocker. The frozen legacy recording catalog
+and TOC digest must not be edited, and Project Link exposes no sanctioned task-definition
+mutation; do not weaken the check or substitute a different recording. The recovered
+exact 1,472-event/180M schedule remains external at SHA-256
+`3c53f2c3034e8a03a9531bff703341131886bfa7ec6c992c0a6f403ac777341e`, but the
+connector cannot invoke that custom route directly. Because the >=5% exact-tail gate
+cannot be established, restore the pre-108 production sources rather than stack an
+unqualified optimization. Pre-edit `gs.hpp` SHA is
+`d913c91040ae761f485c8bd4992b07cb1a335913b5337b2997a572fdbe0a73be`; pre-edit
+`gif_tests.cpp` SHA is `dd6b3589db9dcf5f12a042001c72bc1071f8358167835d1febab4b9c3a1bb498`.
+The standalone `tests/perf108_strip_tests.cpp` remains inert/unreferenced because
+Project Link cannot delete newly created files; clean CMake has no target/reference
+to it. After byte-restore and normal rebuild, continue with read-only/bounded diagnosis
+from existing HG-DIAG-105 evidence until exact qualification execution is available.
+
+HG-DIAG-106 retained-evidence synthesis (no runtime/source probe): the exact HG-DIAG-105
+175M--180M deltas isolate 2,703 disjoint outer triangle samples and +2,108,700 ns of
+complete `rasterize_triangle()` dispatch time. The measured inner stages account for
++1,863,900 ns (~88.4%) of that sampled dispatch: setup +242,500 ns, first-covered
+search +250,400 ns, admission/packing +254,100 ns, dependency +106,600 ns, ordered
+backend flush +821,400 ns, job/native conversion +77,500 ns, palette +61,600 ns and
+tile insertion +49,800 ns. Only ~244,800 ns (~11.6%) remains outside those measured
+inner stages. The flush term alone is ~39.0% of sampled dispatch and is the largest
+remaining substage; HG-PERF-106/107 and HG-FAIL-042 already show that STQ fallback,
+coverage arithmetic and payload/batch-count micro-optimizations cannot individually
+supply the >=5% gate. Whole-route production counters (58,247 flushes, 33,689 dirty
+CPU scopes, 8.33 s readback) are supporting context only, not tail attribution; prior
+nonblocking GPU timing also showed substantial GPU headroom, so do not equate host
+flush time with shader occupancy. Next diagnostic, once the exact 180M route is
+sanctioned again, is aggregate-only **flush-reason attribution**: classify triangle
+`needs_flush` causes (sprite/masked crossover, mapping change, queued read/write
+hazards, frame/depth ordering, capacity) separately from CPU-scope queued conflicts
+and dirty-page downloads in the 175M--180M interval. Do not implement another
+renderer candidate before that classification or while exact qualification remains
+blocked.
+
+HG-DIAG-107 written-change plan (2026-10-10): `workspace_info` now exposes the pinned
+`gameplay180m_authentic` profile, but the replay task is not currently executable from
+this chat. Add only a disabled-by-default aggregate `--profile-flush-reasons` probe.
+When active, classify triangle flush triggers (masked/sprite crossover, mapping change,
+queued read/write hazards, frame/depth ordering, payload/tile capacity, VRAM-owner
+change) and coherence triggers (CPU-scope/scalar queued conflicts and dirty-page
+readback). Report cumulative counts and host nanoseconds at existing checkpoints; store
+no guest payload bytes and change no guest decision/order. External pre-edit copies are
+under `%TEMP%/haunting-toc-probe/hg-diag107-flush-reasons-20261010/preedit/`. Build and
+run ordinary regressions; run the exact 180M attribution only when the fixed replay task
+is callable. Remove the probe after one attribution run.
+
+HG-DIAG-107 read-only narrowing: the retained final pending GS snapshot was sampled
+at ten positions across its 45.5 MB draw queue. About 590 draws show only two FRAME/
+width/ZBUF mapping transitions; 595 sampled primitive records contain579 triangles and
+16 sprites but only one triangle->sprite and one sprite->triangle transition. For264
+valid sampled triangle geometries, average tile footprint is2.59 entries and maximum72,
+far below the >512 entries/triangle average required for the 512K tile cap to beat the
+1024-triangle payload cap. Static replay of the current triangle page-mask predicate over
+those264 backend-shaped draws finds zero inter-triangle mapping/read-write/frame-depth
+hazard flushes. These are final-queue structural samples, not 175M--180M timing evidence.
+The exact HG-DIAG-105 tail counters instead show covered+1182, backend calls+1181,
+accepted+1101 and backend rejects+80; every rejected triangle reaches the current eager
+`gs_sprite_accelerator->flush()` before constructing its precise bulk `GsCpuMemoryScope`.
+A superficially similar deferred-fallback experiment was rejected at +0.45% on 2026-09-20,
+but that predates the retained one-call bulk masked scope. The current `cpu_scope()` now
+checks `(reads|writes)&queued_writes` and `writes&queued_reads` once, flushes only on a
+real dependency, downloads only visible dirty pages and marks only writes dirty. Therefore
+a materially different future candidate is: remove only the eager pre-scope flush and
+rely on the retained bulk-scope hazard contract; change nothing else. Do not qualify it
+until the exact authentic replay task is executable.
+
+HG-PERF-109 candidate status (2026-10-10): remove only the eager CPU-fallback
+`gs_sprite_accelerator->flush()` immediately before the retained bulk
+`GsCpuMemoryScope(reads,writes)`. This is materially different from the 2026-09-20
+rejected deferred-flush experiment because current `cpu_scope()` performs one bulk
+exact dependency check, flushes only when visible CPU pages conflict with queued GPU
+reads/writes, downloads only visible dirty pages and marks only proven writes dirty.
+The one-line candidate `runtime/gs.cpp` SHA-256 `c78b51a34f82da9a520342952bd897e69c919a23b9841ecdcf0d2512cb0a6ff5`
+builds cleanly and passes `build_tests`, runtime, translation and VU-readiness suites.
+Candidate executable provenance SHA-256 `414070c7084d4e3526d6b8981ce1c42166d18446b2fcb75eec19f89e9fe02be0`
+records that exact candidate source hash. The sanctioned `gameplay180m_authentic`
+`run_game_replay` call is still rejected by the outer platform safety layer before
+Project Link executes it, so no performance/correctness qualification claim is made.
+The candidate was immediately restored; `runtime/gs.cpp` is again
+`88777a23f5254f8ed7a9dde129b8f0ffc844b0aaf91db45b79a68b26d3a3cf9d` and the normal
+production rebuild succeeds with executable SHA-256
+`1d16ab1c51f2123990223f44eaeb43fe75f20fb435bc4793573aa41e7fbb4e13`.
+Do not call HG-PERF-109 retained or rejected until the authentic exact replay can run.
+
+Direct authentic replay extension status (2026-10-10): after owner install/restart,
+`workspace_info` confirms `authentic_180m_direct_tool` v1.0.0 is loaded with fixed profile
+`gameplay180m_authentic`, fixed 180M budget, binary `current`, and no arbitrary execution.
+However this existing ChatGPT conversation still exposes the pre-install MCP tool catalog:
+`run_gameplay180m_authentic` is absent/undefined while all older Project Link tools remain
+available. This is a client/conversation catalog-refresh limitation, not a Project Link
+runtime/profile failure. Production remains restored at `runtime/gs.cpp` SHA
+`88777a23f5254f8ed7a9dde129b8f0ffc844b0aaf91db45b79a68b26d3a3cf9d`; do not reapply
+HG-PERF-109 until a fresh conversation/tool discovery exposes the direct action. No
+reinstall is required. Exact next action in a fresh Project Link conversation: verify
+`run_gameplay180m_authentic` is callable before attempting any exact replay.
+
+HG-PERF-109 read-only disposition: **abandon before performance qualification**; do
+not reapply unchanged. A contiguous ~480KB retained final-draw sample across the
+self-feedback region contains 76 backend-accepted triangles, then 16 sprites, then
+306 texture/output-alias backend rejects before accepted triangles resume. Replaying
+the current bulk-scope masks with all 16 sprite footprints deliberately
+*over-approximated* finds only 1/306 rejected triangles with a queued-page conflict;
+305/306 eager fallback flushes are unnecessary for correctness in that sample. But
+the first sprite already executes `render()` with nonempty `triangle_data`, which
+flushes the preceding triangle batch. The 16 sprites then form `commands`; current
+fallback dispatches that sprite batch at the first reject. Without the eager flush,
+the same commands remain queued throughout the reject island and the first later
+accepted triangle necessarily flushes them because `needs_flush` begins with
+`!commands.empty()`. Therefore this candidate moves one real dispatch boundary rather
+than removing it. `Accelerator::flush()` explicitly issues resident `glFlush()` so
+submitted GPU work overlaps later guest/CPU execution; delaying the same submission
+across a long scalar fallback island can reduce overlap. This also explains why the
+older deferred-fallback experiment had only +0.45%. HG-PERF-109 remains restored at
+`runtime/gs.cpp` `88777a23...`; see HG-FAIL-065. Continue diagnosis at the retained
+triangle batch-size ceiling instead of retrying this one-line change.
+
+HG-PERF-110 written-change plan (2026-10-10): resident `Accelerator::flush()` currently
+issues `GL_BUFFER_UPDATE_BARRIER_BIT` after every GPU dispatch even though resident mode
+performs no buffer update/readback there. `download()` already issues that barrier
+immediately before `glGetBufferSubData`; OpenGL requires the bit before later buffer
+updates that must observe shader writes, not unconditionally after every dispatch.
+Move the resident barrier to immediately before an actual VRAM `glBufferSubData` upload
+when the computed upload mask is nonempty. Keep the existing end-of-flush barrier for
+nonresident immediate readback, keep every `GL_SHADER_STORAGE_BARRIER_BIT`, `glFlush()`,
+dirty-page transition, dispatch order and error check unchanged. Pre-edit `gl_gs.cpp`
+SHA-256 `5354e22bdfeed8932a6b856c7b6386d3c195bfc198ba19e60f9f59013a2bbc99` is frozen
+under `%TEMP%/haunting-toc-probe/hg-perf110-resident-buffer-barrier-20261010/preedit/`.
+Validate build/runtime/translation/VU and the resident GPU/CPU differential. Do not call
+it retained without the authentic exact 180M qualification; restore immediately if that
+route remains unavailable.
+
+HG-PERF-110 disposition correction: **unqualified and restored; prior synthetic A/B was invalid for this resident-only change**.
+The candidate `gl_gs.cpp` SHA-256 `2bb9f2f1707377b930003d500cd1fae198fe7e93c22a6f12e10b9b24b23c5cf3`
+passes build/runtime/translation/VU and the ordinary 1,159-case GPU/CPU suite, but that
+suite was launched without `--resident`. HG-DIAG-108 later proved the 1,058-flush
+workload had `diag108_glflush_ns=0`, so it never entered resident submission; the
+apparent 3.85% candidate/control flush difference was run-to-run noise, not activation
+evidence. Do not use that A/B to set a performance ceiling. Candidate source remains
+frozen externally, while production `runtime/gl_gs.cpp` is byte-restored to
+`5354e22bdfeed8932a6b856c7b6386d3c195bfc198ba19e60f9f59013a2bbc99` and clean CMake is
+`2c230720b050fdddc6ec94dd3f43a038a2e6f2fd26fe1787e1394768b374a2f1`. See corrected
+HG-FAIL-066. Do not reapply HG-PERF-110 unless a truly resident A/B is explicitly run.
+
+HG-DIAG-108 plan (2026-10-10): re-check the old HG-DIAG-029 `glGetError` attribution
+under the current RTX 5070 / NVIDIA 617.42 runtime instead of assuming the 2026-09-21
+15-second stall still applies. Temporary `gl_gs.cpp` instrumentation adds cumulative
+steady-clock nanoseconds around only the existing resident `glFlush()` and final
+`glGetError()` inside `Accelerator::flush()`, reports those totals in the existing GPU
+summary, and changes no GL call/order/barrier/error behavior. Run only the existing
+1,159-case resident `gs_gpu_tests` workload through bounded `build_tests`; measured
+runtime is diagnostic-only. Byte-restore immediately afterward. Pre-edit source is
+frozen under `%TEMP%/haunting-toc-probe/hg-diag108-current-driver-flush-sync-20261010/preedit/`.
+If `glGetError` still dominates current flush cost, future work must preserve explicit
+GL error detection while addressing the synchronization point; if it does not, abandon
+the old attribution and profile the current flush body elsewhere.
+
+HG-DIAG-108 result: the initial no-argument run was nonresident and is not valid resident
+attribution. Re-running the existing binary with `--resident --triangles` reached a
+stable prefix of 984 resident flushes before the pre-existing wide-STQ fixture stopped
+the combined mode. That prefix reports `flush_ns=116,716,000`, `diag108_error_ns=102,626,800`
+(**87.9%**) and `diag108_glflush_ns=2,981,500` (**2.6%**) with 808 GPU sprites,
+1,568 GPU triangles / 224 triangle batches, 134,266,880 upload bytes and 83,623,936
+download bytes. Thus the historical `glGetError` synchronization attribution still
+holds on RTX 5070 / NVIDIA 617.42 for current resident code. The diagnostic source and
+CMake hook are byte-restored; active runtime cost is zero. Next candidate must preserve
+one explicit error observation per flush while avoiding the immediate post-`glFlush`
+query dependency rather than deleting error detection.
+
+HG-PERF-111 written-change plan (2026-10-10): on resident flushes only, move the single
+`glGetError()` observation from immediately after `glFlush()` to immediately before
+`glFlush()`, after all upload/bind/dispatch/memory-barrier calls in that flush have been
+issued. Cache the returned error value, execute the existing `glFlush()`, resident dirty
+ownership bookkeeping and queue clearing unchanged, then throw from the same final
+structural location using the cached value. Nonresident flush/readback/error order is
+unchanged. This preserves one explicit GL error observation per resident flush while
+removing the measured immediate submit-then-query dependency; it does not suppress
+errors from any preceding renderer API call. The only error attributable solely to
+`glFlush()` in ordinary OpenGL use is invalid begin/end placement, which cannot occur in
+this OpenGL 4.3 core compute context; asynchronous context-loss timing still requires
+validation before retention. Pre-edit `runtime/gl_gs.cpp` SHA-256
+`5354e22bdfeed8932a6b856c7b6386d3c195bfc198ba19e60f9f59013a2bbc99` is frozen under
+`%TEMP%/haunting-toc-probe/hg-perf111-preflush-error-query-20261010/preedit/`. First run
+native regressions, then prove resident activation with the same `--resident --triangles`
+prefix used by HG-DIAG-108 and compare identical counts. Add a focused deliberate GL
+error case before any performance claim. Exact 180M retention still requires the fixed
+direct replay tool in a conversation where that MCP action is actually exposed.
+
+HG-PERF-111 bounded result: **strongly staged, unqualified, and production restored**.
+Candidate `runtime/gl_gs.cpp` SHA-256
+`fef589b14cf663ca5b158ddd33d416c65e8f26e32af18f3313d787f4b25a81c4` keeps exactly
+one `glGetError()` observation per resident flush, moving it only from immediately after
+`glFlush()` to immediately before `glFlush()` after all renderer upload/bind/dispatch/
+barrier calls; the returned error is cached and thrown from the same final structural
+location. Nonresident order is unchanged. Build/runtime/translation/VU all pass. On
+RTX 5070 / NVIDIA 617.42, the exact resident+triangles prefix has identical 984 flushes,
+808 sprites, 1,568 triangles / 224 triangle batches and byte counts: clean control
+`flush_ns=103,032,900`, candidate runs `82,047,800` and `80,324,800` (**20.37% and
+22.04% lower**). The fully completing `--resident` suite passes **1,159/1,159 GPU/CPU
+cases** with identical 1,079 flushes / 1,122 sprites / masked/coherence counts: candidate
+`flush_ns=80,504,900` versus adjacent clean control `103,242,300` (**22.02% lower**).
+A temporary NVIDIA `GL_INVALID_ENUM` injection after accelerator creation reaches 8 GPU
+triangles / 1 batch and then faults with the existing exact host message
+`GS compute dispatch/readback failed`, proving prior renderer API errors remain observable
+at the moved check. Test-only injection and CMake hooks were byte-restored. Candidate game
+EXE SHA-256 `efaef2a6b68cdf1cce3e13c25998a85d98e302c3e09d9fefbd3f861ce016bba9`
+provenance records the exact candidate source hash. The fixed `gameplay33m` verifier was
+attempted only as an additional runtime check but stopped before native execution because
+its legacy pinned TOC differs; no verifier evidence is claimed. A follow-up current-driver
+context proof resolves the remaining error-observation caveat for the configured Windows
+host: a temporary query on the same 4.3 core GLFW creation pattern reports
+`GLFW_CONTEXT_ROBUSTNESS=200705`, exactly `GLFW_NO_RESET_NOTIFICATION`, on RTX 5070 /
+NVIDIA 617.42. The game host requests the same relevant 4.3 core context and supplies no
+robustness override. GLFW/KHR robustness documentation says this strategy never delivers
+reset-event notification and its graphics-reset-status query always reports `NO_ERROR`;
+preserving state across a reset is recommended but not guaranteed. Therefore the old
+post-`glFlush()` `glGetError()` was not a guaranteed reset-notification observation that
+HG-PERF-111 would delay. Do **not** claim the context can never be lost; this only removes
+the specific one-flush-earlier notification objection for the current configured host.
+The temporary assertion intentionally failed after printing the unexpected-vs-initial-
+hypothesis value, and both `tests/gs_gpu_tests.cpp` and `CMakeLists.txt` were immediately
+restored byte-exact to `e317ba6e...` and `2c230720...`; renderer production was never
+changed. Exact authentic 180M state/output/fault qualification is still mandatory before
+retention. Candidate source is frozen under
+`%TEMP%/haunting-toc-probe/hg-perf111-preflush-error-query-20261010/candidate/`.
+
+HG-PERF-111 retained-evidence ceiling: HG-DIAG-106 attributes 821,400 ns of the exact
+175M--180M sampled 2,108,700 ns complete triangle-dispatch delta to ordered backend
+flush (~39.0%). If the separately activated resident-test reduction of 20.37--22.04%
+transferred completely to that exact-tail flush component, sampled dispatch time would
+fall only by about 7.93--8.59%, an idealized throughput upside of roughly 8.62--9.39%.
+This is large enough to justify the >=5% authentic A/B gate, but it is **not** a measured
+gameplay gain: driver waits can move to later coherence points, the test and game flush
+mixes differ, and only the fixed authentic 180M candidate/control pair can establish
+retention. Do not stack another production mechanism before that pair.
+
+Production is restored to `runtime/gl_gs.cpp`
+`5354e22bdfeed8932a6b856c7b6386d3c195bfc198ba19e60f9f59013a2bbc99`, clean CMake
+`2c230720b050fdddc6ec94dd3f43a038a2e6f2fd26fe1787e1394768b374a2f1`, original
+`tests/gs_gpu_tests.cpp` `e317ba6e8d7f832a4e150ba51e7f564b25c3fb3c774f74b468233135c979a83d`, and rebuilt
+production EXE `2dd24b8984473136e5d353de66ecb9b2e6e683e3ade59eb3b5854cf6e3cbccad`.
+Next exact action in a fresh conversation exposing `run_gameplay180m_authentic`: reapply
+only candidate hash `fef589b1...`, rerun native gates/build/provenance, then direct 180M
+candidate followed by adjacent restored control. Do not stack another production
+mechanism before that qualification.
+
+HG-PERF-107 result: reject and restore. The exact edge-step search passes build,
+runtime, translation, VU-readiness and all 1,159 resident GPU/CPU cases. Its authentic
+180M candidate reaches all 5,270 qualified `0x001BEF84` writers with zero unexpected
+writers, caller mismatches or faults. Candidate and adjacent restored control are
+byte-identical for display, EE RAM, GS VRAM/state, VU1 data/defined/micro/state and
+console output. The 175M checkpoint is 12.0187 vs 11.9157 qualified updates/s
+(**+0.86%**); final 180M is 12.0512 vs 11.9113 (**+1.17%**), well below the >=5%
+retention gate. Candidate executable SHA-256 `1c9561b637e6972279ade71f7c783298b2f0a63b60e7afbd1dd8d50da841e3e0`;
+adjacent restored control `c6e8b602b88e64c26655af1cf20e57c7a96d381cc5c627104839c51f80fa7799`.
+`runtime/gs.cpp` is byte-restored to SHA-256
+`88777a23f5254f8ed7a9dde129b8f0ffc844b0aaf91db45b79a68b26d3a3cf9d` and the
+temporary CMake qualification hook is removed. See HG-FAIL-064.
+
+HG-DIAG-105 written-change plan: add a private atomic aggregate with a 1/4096
+fixed sample rate and an internal `--profile-triangle-stages` activation. Producer
+samples separate setup/STQ, coverage and admission/job packing; the GL consumer
+separates dependency plus any ordered flush, job/native-float copy, palette copy
+and tile insertion. Report cumulative values at the existing 5M checkpoints and
+derive the 175M--180M delta. No payloads, pixels or addresses are logged. Disabled
+behavior is one relaxed flag check per triangle; active timing is diagnostic-only
+and will be removed before qualification. Files: triangle acceleration header,
+`runtime/gs.cpp`, `runtime/gl_gs.cpp`, `runtime/system_diagnostic.cpp`, and this
+inventory. Disproof: absent/unstable samples, changed retained artifacts/faults,
+or timer floor dominating measured samples. External pre-edit backup:
+`%TEMP%/hg-backups/renderer-triangle-stage-census-20261008/preedit/`.
+
+HG-DIAG-105 outer-loop extension plan: the first exact census confines all
+sampled producer/backend work to about 0.42 seconds when extrapolated across the
+7.88-second 175M--180M tail. Extend the same temporary 1/4096 observer around
+triangle draw-environment replay, the complete `rasterize_draw_current` dispatch,
+and the post-draw environment snapshot/accounting. This directly measures the
+remaining 128-register copy still executed for every primitive after HG-DIAG-098.
+The outer sample uses the opposite 1/4096 phase from the inner sample so nested
+timer/atomic overhead cannot inflate complete-dispatch time. No state or payload
+is recorded. Reject the copy as the next structural target if
+its extrapolated cost cannot support a material gain. External extension preimage:
+`%TEMP%/hg-backups/renderer-triangle-stage-census-20261008/pre-outer-extension/`.
+
+HG-DIAG-105 rejection extension: the disjoint outer sample shows 99 covered
+triangles in the final interval but only 49 backend calls; backend rejects do not
+increase. Add aggregate counters at the existing producer submit guards to
+classify the roughly half of covered triangles that fall through to scalar pixels.
+Counters increment only on an already-occurring rejection while the temporary
+switch is active. The dominant exact guard, not the older 31M--33M scene, selects
+the next native renderer mechanism.
+
+HG-DIAG-105 outer-eligibility extension plan: source audit after the replay harness
+became blocked by the authentic-TOC/legacy-recording identity check found four
+covered-triangle scalar fallbacks before `submit()` that the current rejection
+census cannot see: no triangle accelerator, FST textured coordinates, unavailable
+prepared perspective coordinates, and fog. Add diagnostic-only counters at that
+existing eligibility gate without changing its predicate/order, and add names to
+the aggregate report. No payload/state is recorded and disabled behavior remains
+unchanged. Validation is build plus runtime/translation/VU regressions; the 180M
+measurement remains pending until a non-fabricated exact replay input is restored.
+Do not weaken the TOC identity check or recreate the discarded synthetic TOC.
+Exact source preimages are under
+`%TEMP%/haunting-toc-probe/hg-diag105-outer-eligibility-20261008/preedit/`;
+`docs/PROGRESS.md` uses Project Link's automatic byte backup for this plan edit.
+
+HG-DIAG-105 authentic replay recovery plan: do not alter the rejected legacy
+recording catalog or its TOC digest. Reuse only already-recorded authentic inputs.
+The corrected 1,261-event schedule through slice 120,000,000 (SHA-256
+`f64d8675...`) and the 211 later game-delivered transitions from the previously
+successful 180M family replay (SHA-256 `8c766fc0...`) form one strictly increasing
+1,472-event schedule through slice 179,730,432. The combined external file is
+`%TEMP%/haunting-toc-probe/hg-diag105-authentic-180m.input-events.txt`, SHA-256
+`3c53f2c3034e8a03a9531bff703341131886bfa7ec6c992c0a6f403ac777341e`.
+Temporarily add one `hg_game` POST_BUILD diagnostic command that uses the already
+restored authentic 2,064-byte TOC, this exact schedule, resident GPU triangles,
+180M slices, 5M checkpoints and `--profile-triangle-stages`. This is a bounded
+measurement harness only; it does not change guest behavior or the verifier
+contract. Remove the post-build command immediately after collecting the 175M
+and final counters, rebuild the normal target, then remove HG-DIAG-105 itself
+before qualification. CMake and diagnostic source edits remain protected by
+Project Link byte backups.
+
+HG-DIAG-105 authentic outer-eligibility result: the restored 180M route completed
+the final census. From the 175M cumulative report to the final budget report,
+covered samples rise 4,762 -> 5,944 and backend calls 4,523 -> 5,704. Of the
+four pre-submit eligibility fallbacks, no-accelerator, FST and fog change by zero,
+while perspective-unavailable rises 4,044 -> 6,195 (**+2,151**). The combined
+replay file was parser-validated after repairing one chunk-boundary copy error;
+its final SHA-256 is
+`1267d0720ae86a402804f8deb710e7b2c24e7d60ebd73320354e9789bf3a3e10`.
+Temporary CMake/game-host replay plumbing is restored byte-exactly.
+
+HG-DIAG-105 perspective-failure split plan: before selecting a production
+representation, distinguish why `PreparedCoordinate::prepare()` declines.
+Dimensions/non-finite values would fault the already-executed scalar path, so the
+live successful route should reduce to either common-exponent spread exceeding
+the signed-64 preparation or coefficient-times-area exceeding signed-64. Add only
+aggregate temporary reason counters, leave preparation/eligibility/order
+unchanged, validate runtime/translation/VU suites, and rerun the exact authentic
+180M schedule. If area-product overflow dominates, the next production candidate
+may use the existing wider checked scalar arithmetic to prove fault safety while
+feeding the native-relaxed renderer; if exponent spread dominates, do not assume
+that narrower mechanism is sufficient. Automatic Project Link byte backups
+protect every diagnostic edit; remove HG-DIAG-105 before qualification.
+
+HG-DIAG-105 perspective-failure split result: the exact authentic 180M census
+shows a one-to-one match between the generic perspective miss and the narrow
+product proof. At the 175M cumulative report both
+`reject_perspective_unavailable` and `reject_perspective_product` are 4,044;
+at the final report both are 6,195 (**+2,151**). Dimension, non-finite and
+common-exponent-shift failures remain zero throughout that decisive interval.
+This confirms the scene-specific scalar fallback is not malformed STQ data; it is
+the signed-64 coefficient-times-area bound used only by the current accelerator
+representation.
+
+HG-PERF-106 plan before edits: add one native-relaxed-only fallback for exactly
+those product-overflow perspective triangles. Keep the normal prepared/int64 path
+unchanged. Independently decode and validate all S/T/Q coefficients without the
+area-product restriction, require finite values, per-coordinate signed-64
+coefficient fit and strictly positive Q at all three vertices, then call the
+existing exact scalar perspective helper at all six vertex S/Q and T/Q ratios so
+all existing dimension/division/range faults remain explicit before submission.
+Because GS X/Y are 16-bit, covered nonnegative barycentric weights sum to at most
+65535^2; once each decoded coefficient fits signed 64-bit, its weighted product
+is below 2^95 and the existing 128-bit scalar arithmetic has ample proof
+headroom. For the native-relaxed backend only, encode a common-power-of-two
+normalized float form of the already-validated coefficients into the existing
+S/T/Q job slots and mark the existing `native_float_stq_flag`; do not move or
+duplicate conversion work on ordinary accepted triangles (HG-DIAG-104 proved that
+regresses them). Add an accelerator capability query with a conservative false
+default, have the GL native-relaxed backend advertise support and skip its
+ordinary int64-to-float conversion when the job is already marked. Add a focused
+GPU-vs-scalar differential that forces coefficient-times-area overflow and proves
+backend acceptance plus byte-identical VRAM, together with guard cases that
+remain scalar/faulting. Validate runtime/translation/VU/GPU suites, then run the
+exact 180M route. Retain only for matching artifacts/faults and a repeatable
+material tail gain. Pre-edit copies live under
+`%TEMP%/haunting-toc-probe/hg-perf106-wide-stq-20261008/preedit/`; automatic
+Project Link backups are additional rollback protection.
+
+HG-PERF-106 result: reject as performance-flat and leave the GL capability disabled.
+The focused resident GPU differential passes all 1,159 GPU/CPU cases on the RTX 5070,
+and the activated build passes runtime, translation and VU-readiness regressions. The
+exact authentic 180M candidate reaches all 5,270 qualified `0x001BEF84` writers with
+zero unexpected writers, caller mismatches or faults. Activation is proven rather
+than inferred: triangle draws rise from 21,985,289 in the adjacent disabled control
+to 21,991,484 in the candidate (**+6,195**), exactly matching the cumulative
+perspective-product fallback census. Candidate and control are byte-identical for
+display, EE RAM, GS VRAM/state, VU1 data/defined/micro/state and console output.
+Performance does not clear the retention gate: at 175M the candidate/control pair is
+11.9849 vs 11.9479 qualified updates/s (**+0.31%**), and the final 180M interval is
+11.9595 vs 11.9406 (**+0.16%**). The temporary CMake qualification harness is removed,
+`Accelerator::accepts_native_float_stq()` again returns false, and the wide-STQ
+implementation remains staged/inactive for reference rather than production. Candidate
+executable provenance SHA-256 `b23a045a...`; adjacent disabled control `fc63c37a...`.
+After removing the temporary harness, an exact-byte production relink records 156-input
+provenance with executable SHA-256 `f895e8603b27cc7cc89793d39fe84bafefb0eee6ed18c350091e52667c243789`;
+restored-state `build_tests`, runtime, translation and VU-readiness suites all pass.
+See HG-FAIL-063.
+
+HG-DIAG-104 plan before edits: native-relaxed triangle submission currently packs
+nine validated S/T/Q coefficients as 64-bit integers, copies the job into the GL
+queue, then reloads and rewrites all nine as the float representation consumed by
+the existing native shader. Add an internal accelerator capability query and,
+only when that exact backend requests native-float STQ, cast each already-validated
+coefficient inside the producer's existing per-vertex loop and mark the unchanged
+wire flag. The backend retains its old conversion as fallback for callers that do
+not prepack. This changes only when identical float bits are written, not
+validation, admission, shader math, visible pixels, ordering or faults. Run
+runtime/GIF and resident GPU differential suites, then the exact 180M route;
+retain only for byte-identical artifacts and a repeatable material gain. External
+pre-edit backup: `%TEMP%/hg-backups/renderer-prepacked-stq-20261008/preedit/`.
+
+HG-DIAG-104 result: reject and remove. Runtime/GIF behavior remains at the known
+baseline, and a new 1,351-case native-relaxed comparison proves producer-prepacked
+jobs generate the same pixels as the former backend conversion. The exact 180M
+run reaches 5,270 original writers with no unexpected writer/caller/fault; display,
+EE, GS, VU and console artifacts are byte-identical to retained HG-DIAG-102.
+Activation is certain because the backend conversion count falls from 15,671,454
+to zero. Nevertheless the decisive tail is **19.1972 FPS**, below retained
+20.1939/20.1994: placing the casts in the producer's validation loop worsens code
+shape/register pressure more than the removed consumer pass saves. All candidate
+source/test edits are restored byte-exactly and qualified executable/manifest
+`2c13feb1...` are restored. Evidence: `%TEMP%/hg-prepacked-stq1-20261008`.
+
+HG-DIAG-103 plan before edits: the retained page-bulk PSMT8 route still opens a
+new `GsLocalMemory::write_span` whenever swizzled rectangle traversal returns to
+a physical page. The exact 180M route reports 4,164,551 such CPU scopes; a page
+pointer is valid for the full ordered IMAGE run because VRAM storage cannot move
+and no packet/backend command interleaves with that call. Cache the first checked
+mapping for each of the 512 physical pages, invalidate the cache before any
+fallback qword that can change observer ownership, and retain the existing strict
+full-page discard proof. Add a counting-observer differential fixture that proves
+one materialization per distinct revisited page, then run GIF/runtime/resident-GPU
+regressions and the exact 175M--180M qualification. Retain only with identical
+artifacts/fault order and repeatable throughput gain. External pre-edit backup:
+`%TEMP%/hg-backups/renderer-psmt8-page-cache-20261008/preedit/`.
+
+HG-DIAG-103 result: reject and remove. The counting-observer fixture confirmed
+that a single synthetic transfer call can revisit pages and that the cache then
+opens exactly one checked mapping per distinct page. Runtime tests and all 1,367
+resident GPU/CPU cases pass; GIF reaches only its known overlap assertion after
+1,285 equivalence cases. The exact 180M candidate also reaches 5,270 original
+writers with zero unexpected writer/caller/fault, and its display, EE, GS, VU and
+console artifacts are byte-identical to retained HG-DIAG-102. However, the real
+route's **4,164,551** `bulk_cpu_scopes` count is unchanged. Source audit confirms
+that it measures `GsCpuMemoryScope` raster coherence rather than IMAGE
+`write_span`; it was not evidence for this candidate. Production IMAGE calls
+have no material same-call revisit reuse. The unused 512-pointer initialization
+regresses the 175M--180M tail from
+20.1939/20.1994 to **19.1746 FPS**. Candidate source/test edits are removed
+byte-exactly, and the qualified executable/manifest `2c13feb1...` are restored.
+Evidence prefix: `%TEMP%/hg-psmt8-page-cache2-20261008`.
+
+HG-DIAG-102 result: retain. `PreparedCoordinate::prepare` proves each decoded
+STQ coefficient times triangle area fits signed 64 bits with
+`magnitude > INT64_MAX / area`. A textured triangle prepares S, T and Q across
+three vertices, so the hot renderer frontend may execute nine variable 64-bit
+divisions before coverage rejection or GPU admission. The retained predicate uses
+an exact host 64x64->128 multiply overflow check (`_umul128` on MSVC x64,
+`unsigned __int128` where available, and the existing division as portable
+fallback). Coefficients, scaling, readiness, GPU admission, scalar fallback and
+fault behavior are unchanged. The helper passes 200,004 boundary/random comparisons,
+runtime and all 1,367 GPU/CPU cases; GIF reaches only its known overlap assertion.
+Exact prefixes `%TEMP%/hg-stq-product-proof1-20261008` and `proof2` each reach
+5,270 writers with no unexpected writer/caller/fault and byte-identical display,
+EE, GS, VU and console artifacts. Their decisive tails are **20.1939** and
+**20.1994** FPS versus retained 18.8598--18.9329 (+6.66% to +7.10%), with identical
+15,722,424 GPU triangles and 27,266 batches. Production SHA-256 is
+`2c13feb1bae48706b1b479a6cf7f1642d4d92f34d0024b1eca1a05d1f4e30f93` with
+156-input provenance. External preimage/candidate backup:
+`%TEMP%/hg-backups/renderer-stq-product-proof-20261008/`.
+
+HG-DIAG-102 bounded extension result: reject and remove. GPU job packing repeats three quotient bounds
+after preparation: one Q coefficient limit and one numerator limit for each of S/T.
+An exact shifted-product predicate equivalent to
+`magnitude <= (INT64_MAX / area) >> shift`, using the retained wide multiply after
+a safe left-shift bound, passed expanded direct comparisons, native suites, and an
+exact 5,270-writer replay with byte-identical display, EE, GS, VU and console
+artifacts. It nevertheless reduced the tail from the tightly repeated
+20.1939/20.1994 to **19.9468 FPS**. The three-proof extension and tests are removed;
+the retained first-stage candidate is restored from its pre-extension backup.
+
+HG-DIAG-101 result: every nondegenerate triangle currently constructs
+`GsTriangleQuotient` and performs a host floating-point reciprocal before coverage
+rejection or GPU admission, although the quotient is consumed only by the scalar
+pixel fallback. Deferring it until scalar fallback passed runtime and all 1,367
+GPU/CPU cases, reached 5,270 exact writers with no unexpected writer/caller/fault,
+and matched display, EE, GS, VU and console artifacts byte-for-byte. It nevertheless
+reduced the tail to **18.1571** FPS versus retained 18.8598--18.9329, so it is
+removed. Scalar quotient preparation is not the remaining ceiling. External
+preimage/evidence is under `%TEMP%/hg-backups/renderer-lazy-triangle-quotient-20261008/`
+and `%TEMP%/hg-lazy-triangle-quotient1-20261008*`.
+
+The exact 180M automated GPU-host route was replayed with the existing low-rate
+original-frame probe.  Guest writer cadence remains 29.76--29.89 Hz, but visible
+host update rate falls from 30 Hz to 14.9104 Hz in the 175M--180M interval; other
+measured lows are 17.1885 Hz at 120M--125M and 19.1079 Hz at 170M--175M.  This
+reproduces the user's movie/area drops without changing guest clocks or requiring
+manual input.  Rasterized draws vary by orders of magnitude, but interval draw
+count has only weak correlation with update rate (Pearson approximately -0.27),
+so draw count alone does not identify the renderer-side cause.
+
+Plan before edits: add temporary HG-DIAG-097, active only for `--profile` realtime
+GPU-host runs.  At each existing checkpoint it will report deltas for GL flush,
+upload, readback/materialization, packet-application samples, raster samples and
+display publication.  Sampling is fixed-rate, aggregate-only, and records no game
+bytes.  It must preserve the exact 180M route, original writer count/order, final
+frame/state/fault result and guest cadence.  Use the worst 175M--180M interval to
+select one renderer change with a credible >=30 Hz ceiling; remove the probe before
+qualification and compare candidate/control on the same automated route.  Reject
+any change that alters visible output, guest-observable GS behavior, explicit
+faults, or merely moves wait time to another synchronization point.  Current dirty
+preimages and hashes are backed up externally at
+`%TEMP%/hg-backups/renderer-interval-097-20261008/` (the real Windows Temp path,
+not the sandbox Temp mapping).  Baseline evidence prefix is external
+`%TEMP%/haunting-render-interval-profile-20261008`.
+
+HG-DIAG-097 result: the no-preview control reproduces 15.2494 updates/s in
+175M--180M; the instrumented route reaches the same budget with 5,270 original
+writer events, 29.8906 Hz guest cadence, no explicit fault, and byte-identical
+final display, EE RAM, GS VRAM/draw-state JSON, VU data/defined/micro/state versus
+the control.  In the instrumented 175M--180M tail, display publication is only
+117.9 ms and GL flush plus readback is 682.3 ms.  Sampled raster application is
+the dominant inclusive renderer bucket.  Exact primitive counts are 600 ordinary
+triangles, 1,997,115 triangle-strip triangles, and 61,089 sprites; other primitive
+types are zero.  This rejects presentation, readback-only, and CPU point/line
+fallback work as the scene-specific cause.
+
+Candidate plan before renderer edit: `rasterize_draw` currently copies all 128 GS
+register slots from the queued draw into live state and copies all 128 live slots
+back for every primitive, although the raster implementation reads only the
+audited rendering-register subset.  For the roughly two million triangle-strip
+draws per slow interval, those two full-state copies are renderer-private traffic.
+Temporarily swap only the exact registers read by point/line/triangle/sprite pixel,
+texture, depth, blend, fog, scissor and GPU-admission paths; preserve `value` in
+every other slot untouched and restore the selected slots on success or exception.
+Add a differential test that mutates every selected and unselected register and
+compares pixels, VRAM, return value, faults and complete post-call GS state against
+the frozen full-copy behavior.  Rebuild and run native regressions, then remove
+HG-DIAG-097 and compare the exact 180M candidate against an adjacent full-copy
+control.  Retain only if state/output/fault order match and the slow intervals
+improve repeatably.  Candidate preimage backup:
+`%TEMP%/hg-backups/renderer-live-state-swap-20261008/`.
+
+Candidate result: the selected-register swap preserved every compared final
+artifact byte-for-byte, including display, EE RAM, GS VRAM/draw JSON and all VU
+captures.  It nevertheless failed the throughput gate.  Against the adjacent
+instrumented control, the 120M--125M interval improved only 17.4134 -> 17.7601
+updates/s, while the decisive 175M--180M tail regressed 15.4990 -> 15.2262.
+The implementation and its focused test were removed; all four HG-DIAG-097 code
+files are byte-identical to their pre-probe backups.  Do not repeat narrower
+queued-state copying as a 30 FPS route.
+
+The older HG-DIAG-043 and HG-DIAG-070 evidence already closes the tempting early
+no-op census/search route: 56.12% of heavy-scene triangles were zero-area or had
+no covered sample, but the exact first-covered search extrapolated to only 42.52 ms
+in the whole 31M--33M window, and submitting empty strip geometry earlier regressed
+qualified throughput to 11.6002 FPS.  Do not repeat that census, the exact scanline
+solver, or early GPU submission unchanged.  The next non-edit evidence is the same
+180M route with the normal launcher configuration `HG_VU_WORKERS=3` and retained
+HG-DIAG-091 device-stage statistics.  This must distinguish stage-B VIF/VU pressure
+from stage-C GIF/GS/GL pressure before committing to a raw-strip/tile-list rewrite;
+the latter is justified only if the current slow interval is actually renderer-stage
+limited and has a credible ceiling beyond the already rejected admission work.
+
+Clean restoration checkpoint: Release `hg_game.exe` SHA-256 is
+`110a0aa59d424002a169558c9fa4b7455a43cc2fe5951d6805f2eaec0bc026ce`
+with 156-input post-link provenance.  `runtime_tests` passes and the resident
+triangle GPU/CPU suite passes all 1,367 cases.  `gif_tests` reaches the unchanged
+known `host_vu_stalled` overlap assertion (now line 1339) after reporting 1,285
+qword-append equivalence cases; there is no new failure.  No HG-DIAG-097 code or
+state-swap candidate remains in the production source.
+
+Three-worker device-stage result: the exact 180M route completed with 5,270
+original writers, no unexpected writer/caller/fault result, and byte-identical
+display, EE RAM, GS VRAM/state and VU captures versus the zero-worker control
+(raw IOP RAM retains the expected clock payload difference).  `HG_VU_WORKERS=3`
+restores almost every 5M interval through 170M to 29.8--30.0 updates/s, proving
+that the earlier broad 14--19 readings mixed renderer pressure with an unlike
+zero-worker launch.  It does not clear the final scene: 170M--175M is 27.6879
+and 175M--180M is 16.1883 updates/s.  From the 175M checkpoint to the final
+drain, stage-C idle time remains exactly 77.922 s while wall time advances about
+8.925 s; stage C is continuously busy.  Stage B idle advances 1.239 s.  Final
+stats are B commands 899,024,366 / idle 109.848 s and C commands 10,740,748 /
+idle 77.922 s.  External evidence prefix:
+`%TEMP%/hg-device-stats-workers3-20261008`.
+
+Plan before the next renderer edit: replace the per-draw 128-register environment
+copy with an ordered renderer-private delta stream.  The existing path copies
+the complete 1 KiB register array once at every primitive kick and twice again
+around every raster call; the 180M route rasterizes 61,992,917 primitives.  Keep
+one full base at the first retained draw, append every subsequent register value
+change with its original order, and record only an event cursor in each runtime
+draw.  `rasterize_pending_draws` will save live state once, replay deltas between
+draws, and restore it once; individually constructed test draws retain an explicit
+snapshot path.  Diagnostic serialization must reconstruct the identical complete
+environment for every retained draw.  Preserve register/event/fault timing,
+vertices, draw order, VRAM/coherence and pixels.  Add differential tests for
+interleaved state changes, partial retirement, direct raster calls and exceptions;
+then run runtime/GIF/GPU suites and the exact workers=3 route.  Reject on any
+state/capture difference or if the 175M--180M interval does not improve materially.
+This is renderer-private storage only; guest clocks and the frozen `v1/` tree stay
+unchanged.  Pre-edit backup: `%TEMP%/hg-backups/renderer-environment-deltas-20261008/`.
+
+Renderer environment-delta result: retain.  Runtime draws now store one ordered
+register-event cursor instead of a 1 KiB array.  The GS keeps one base snapshot,
+records every subsequent register mutation (including TEX2's TEX0 projection and
+direct HWREG), and advances a persistent raster snapshot/cursor once per draw.
+Individual synthetic draws keep an owned explicit snapshot.  Retirement rebases
+the remaining event stream, and the external GS serializer reconstructs the
+identical complete per-draw arrays.  An initial benchmark was invalid because it
+replayed the prefix on every service call; it was stopped at 67M, fixed, and is
+not performance evidence.  AddressSanitizer then identified a test-only stack
+overflow from putting two additional arrays inline in every GS state; heap-backed
+deep-copy storage removed it without shared mutable state.  No temporary debug
+logging remains.
+
+Corrected Release executable
+`229252d301c0f5edebbbffc717434bb4f093b32c10a153a52dd10bc1f32b0062`
+has 156-input post-link provenance.  Against the adjacent restored three-worker
+control's 16.1883 updates/s in 175M--180M, two exact candidate runs measure
+17.4105 and 17.3488 updates/s: +7.55% and +7.17%, both above the required 5%
+retention gate.  The second run also restores 170M--175M from the control's
+27.6879 to 30.0003 updates/s.  Both reach 5,270 original writers with no
+unexpected writer, caller or fault, and both are byte-identical to control for
+display, EE RAM, GS VRAM, reconstructed GS JSON, VU data/defined/micro/state and
+console output.  External prefixes are `%TEMP%/hg-env-delta-candidate2-20261008`
+and `candidate3`.  `runtime_tests` passes, the resident triangle GPU/CPU suite
+passes all 1,367 cases, and `gif_tests` reaches only the unchanged known
+`host_vu_stalled` assertion at line 1343 after 1,285 qword equivalence cases.
+
+This is a repeatable structural renderer gain, but the final interval remains
+17.35--17.41 rather than 30 FPS.  Stage C still has the remaining tail ceiling;
+do not credit the delta stream with completing the 30 FPS goal.  Next work should
+measure and remove the remaining per-triangle job/palette/tile insertion traffic
+in that exact tail, taking the prior rejected palette-cache, 8x8 tile and active-
+tile-compaction experiments as negative constraints rather than repeating them.
+
+Next renderer plan after broad authorization (2026-10-08): remove duplicated
+indexed-palette construction at both sides of the triangle interface.  Today every
+accepted triangle owns a zero-initialized 256-word palette, `rasterize_triangle`
+rebuilds that palette from the same shared CLUT for each draw, and `render_triangle`
+appends all 256 words to the batch payload.  The 180M route accepts 15,722,424 GPU
+triangles, so this representation can create tens of GiB of redundant host writes.
+The prior HG-FAIL-042 experiment deduplicated only backend payload and was flat on
+the much smaller 31M--33M scene; do not repeat it unchanged.  This candidate will
+also eliminate job-side palette zero/fill work: cache one exact RGBA32 expansion per
+CLUT generation in GS state, pass a pointer/generation/base/count through the
+renderer-private job, and append one immutable palette per generation/selection in
+each ordered GL batch.  Palette mutation already drains preceding pending draws;
+the batch owns copied words before the cache can change.  Untextured/direct-color
+jobs carry no palette.  Preserve shader lookup, PSMT4 CSA selection, draw order,
+VRAM/coherence, faults and external GS serialization.  Differential tests must
+cover multiple palettes in one batch, PSMT4 bases, mutation after submission,
+wrapping/flush and source lifetime.  Retain only if captures remain byte-identical
+and two exact runs materially improve the 17.35--17.41 tail without regressing
+170M--175M.  Pre-edit backup:
+`%TEMP%/hg-backups/renderer-versioned-palettes-20261008/`.
+
+Versioned-palette result: reject and remove. Runtime and all 1,367 resident
+GPU/CPU cases pass. Exact replay
+`%TEMP%/hg-versioned-palettes-candidate1-20261008` reached 5,270 writers with no
+unexpected writer/caller/fault result and byte-identical display, EE RAM, GS
+VRAM/state, VU data/defined/micro/state and console versus candidate3 (raw IOP
+retains only the expected clock payload difference). The mechanism was active:
+triangle batches fell 46,227 -> 39,848 and total GL flush time 10.263 -> 9.142 s.
+Nevertheless 175M--180M moved only 17.3488 -> 17.5313 updates/s (~1.05%), below
+the 5% retention gate; 170M--175M stayed 29.9939. All099 code/test changes are
+removed and the retained environment-delta renderer is restored. This confirms
+that palette/job upload traffic is not the remaining tail ceiling. Next work must
+remove substantial per-triangle construction or GPU replay work, not another
+payload/batch-count micro-optimization.
+
+Next renderer plan (HG-DIAG-100): the same exact run reports **2,552,930,784**
+resident masked PSMT8 word updates, dwarfing its 15.7M accepted triangles. The
+retained masked path is beneficial for small partial uploads because it avoids a
+GPU-page readback, but its per-16-pixel host index construction, virtual observer
+call, eight masked-index probes and merge operations can dominate very large IMAGE
+payloads. Add a bounded bulk alternative only for large complete consecutive
+PSMT8 IMAGE runs: partition by physical GS page, materialize each touched page
+once through the existing coherence observer, apply all ordered byte-lane updates
+directly to that page, and retain the current masked route for short/partial runs.
+Transfer progress, surplus semantics, page wrapping, preceding draw order and
+first faults must remain identical. Differential tests will cover threshold edges,
+partial first/last rows, page wrap, surplus, source mutation and GPU-owned pages.
+Measure the exact 180M route against the retained 17.35--17.41 baseline and keep
+only if captures are exact and the tail improves repeatably by at least 5%.
+Pre-edit backup: `%TEMP%/hg-backups/renderer-bulk-psmt8-20261008/`.
+
+HG-DIAG-100 result: retain. Large consecutive PSMT8 IMAGE runs now materialize
+and update one physical GS page at a time; the existing masked observer remains
+for smaller runs. Differential wrap/page/completion coverage, runtime tests and
+all 1,367 resident GPU/CPU cases pass; `gif_tests` has only the unchanged known
+overlap assertion after 1,285 qword-equivalence cases. Exact candidate prefixes
+are `%TEMP%/hg-bulk-psmt8-candidate1-20261008` and `candidate2`. Both reach 5,270
+writers with zero unexpected writer/caller/fault result and byte-identical display,
+EE RAM, GS VRAM/state, VU data/defined/micro/state and console versus the retained
+control. Their 175M--180M intervals are **18.3149** and **18.4098** updates/s,
+versus 17.4105/17.3488 controls (+5.2% to +6.1%); 170M--175M remains about30.
+Masked GPU word jobs fall 2,552,930,784 -> 0 and triangle batches 46,227 -> 27,266.
+The tradeoff raises full-route page upload/download traffic, but removes more CPU
+merge work in the saturated tail than it adds synchronization. Current executable
+SHA-256 is `5035eac4bd3af7abff3390f301bd0252561ce66df090fedeaece31c83c9afef5`
+with 156-input provenance; exact retained candidate is backed up externally.
+This advances the worst scene but does not complete 30 FPS. Next measure whether
+the remaining tail is dominated by page materialization or per-triangle GPU replay;
+do not lower the bulk threshold blindly because small masked uploads were already
+proven beneficial.
+
+HG-DIAG-100 follow-up plan: remove the new route's avoidable readback only when a
+single supplied IMAGE run provably overwrites complete physical PSMT8 pages. Use
+strict guards: the run contains the transfer's entire remaining rectangle; base,
+destination and dimensions align to 128x64 PSMT8 pages; coordinates do not wrap;
+and every selected physical page is fully covered. Add a renderer-private coherent
+discard-write operation that flushes prior ordered GPU commands, invalidates old
+GPU page ownership without downloading it, and marks the host's complete replacement
+dirty for later upload. Partial pages retain ordinary materialization. Validate
+full/partial page mixtures, prior GPU writes, wrap rejection, copy/readback and
+exact replay state. Keep only if it improves the 18.31--18.41 tail; otherwise
+restore the retained page-bulk candidate.
+
+Full-page follow-up result: retain. Only complete, aligned, nonwrapping PSMT8
+page rectangles may discard old resident contents; prior GPU dependencies are
+ordered and the complete host replacement becomes the next upload. Partial pages
+still use ordinary materialization. Runtime and all 1,367 GPU/CPU cases pass.
+Exact replays `%TEMP%/hg-bulk-psmt8-discard1-20261008` and `discard2` reach 5,270
+writers, zero unexpected writer/caller/fault result, and byte-identical display,
+EE, GS, VU and console artifacts. Final intervals are **18.9329** and **18.8598**
+updates/s, repeatably above page-bulk-only 18.3149/18.4098 and ~8.3--9.1% above
+the 17.35--17.41 controls. Downloads fall from ~11.0 GB to 7.90--7.95 GB and
+readback wait from ~16.9 s to ~6.3 s. The twice-qualified executable SHA-256 is
+`6db42239eee9f6a5d2e7747f01d0b89bd81e80b53c77a4baec57ee90561caec2`
+with 156-input provenance. After removing rejected HG-DIAG-101, retained
+HG-DIAG-102 supersedes this executable as the current production renderer
+baseline. The 30 FPS target remains open.
+
+Rejected HG-DIAG-100 refinement: selecting fully covered interior pages within a
+nonaligned complete rectangle preserved byte-exact display, EE, GS, VU and console
+artifacts, but the exact tail fell to **18.4950** updates/s versus the retained
+18.8598--18.9329. The broadening and its test are removed; the twice-qualified
+strict aligned-page rule remains the baseline. Transfer-side scope
+widening is exhausted without new evidence; the remaining work is per-triangle GPU
+construction/replay rather than more speculative IMAGE threshold changes.
+
+## ACTIVE MILESTONE (2026-10-06): make the recorded door transition complete
+
+Post-scene polymorphic-family plan (2026-10-08): extending the corrected
+1,261-event route neutrally to 160M crossed the former `0x002599a0` boundary
+and reached a new explicit AOT stop at `0x002f8550` after checkpoint 130M.
+Original `0x002ee91c..30` loads node vptr `+0x30`, dispatches slot `+0x10` at
+`0x002ee928`, and advances the linked list through node `+0x28`.  The saved EE
+RAM contains twelve nodes at `0x00dad6f0..0x00dada60`; every node uses vptr
+`0x00470700`, whose observed slot is exactly `0x002f8550`.  RAM and the USA ELF
+agree on its null prefix, four executable words `0x00470708..14`, and null
+suffix.
+
+Do not repeat the earlier one-subtype-at-a-time expansion.  A complete scan of
+initialized original data finds thirteen interfaces with the same null-bounded
+layout and shared base methods `0x002ee6d0/0x002ee6c0`: vptrs `0x004702b0`,
+`0x004703b0`, `0x004703d0`, `0x00470440`, `0x00470460`, `0x00470700`,
+`0x00472350`, `0x00472bd0`, `0x00472c10`, `0x004737f0`, `0x00473810`,
+`0x00475ca0`, and `0x00479f90`.  Original code materializes every address in a
+constructor/installer; twelve of the 22 unique method targets remain missing.
+Replace the shared call site's former single-table discovery hint with the exact
+22-target union, regenerate once, and require every target to compile while the
+runtime still follows the guest-loaded register.  Run Python, runtime,
+translation, device-thread, VU-readiness and generation checks, then replay the
+same external schedule beyond 130M and extend again.  Any target outside this
+proved union remains an explicit stop.  Pre-edit files are preserved at
+`%TEMP%/hg-backups/ee-polymorphic-2ee928-20261008/`.
+
+Polymorphic-family result: generation emits every one of the 22 exact method
+targets and grows reachability by 1,503 original words to 510,213; five newly
+exposed dynamic boundaries remain explicit.  Release executable SHA-256 is
+`676db71118673145faf64a2df698f1a869b4524470011c8a952a4530abe15d03`
+with 156-input provenance.  All 135 Python tests, device-thread differentials,
+runtime, translation, and 262,144 fused plus 81,920 compiled VU-readiness
+comparisons pass.  The exact corrected route crosses `0x002f8550` and reaches
+132,069,428 us before a distinct explicit VU1 identity fault at original VIF1
+status read `0x0010ca44`, entry zero, return `0x001b86cc`.  Retained preview
+SHA-256 `c9d80789...` visibly shows the portrait-and-clock scene; GS-VRAM is
+`5f1135f6...` and metadata is `d7e71d5b...`.  Evidence prefix is external
+`%TEMP%/haunting-toc-probe/polymorphic-2ee928-replay-160m-final`.
+
+Plan before the separate VU config edit: captured MicroMem SHA-256 is
+`be37654b...`, not any configured identity.  It decomposes byte-for-byte into a
+contiguous 611-pair original image: micro `0x0000` <- source `0x003a9548` x256;
+`0x0800` <- `0x003a9d50` x96; `0x0b00` <- `0x003a4ec0` x16; `0x0b80` <-
+`0x003a2ba0` x106; `0x0ed0` <- `0x003aaf50` x38; `0x1000` <- `0x003ab088`
+x99.  Covered-byte SHA-256 is `29d60202...`; structural decoding has no
+unsupported pair, external branch, or missing delay slot.  END pairs are
+`0x0048/0x0ad8/0x0b60/0x0eb0/0x12f0`, proving the complete resume family
+`0x0058/0x0ae8/0x0b70/0x0ec0/0x1300` alongside observed MSCAL entry zero.
+First run the same route with synchronous devices and require the identical
+MicroMem/fault.  Only then configure this exact composite and all five resumes,
+regenerate, repeat all gates, and replay past 132M.  Any other identity or entry
+remains explicit.  Pre-edit backup:
+`%TEMP%/hg-backups/vu1-scene14-20261008/`.
+
+Synchronous control result: it stops on the same entry-zero identity at
+132,037,819 us, immediately at original VIF activation `0x001b795c`, and its
+MicroMem SHA-256 `be37654b...` plus retained preview `c9d80789...` are
+byte-identical to the threaded run.  The threaded `0x0010ca44` publication is
+therefore the designed next-scheduling-boundary behavior, not ordering damage.
+Config now adds only exact `scene14_mscal0_composite` with observed entry zero
+and all five decoded END successors in one batch.
+
+Scene14 result: regeneration keeps EE reachability/unresolved counts unchanged
+at 510,213 / 6,709 and changes only the generated VU unit.  All 135 Python
+tests, device-thread differentials, runtime, translation, and 262,144 fused plus
+81,920 compiled VU-readiness comparisons pass.  Release `hg_game.exe`
+SHA-256 is `34238a665f2b7f138e6b738ee65622c3243950d90568dbb33a121c7305460666`
+with 156-input provenance.  The first GPU-host acceptance attempt reached
+checkpoint 130M, then exited only because live-input handoff lacked a writable
+external log; this was a host launch error, not a guest fault.  The corrected
+launch supplied an explicit external input log, crossed the former 132M VU
+identity stop, and completed the 145M budget with no explicit fault.  Metadata
+is `native-iop-budget`, `virtual_time_us=145000000`; retained preview
+`27a9f270...` visibly advances to a closer portrait view, GS-VRAM is
+`780d60a6...`, metadata `65ee6bea...`, and final MicroMem `62a47cd2...`.
+External evidence prefix:
+`%TEMP%/haunting-toc-probe/vu1-scene14-gpu-replay-145m-final`.  The host was
+closed after capture because the native presentation contract retains the final
+frame at budget completion.  Next measurable action is extend the same route
+neutrally beyond 145M and batch the next independently proved family, if any;
+do not return this already-cleared portrait transition to manual testing.
+
+Post-scene14 family plan (2026-10-08): the 180M GPU-host extension crosses
+checkpoint 150M and stops explicitly at missing AOT target `0x0025fd00` at
+156,495,887 us, receiver `0x0180f690`, return `0x002631d8`.  Original
+`0x002631c4..d4` loads object vptr slot `+0x2c` and calls it at
+`0x002631d0`.  Saved EE RAM gives vptr `0x0046d410`, whose exact original/live
+slot is `0x0025fd00`.  A whole initialized-image shape scan finds fourteen
+null-bounded 15-slot interfaces with the same ABI at `0x0046d370`,
+`0x0046d3c0`, `0x0046d410`, `0x0046d460`, `0x0046d4b0`, `0x0046d500`,
+`0x0046d550`, `0x0046d5a0`, `0x0046d5f0`, `0x0046d640`, `0x0046f610`,
+`0x0046f660`, `0x00476450`, and `0x00476b60`.  The original constructor block
+`0x00263224..0x002634cc` independently materializes every one of those vptrs;
+their exact union is 54 executable methods, all currently untranslated.
+
+Configure the complete 54-target union at the one observed `jalr`, never a
+single `0x0025fd00` root.  Regenerate below the 650K cap, require all targets to
+emit and keep downstream unknown transfers explicit, run the full Python/native
+gate once, then extend the same GPU replay beyond 156M.  External pre-edit
+backup: `%TEMP%/hg-backups/ee-family-2631d0-20261008/`.
+
+Post-scene14 family result: all 54 targets emit; reachability rises by 808
+original words to 511,021 and 20 newly exposed dynamic boundaries remain
+explicit (6,729 total).  All 135 Python tests, device-thread differentials,
+runtime, translation, and 262,144 fused plus 81,920 compiled VU-readiness
+comparisons pass.  Release `hg_game.exe` SHA-256 is
+`c6e8c4b9252afc3d285516df1b7bdf815b1a88eb12882845a19170a40b805082`
+with 156-input provenance.  Its exact GPU-host replay crosses the former
+156,495,887-us `0x0025fd00` stop and completes the 180M budget with no explicit
+fault (`native-iop-budget`, EE `0x001befe4`).  Preview SHA-256 is `1b484bf1...`,
+GS-VRAM `c98262dc...`, metadata `077a4766...`, and final MicroMem
+`69dc38b1...`.  External evidence prefix:
+`%TEMP%/haunting-toc-probe/family-2631d0-gpu-replay-180m`.  The user-observed
+post-budget "freeze" was only the native host retaining its final frame; PID
+8488 was closed after capture.  Next measurable action is extend this same
+automated route past 180M; do not ask the user to repeat the cleared transition.
+
+Autonomous post-`0x002fed30` boundary (2026-10-08): the qualified 24-method
+`0x00470e00/20/40/60/80` interface batch crossed the former first-input stop.
+The corrected 1,261-event external route then stopped explicitly after checkpoint
+110M at EE `0x002599a0`, with `v0=8`, `a0=0x003ea2b8` and return
+`0x00259950`.  This is a new missing static AOT label, not a renderer/device
+deadlock.  The original `0x0025995c..78` sequence bounds selector `s2` below
+101 and indexes the complete initialized original table
+`0x0045a100..0x0045a294`; selector 2 maps exactly to the observed label.  The
+table has eight unique executable local labels and seven are untranslated.  The
+immediately called original routine independently bounds a sibling selector below
+101 at `0x00259ac8..e4` and indexes initialized table
+`0x0045a2a0..0x0045a434`; its three executable local labels are untranslated.
+
+Plan before edits: configure both complete 101-word original switch ranges rather
+than adding only `0x002599a0`, regenerate once, require all eleven unique labels
+to appear as static cases and both `jr` sites to leave the unresolved queue, then
+run Python, runtime, translation, device-thread and VU-readiness gates.  Replay
+the same corrected external schedule beyond 110M before extending it again; any
+target outside the two proved bounds remains explicit.  The malformed synthetic
+route is retained unchanged (SHA-256 `cb17f9db...`); its corrected derivative
+adds only the missing seventeenth zero field at synthetic slice 113,000,000 and
+has SHA-256 `f64d8675...`.  Replay preview/state hashes before the fault are
+`00c470b9...` / `1d54f2ed...`.  External preimages:
+`%TEMP%/hg-backups/ee-switches-45a100-20261008-1004/`.
+
+Result: generation completes below cap at 508,710 reachable original words /
+6,704 explicit unresolved items and emits all eleven unique local labels in
+shard 12.  Both configured `jr` sites are resolved.  All 135 Python tests,
+device-thread differentials, runtime, translation, and 262,144 fused-transform
+plus 81,920 compiled VU-readiness comparisons pass.  Release executable
+`b964883c1a5ab35a7dd9e81d9f943e35cf6f3a2a04e20aec0b05b1d424569e4d`
+has 156-input provenance.  Its exact corrected 1,261-event replay crossed the
+former `0x002599a0` stop, consumed every synthetic input through slice 120M and
+completed the 125M budget with no explicit EE fault.  Metadata kind is
+`native-iop-budget`, `virtual_time_us=125000000`; preview SHA-256 is
+`34b27ad9...`, raw IOP RAM `71303731...`, and metadata `3f385cd1...`.
+The inspected 640x448 terminal preview shows Fiona examining an item in the next
+scene, so this is meaningful route progress rather than an idle-frame budget.
+External evidence prefix:
+`%TEMP%/haunting-toc-probe/switches-45a100-replay`.  Next action is the same
+route with a later neutral budget to let the scene finish and expose any later
+explicit boundary before another user handoff.
+
+Latest continuation boundary (2026-10-08): after the replay-ready handoff at
+slice 104,603,648, the user supplied 30 further controller transitions and the
+original program stopped explicitly at EE `0x0033e750`, called through the same
+vtable slot `+0x0c` at `0x0029ef54` (return `0x0029ef5c`).  The exact continuation
+log is preserved outside the repository with SHA-256 `d9816485...`; fault stderr
+SHA-256 is `c4d30b5b...`.  This is a missing static AOT entry, not a renderer or
+host freeze.
+
+Plan before edits: the target occurs exactly once in initialized original data at
+`0x00476f5c`, proving vptr `0x00476f50`.  Null prefix words at `0x00476f50/54`
+and null suffix words beginning `0x00477024` bound the complete 51-entry executable
+interface at `0x00476f58..0x00477024`.  Forty-seven methods are already compiled;
+batch its only four missing methods `0x0033e620`, `0x0033e730`, `0x0033e740`, and
+`0x0033e750`.  Original decoding independently establishes a normal body ending
+at `0x0033e724`, a `jr ra` body at `0x0033e730/34`, a direct trampoline at
+`0x0033e740/44`, and the observed body returning at `0x0033e83c/40`.  Regenerate
+once, run Python/runtime/translation/device-thread/VU-readiness gates, compose the
+prior route with this continuation without changing same-slice final-state
+semantics, and visibly replay to the new final event with the guest paused for
+live input.  Any target outside this bounded table remains explicit.  External
+preimages: `%TEMP%/hg-backups/ee-vtable-476f50-20261008/`.
+
+Result: generation reports 387,285 reachable original words / 5,049 explicit
+unresolved items and emits all four missing methods in shard 25.  All 135 Python
+tests, device-thread differentials, runtime, translation, and 262,144 fused plus
+81,920 compiled VU-readiness comparisons pass.  Release executable
+`96fd9789d133dd8bdeb7ba1e19f2550e31865e24cf8b88a5e077490a54c77143`
+has 155-input provenance.  The strictly ordered combined replay contains 1,238
+events (SHA-256 `4c27d971...`); where the prior final neutral event and first live
+event shared slice 104,603,648, it retains the later effective live state once at
+that slice.  Visible PID 44864 crossed every earlier stop and reached the new final
+event at slice 109,148,160 with no fault; guest execution is intentionally paused
+there until the first changed live controller input.  Fresh continuation log:
+`%TEMP%/haunting-toc-probe/manual-ready2-continuation.input-events.txt`.
+
+Next breadth milestone: perform a whole-EE initialized callback/vtable census and
+rank missing targets by independently proved table boundaries plus original
+installer/call-site provenance.  Promote complete high-confidence families in
+batches rather than waiting for one runtime stop per method; never auto-root an
+arbitrary executable-looking data word or weaken the unresolved-target fault.
+
+Whole-EE common-interface batch (2026-10-08): after the replay-ready handoff, ten
+new controller states advanced to an explicit missing AOT target `0x00210df0`,
+called through slot `+0xb4` at `0x002de0d0` (return `0x002de0d8`).  External
+stderr/input hashes are `a0860a94...` / `038031c7...`; both game processes were
+identity-checked and closed.  The target occurs in two initialized tables at
+`0x0046c214` and `0x0046fa94`, selecting vptrs `0x0046c160` and `0x0046f9e0`.
+Each has 44 executable entries at `+0x08..+0xb4`, two null prefix words and null
+suffix words beginning at `+0xb8`.  Original constructors at `0x00210938..48`
+and `0x00210960..6c` independently install both vptrs.
+
+Plan before edits: extend the proof beyond the observed slot.  A whole initialized
+ELF census found 15 null-bounded 44/51-entry tables sharing the exact eight-method
+core interface sequence `1f1ed0,1f4700,1f46f0,1f46e0,1f6e00,194fb0,195ed0,
+1f1e70`.  Original code materializes and stores every corresponding vptr, with
+2--18 independent installer references per table.  They contain 83 unique methods
+not present in generated dispatch.  Root that complete missing union in one batch,
+regenerate once, require all entries to decode explicitly, run the full Python,
+runtime, translation, device-thread and VU-readiness gates, then replay the combined
+route plus the new continuation.  The broader raw scan found 713 null-bounded
+executable-looking runs, but those are census leads only: do not promote any run
+without interface/call-site or bounded-selector provenance.  External CSV:
+`%TEMP%/haunting-toc-probe/ee-null-bounded-pointer-census-20261008.csv`; preimages:
+`%TEMP%/hg-backups/ee-common-vtable-census-20261008/`.
+
+Mass indirect-call/jump continuation: regenerating the existing CFG triage after
+the 83-method common-interface batch reports 4,946 unresolved `jalr`, 98 unresolved
+non-return `jr`, seven syscalls and one exception return.  Direct adjacent
+file-pointer recovery has no unconfigured candidate, so the useful broad source is
+not blind opcode scanning.  The original member-call ABI supplies 778 independently
+identified file-backed descriptors with exact shape `(adjustment=0, selector=-1,
+target)`, each loaded by reachable original code; 510 distinct executable targets
+remain untranslated.  This is stronger provenance than a raw pointer run and does
+not infer a runtime decoder or fallback.
+
+Plan before edits: root the complete 510-target missing descriptor union in one
+generated config batch, regenerate once, and require every target to produce a
+static dispatch case.  Then rerun triage to quantify removed candidate gaps and
+execute the complete regression suite.  Keep the 2,631 raw installed-table target
+leads separate: 38 scans hit their 256-byte cap and adjacent tables can merge, so
+they are not authorized for wholesale promotion until exact table extent and use
+are independently proved.  Continue with bounded selector/jump-table families
+after the descriptor batch.  External preimages:
+`%TEMP%/hg-backups/ee-member-descriptor-census-20261008/`.
+
+The first mass regeneration reached the configured 400,000-word analysis ceiling:
+triage reported 517 `instruction budget exhausted` boundaries, so that generated
+state is not a completed candidate.  Raise only the build-time discovery limit to
+500,000, regenerate, and require zero budget-exhaustion issues before building or
+replaying.  This does not alter guest/runtime budgets or clocks.  External pre-cap
+preimage: `%TEMP%/hg-backups/ee-analysis-cap-20261008/`.
+
+Member-descriptor fixed point: nine regeneration rounds added 671 distinct exact
+descriptor targets in total (510, 96, 34, 15, 7, 3, 3, 1, 2).  The queue now has
+1,072 proven records and zero uncompiled member targets.  Reachability is 495,556
+words with no analysis-budget boundary.  More unresolved transfer *sites* appear
+because substantially more original code is now reachable; they are retained as
+explicit faults rather than counted as regressions.
+
+Mass jump-table plan: classify all 151 unresolved non-return `jr` sites.  A new
+read-only census proves 78 complete bounded switch dispatchers using the exact
+original sequence: unsigned selector bound (`sltiu`), rejecting branch, selector
+shift by two, constant file-backed table base, indexed load, and `jr`; every entry
+within the bound is executable.  Add all 78 sites as exact `indirect_targets` table
+ranges in one batch, regenerate, and require the sites to leave the unresolved-jump
+queue.  The remaining dynamic `jr` shapes stay explicit.  External proof report:
+`%TEMP%/haunting-toc-probe/ee-bounded-jr-census-20261008.json`; preimages:
+`%TEMP%/hg-backups/ee-bounded-jr-census-20261008/`.
+
+The 78-table regeneration reached the expanded 500,000-word discovery ceiling,
+so it is again an incomplete intermediate and will not be built or replayed.
+Raise the analysis-only ceiling to 650,000 and require a below-cap result with no
+`instruction budget exhausted` boundary.  Runtime instruction budgets remain
+unchanged.  Pre-cap backup: `%TEMP%/hg-backups/ee-jump-analysis-cap-20261008/`.
+
+Mass-scan result: the 650,000 build-time ceiling completes below cap at 505,102
+reachable original words.  Descriptor discovery converged with zero missing target;
+bounded-switch discovery converged after 78+16 tables.  Non-return unresolved `jr`
+sites fell from 151 to 73, and none of those remaining sites satisfies the proved
+bounded-switch pattern.  Direct adjacent file-pointer discovery has zero candidate.
+The remaining 6,568 `jalr` sites are dynamic call locations, not 6,568 known missing
+functions; raw installed-table scans remain unpromoted where exact extent/use is not
+proved.  All 135 Python tests, device-thread differentials, runtime, translation,
+and 262,144/81,920 VU comparisons pass.  Release executable
+`67607449f0f0f8c58d8a2d0640eccb6e38eca33ff62572620512f2282ce632af`
+has 156-input provenance.
+
+The next replay route combines 1,247 strictly increasing states through slice
+109,282,304 (SHA-256 `bd58b838...`).  Its same-slice live handoff replaces the
+prior final neutral event with the first effective live state, preserving the
+actual paused/resume semantics.  Launch visibly with replay-ready pause and a fresh
+external continuation log; any later unsupported target remains explicit.
+
+Visible replay result: PID 10560 crossed every prior stop and reached the final
+recorded event at slice 109,282,304 with no fault.  Guest execution is intentionally
+paused until the first changed live controller input.  Fresh continuation log:
+`%TEMP%/haunting-toc-probe/manual-ready3-continuation.input-events.txt`.
+
+Immediate post-handoff stop: the first live analog state at slice 109,282,304
+reached explicit target `0x002fed30` through the original member helper (return
+`0x0011fb04`).  Evidence stderr/input hashes are `d8823a91...` /
+`759d2a03...` and the process was closed.  The target is slot `+0x10` of
+vptr `0x00470e80`.  Original code installs this vptr at `0x00176d28` and
+`0x002fec6c`; the adjacent original constructors install the same bounded
+six/eight-slot interface family at `0x00470e00/20/40/60/80`.  Two null prefix
+words and the next vptr/null boundary prove each extent.  Across the five tables,
+24 methods remain untranslated.
+
+Plan before edits: add the complete 24-method missing union, regenerate and run
+the established gates, then replay the combined route and use host computer control
+to drive beyond the former handoff while taking screenshots and watching the fault
+log.  Do not return control after only one changed state.  External preimages:
+`%TEMP%/hg-backups/ee-vtable-family-470e00-20261008/`.
+
+Active continuation boundary (2026-10-08): the latest focused manual run crossed
+checkpoint 66M and stopped explicitly at EE `0x002cc068`, selected by the bounded
+indirect branch at `0x002cc05c` with selector 0.  This is a missing static AOT
+entry, not a renderer, input, or host deadlock.  The original instruction stream
+bounds the selector below 26 and indexes initialized table
+`0x0045d2f0..0x0045d358`.  Independent reads of the pinned original ELF and an
+earlier live EE RAM capture agree byte-for-byte: entry 0 is `0x002cc068`, entries
+1--25 are `0x002cc070`, and both targets are executable labels inside the already
+bounded `0x002cbff0..0x002cc128` body.  The shared HG configuration was checked
+only as a non-rendering lead and independently agrees on that function boundary.
+
+Plan before edits: configure the complete 26-word original dispatch table rather
+than adding only the observed target, regenerate once, inspect both emitted entry
+cases, and run Python, runtime, translation, device-thread and VU-readiness gates.
+Then replay the newly preserved manual input stream unattended beyond 66M before
+another interactive launch.  Keep any target outside the proven table explicit.
+External preimages: `%TEMP%/hg-backups/ee-switch-45d2f0-20261008/`; external live
+evidence: `%TEMP%/haunting-toc-probe/20261008-0846-freeze-2cc068-manual-authentic.*`.
+
+Result: configured generation reports 386,000 reachable original words / 5,047
+explicit unresolved items and emits both `0x002cc068` and `0x002cc070` cases in
+shard 16.  All 135 Python tests, device-thread differentials, runtime,
+translation, and 262,144 fused-transform plus 81,920 compiled VU-readiness
+comparisons pass.  Release executable
+`22ccf8e583a2ebbeef1a11507ca3f3c652bd2ae56e96fbf616d357856b1d4b5a`
+has 155-input post-link provenance.  An unattended replay of the exact 928-event
+manual stream (SHA-256 `b4d7a4a5...`) crossed the former 66M stop, completed the
+90M budget with no explicit fault, and wrote final IOP/EE/GS/VU/display state.
+The exact hidden process was closed after capture; no game process remains.
+External replay prefix: `%TEMP%/haunting-toc-probe/switch-45d2f0-replay`.
+
+Next live boundary (2026-10-08): the validated build continued to about 104.6M
+and explicitly stopped at member callback `0x00383ab0`, reached from original
+`0x00209360 -> 0x00384ba0 -> 0x00100b40/0x00100b6c` with object
+`0x017f3af8`.  The focused logger preserved 1,212 delivered controller states
+(SHA-256 `5db41cc1...`) outside the repository.  This is a later AOT boundary,
+not recurrence of the cleared `0x002cc068` switch or a renderer/device stall.
+
+Plan before edits: batch the complete missing subset of the original member-state
+descriptor family, not only the observed callback.  Original dispatcher
+`0x00383d20` selects and copies the initialized descriptors at
+`0x0044af20..0x0044afa0` into the same consumed object field.  Four targets are
+already compiled; the missing entries are `0x00383450`, `0x00383a20`,
+`0x00383ab0`, and `0x00383ca0`.  Independent original decoding bounds their
+returns/delays at `0x00383540/44`, `0x00383aa0/a4`, `0x00383be8/ec`, and
+`0x00383d18/1c`; the shared non-rendering list was only a lead and truncates
+these extents.  Add all four to the existing `0x00100b6c` member dispatch,
+regenerate once, run the full differential gates, then replay the exact 1,212
+events beyond 104.6M.  External preimages:
+`%TEMP%/hg-backups/ee-member-state-383ab0-20261008/`; live evidence prefix:
+`%TEMP%/haunting-toc-probe/20261008-0853-freeze-383ab0-manual-authentic`.
+
+Result: generation reports 386,208 reachable original words / 5,047 explicit
+unresolved items and emits all four missing callbacks in shard 28.  All 135
+Python tests, device-thread differentials, runtime, translation, and 262,144
+fused-transform plus 81,920 compiled VU-readiness comparisons pass.  Release
+executable `8b301981152d06062f36c2c236c6148e0e34874708d1d069994d0e5ab268d314`
+has 155-input provenance.  The exact 1,212-event route crossed the former
+104.6M `0x00383ab0` stop and completed a 140M hidden replay with no explicit
+fault, writing final IOP/EE/GS/VU/display state.  The replay process was closed
+after capture.  External evidence prefix:
+`%TEMP%/haunting-toc-probe/member-state-383ab0-replay`.
+
+Visible replay handoff plan (2026-10-08): the user correctly requested that the
+preserved route return them to the cleared position instead of requiring another
+manual retrace. Current host polling can overwrite scheduled pad snapshots, so
+while an explicit `--input-events-file` still has pending records, suppress only
+live host-controller delivery. Apply every recorded state at its original guest
+slice, then automatically resume ordinary keyboard/gamepad polling immediately
+after the final event without restarting the game. This remains opt-in
+HG-DIAG-006 guest input; default gameplay, guest clocks, renderer, and faults are
+unchanged. Validate parser/unit regressions and the exact route, then launch a
+visible realtime replay with a fresh continuation logger. External preimages:
+`%TEMP%/hg-backups/input-replay-live-handoff-20261008/`.
+
+The first visible handoff reached its final recorded event at slice 104,603,648
+and enabled live input as designed, then neutral guest execution exposed a new
+explicit AOT boundary at `0x002f7920` about eight seconds later. Original caller
+`0x0029ef48..58` invokes vtable slot `+0x0c` on object `0x00cba300` and returns
+at `0x0029ef5c`. The target occurs exactly once in initialized original data, at
+`0x0047054c`, proving live vptr `0x00470540`; two null prefix words and four null
+suffix words independently bound its 51-entry executable interface at
+`0x00470548..0x00470614`. Thirty-two unique targets are already compiled; batch
+the 19 missing original methods rather than taking one vtable slot per freeze.
+Keep dispatch runtime-loaded and every target outside the bounded interface
+explicit. Then add an opt-in replay-ready wait: after the final scheduled state,
+hold guest execution until the first changed live controller state, so neutral
+execution cannot run ahead before the user is ready. Backups:
+`%TEMP%/hg-backups/ee-vtable-470540-20261008/` and the prior handoff backup.
+Fault evidence: `%TEMP%/haunting-toc-probe/20261008-replay-handoff-freeze-2f7920.*`.
+
+Result: generation reports 387,047 reachable words and emits the complete 19
+previously missing interface methods across three shards. All 135 Python tests,
+device-thread differentials, runtime, translation, and 262,144/81,920 VU
+comparisons pass. Release executable
+`e596a9b1e31a0927118e50c7f6655aaa9c8309d7e6eb2d354922d79c9f631ce9`
+has 155-input provenance. The visible exact replay reached slice 104,603,648
+without fault and is intentionally holding guest execution there until the first
+changed live controller input. PID 46048; continuation log:
+`%TEMP%/haunting-toc-probe/manual-ready-continuation.input-events.txt`.
+
+Batching the active post-door callback family (2026-10-07): the latest manual
+run crossed `0x002f4090` and stopped explicitly at `0x002f39e0`, again with
+receiver `0x00fc6fe0` and return `0x002f609c`.  This is the same object+`0x110`
+negative descriptor used by every recent stop, so continuing one observed root
+at a time is no longer appropriate.  The pinned original contains a bounded
+descriptor chain at `0x0041a1d0..0x0041a2b0`.  Its already observed members and
+their original routines install the complete successor graph: `2f5c80 ->
+2f59a0`; `2f59a0 -> 2f5280/2f55c0`; `2f5280 -> 2f4e40/2f4a30`; `2f4a30 ->
+2f46b0/2f59a0`; `2f4330 -> 2f4090`; and `2f4090 -> 2f39e0/2f3d30`.
+The six missing functions are contiguous, independently bounded original bodies:
+`[2f39e0,2f3d28)`, `[2f3d30,2f4088)`, `[2f46b0,2f4a28)`,
+`[2f4a30,2f4e38)`, `[2f4e40,2f527c)`, and `[2f5280,2f55b8)`.
+
+Plan before edits: add those six exact descriptor-proven targets together to the
+existing `0x00100b6c` target set, regenerate once, inspect all six emitted entry
+cases, and run Python, runtime, translation, and device-thread differential
+gates.  Then replay the preserved 1,321-event route unattended with preview and
+state capture, rather than asking the user to retrace it.  The original 506-event
+input capture remains unchanged outside the repository (SHA-256 `c70052c9...`);
+the 1,321-event continuation remains external (SHA-256 `05fed5c7...`).  Map the
+active-low button/axis changes into a human-readable control summary, but do not
+store the game-derived event streams in the repository.  Any target outside this
+closed descriptor graph remains an explicit fault.  Backup:
+`%TEMP%/hg-backups/ee-2f-active-family-20261007/`.
+
+Batch result: generation reports 385,992 reachable original words / 5,048
+explicit unresolved items and adds all six expected entry cases to shard 17.
+All 135 Python tests, device-thread differentials, runtime, translation, and
+262,144 fused-transform plus 81,920 compiled VU-readiness comparisons pass.
+Release executable `2e35d6f66cff9eddf220abfb997e75ef17e7893f226a7b8d3cf1a852eb39e0c2`
+then completed the immutable 354M/1,321-event replay with no fault.  Its dump
+kind is `native-iop-budget`, `virtual_time_us=354000000`; EE RAM, GS JSON, all
+VU data/defined/MicroMem/state, and console are byte-identical to the adjacent
+successful control.  GS VRAM/display match the newer adjacent restored-control
+hashes `68a4dd85...` / `6300b195...`.  The continuously published preview was
+inspected and shows the portrait/clock scene correctly; the exact terminal
+display sample is black during the transition.  Evidence prefix:
+`%TEMP%/haunting-toc-probe/ee-2f-family-replay-20261007`.
+
+The preserved input map is now decoded rather than treated as opaque events.
+The 506-event live route contains 19 Cross, 7 Start, 2 Square and one Circle
+press edge, plus analog left-stick travel (198 up, 148 down, 29 left and 74
+right classified transition samples).  The 1,321-event continuation contains
+26 Start, 9 Cross, 3 D-pad-left and 2 Circle press edges plus its analog route.
+These are delivered PS2-pad transitions, not global keyboard observations.
+
+To capture the user's next genuinely new route without `--profile`, retained
+HG-DIAG-006 now has explicit `--input-log external.txt`.  It writes and flushes
+only controller changes already delivered to the focused game window, in the
+existing strict replay format; repository paths are rejected and default cost
+is zero.  The manual launcher records to `%TEMP%/haunting-toc-probe/manual-authentic.input-events.txt`
+while retaining native renderer, core-0 audio and all original controls.  Exact
+format/parse round-trip tests pass with the full runtime suite.  Final Release
+executable after the logger is
+`ded507c951ae6ae75b3d6fd21c377e4ed2b9511cbb8319560d1ffe1acf84d323`
+with 155-input provenance.  Logger backup:
+`%TEMP%/hg-backups/manual-input-log-20261007/`.  Logged runs remain excluded
+from qualified FPS because per-change file flushing has unmeasured host cost.
+
+Latest replayable live boundary (2026-10-08): the focused input logger preserved
+928 delivered controller transitions from slice 7,880,704 through 57,810,944,
+then the game stopped explicitly at the same original `VMADD.xyzw` instruction
+`0x0010dcbc`.  This time ACC.W is noncanonical exponent-255 `0xff9b3def`,
+created by the immediately preceding `VMULA.xyzw`; the MADD source is zero in
+all lanes.  Sony *VU User's Manual* 6.0 pp.26--29 defines every exponent-255
+mantissa as a finite VU value `1.F * 2^128`, not IEEE infinity/NaN, and pp.39--43
+defines combined multiplication/addition exception flags.  Therefore the old
+guard is too narrow: this is a valid VU operand class, not one magic bad value.
+
+Plan before edits: retain the already-tested special treatment for canonical
+`+/-MAX`, whose stored value represents an earlier saturated overflow.  For
+every other ACC encoding, including all exponent-255 mantissas, use the existing
+exact 24-bit integer `Fpu::add`; a product overflow supplies its saturated value,
+while a product underflow contributes signed zero.  Multiplication flags affect
+sticky fields only and final-add flags affect current plus sticky fields, exactly
+as the manual's MADD table requires.  Add focused differential rows for both
+signs, exponent-255 zero/tiny/cancellation/overflow additions, product overflow
+and underflow with zero/normal ACC, final addition overflow/underflow, masks,
+aliases and atomic state.  Then rebuild runtime/translation/VU regressions and
+replay the complete 928-event route unattended before another manual launch.
+External preimages: `%TEMP%/hg-backups/vu0-madd-exception-envelope-20261008/`.
+
+VU result: all 135 Python tests, runtime, translation, 262,144 fused-transform
+and 81,920 compiled VU state/readiness comparisons pass.  Release executable
+`9662e2759332c34b4215132217a88684ab3dbfab68fffe99cb1eefbc0b765aa4`
+replayed the exact external 928-event stream through the former 57.8M stop and
+published its 80M final state with no fault.  Checkpoints continued through
+79M; the exact process was closed only after the normal post-budget host linger.
+External log hashes are stderr `a3a65e87...`, stdout `0e689e55...`, input
+`37287d5e...`.  Retain the full documented MADD exception envelope.
+
+Interactive 30 Hz lock plan (2026-10-08): the existing `--realtime` pacer maps
+modeled guest microseconds to wall time and remains unchanged, but native scanout
+publication can reach about 40 updates/s while changed game frames are normally
+30/s.  Add a default-on interactive host backpressure limiter at complete
+presentation boundaries, toggled by edge-latched F2.  It may wait between host
+publications but must not change guest clocks, omit work/events, mutate pixels,
+or affect hidden/unattended qualification.  Disabling it wakes the next boundary;
+long host stalls rebase rather than create catch-up bursts.  Add deterministic
+deadline/toggle/stall tests, expose the state in the title and F1 reference, and
+document the control.  External preimages:
+`%TEMP%/hg-backups/host-30fps-toggle-20261008/`.
+
+30 Hz lock result: interactive native-host runs now begin locked and F2 toggles
+the lock on a press edge; the title and F1 panel expose its live state/control.
+Backpressure occurs before the existing latest-frame host publication; guest
+rendering work and the UI handoff policy are unchanged.  A 100 ms late bound
+rebases after long host stalls instead of producing a catch-up burst; disabling
+the lock wakes an in-progress wait.
+Hidden and explicit `--unlimited` runs start unlocked.  Deterministic deadline,
+reset and stall tests pass, as do the complete runtime/controls regressions.
+Release executable is
+`6017a3623ecd6bc35838c9141587d6fb925177e6066e053e2e08106a20043174`.
+This is host wall-clock backpressure only, not a guest-clock or renderer change.
+A 100-presented-frame interactive-path smoke run measured exactly 30 produced
+and 30 presented updates in each of three adjacent steady one-second intervals;
+the startup screen itself changed only when its pixels changed.  External stderr:
+`%TEMP%/haunting-toc-probe/host-lock30-smoke100.err.txt`.
+
+Immediate live rejection (2026-10-08): the user reports drastically delayed
+inputs with the default-on lock.  The cause is structural: waiting inside
+`NativeHost::present` blocks the runtime/device publication thread, so input
+consumption can sit behind renderer/device work even though the UI samples keys.
+Reject and remove worker backpressure.  Preserve F2 and the 30 Hz visual cap by
+coalescing only the existing UI-thread latest-frame handoff until its next
+deadline; continue polling/publishing input every UI iteration and never sleep
+the worker.  Hidden/unlimited behavior remains unchanged.  Add deterministic
+due/present/reset/rebase tests, rerun runtime/pacing gates, and relaunch.  Current
+candidate backup: `%TEMP%/hg-backups/host-30fps-backpressure-rejected-20261008/`.
+
+Replacement result: retained F2 lock is UI-only and never waits in
+`NativeHost::present`.  The UI continues sampling/publishing controller state on
+every loop while it leaves the latest completed frame pending until due.  The
+100-frame smoke proves the separation: three steady intervals produced
+40/40/41 runtime updates while presenting exactly 30/30/30; the rejected build
+had throttled production itself to 30.  Host pacing plus the complete runtime
+keyboard/controls suite pass.  Release executable
+`534c6318773a8d34bf11869f35cf5527ede9bd249f1eda02d78e5bd6cae46f0f`.
+External stderr: `%TEMP%/haunting-toc-probe/host-lock30-ui-smoke100.err.txt`.
+
+Renderer late-route raster recurrence candidate (2026-10-07): the completed
+HG-DIAG-005 census on the exact 354M/1,321-event route measured 23,082,276
+triangle-strip calls (60.5004985 s) and 1,795,828 sprite calls (276.4504911 s).
+The severe 330M..350M section alone added 15,451,806 strips and 293,171
+sprites, accounting for about 27.3 s and 75.3 s respectively.  A retained
+49,257-draw late capture independently contains 47,019 triangles, of which
+43,667 have no covered sample (304 zero-area and 43,363 subpixel/scissored),
+so the existing first-sample search repeatedly recomputes three full edge
+products for pixels that will never rasterize.  This is measured late-scene
+evidence; it does not reopen the previously flat deferred-STQ experiment.
+
+First bounded change: modify only `runtime/gs.cpp` so the existing exact
+top-left coverage search carries the three edge equations incrementally across
+the integer sample grid.  Initial edge values and per-X/per-Y increments are
+computed from the same fixed-point vertices; the acceptance inequalities,
+sample order, first covered coordinate, later raster path, state, faults,
+VRAM/coherence and OpenGL commands remain unchanged.  Expected effect is to
+remove six multiplies per rejected sample without dropping a guest primitive.
+Disproof is failure of renderer/runtime regressions, any capture/state/fault
+difference, or no material improvement in the same late replay.  This is an
+independently handmade optimization of this renderer; no external renderer
+implementation was consulted.  Pre-edit backup:
+`%TEMP%/hg-backups/renderer-edge-recurrence-20261007/`.
+
+Result: reject the edge recurrence as state-correct but throughput-flat.  The
+candidate passed 1,159 GPU/CPU cases, `runtime_tests`, and 2,000,000 independent
+old/new randomized first-covered-sample searches.  Two complete 354M replays
+matched each other, and an adjacent byte-restored control matched the candidate
+exactly: display SHA-256 `6300b195...`, GS VRAM `68a4dd85...`, GS JSON
+`013aab9c...`, EE RAM `91648e2b...`, VU captures and console output.  Both
+adjacent runs differ from the older clean capture in the same 57 scattered GS
+VRAM bytes / 35 display bytes, proving that difference was not introduced by
+the candidate (the old and new edge searches are also mathematically identical).
+Candidate late video intervals were 32--43 changed/s; the exact restored control
+was independently 31--42 changed/s in the same 334M..349M route.  Therefore the
+large apparent gain versus the earlier 5--6/s observation was run/host-state
+drift, not this code change.  `runtime/gs.cpp` is restored byte-exactly to
+`70759cee...`; current restored-control executable is `e416dfcd...`.  Do not
+retain or credit the recurrence.  Next acceptance evidence is the same late
+route with the normal SPU2 output path enabled, because host audio deliberately
+paces the guest and is the closest unattended match to a visible gameplay run.
+
+Live-launch root cause and bounded renderer activation plan (2026-10-07):
+`RUN_MANUAL_AUTHENTIC_TOC.cmd` currently does not pass `--gpu-resident` or
+`--gpu-triangles`, so it installs no native GS accelerator and runs the CPU
+reference renderer.  It also enables `--profile` and publishes an external
+860,175-byte PPM throughout play, neither of which belongs in an interactive
+performance run.  This exactly separates the user's 4 FPS launch from the
+adjacent 31--42 changed/s route using the same restored executable and native
+renderer.  Change only this local launcher: install the existing resident GPU
+sprite/triangle renderer, remove the profiler and PPM writer, preserve authentic
+TOC, original guest clocks, checkpoint/video-rate logging, input and window
+behavior.  Do not change any guest or non-renderer implementation.  Validate
+the actual command through the recorded late route and keep the CPU/reference
+path available by direct command-line omission of the renderer switches.
+Pre-edit launcher backup: `%TEMP%/hg-backups/manual-native-renderer-launch-20261007/`.
+
+Live-launch result: retained launcher SHA-256 `58ac456b...` now selects the
+existing handmade `--gpu-resident --gpu-triangles` renderer, removes only the
+host profiler and continuously rewritten external PPM, and selects the already
+qualified `HG_VU_WORKERS=3` runtime setting without changing VU/EE code.  The
+restored renderer executable is `e416dfcd...`; `runtime/gs.cpp` remains exact
+`70759cee...` and no experimental renderer source remains.  Exact late-route
+evidence with the launcher renderer and no VU workers sustains 32--37 produced
+updates/s through 332M..349M before producer-only dips to 23--26.  The qualified
+three-worker configuration sustains 31--42 changed/s across the adjacent
+334M..349M heavy region and 35--49 produced/s afterward.  Complete candidate/
+restored-control captures remain byte-identical under matched observation.
+This clears the user's 30 FPS gate for a manual door attempt with the corrected
+launcher; audio synthesis/output quality remains a separate known subsystem and
+was not changed under the renderer-only authorization.
+
+Manual corrected-launch freeze (2026-10-07): the live run sustained 39--42
+produced/presented updates per second through seconds 36--60 and exactly 30
+changed updates per second through seconds 62--64.  It then stopped explicitly
+at EE `0x002f4330` near slice 64M with `a0=0x00fc6fe0` and
+`ra=0x002f609c`; frame publication ceased only after that AOT fault.  The host
+continued its refresh loop, which made the visible result look frozen, and was
+closed after the log was preserved.  This is not a renderer stall: it is a new
+direct member target through the already documented `0x00100b6c` helper and the
+same object/caller used by prior `0x002f5c80`, `0x002f59a0`, and `0x002f55c0`
+stops.  No non-renderer source/config change is made under the user's current
+renderer-only authorization.  Exact next action if that scope is expanded:
+independently bound and verify original target `0x002f4330`, add only the proven
+AOT root, regenerate/rebuild, and repeat the transition.
+
+`0x002f4330` pre-edit proof (2026-10-07): own decoder bounds the function to
+`[0x002f4330,0x002f46a4)`, with `JR ra` at `0x002f469c`, stack restoration at
+`0x002f46a0`, three padding words, and a distinct prologue at `0x002f46b0`.
+All 884 original file-backed bytes equal the retained live EE RAM range, SHA-256
+`9c9030c522e3483e83e29451db17e359a481b12e9721ca90e7b3dac8f4f6fee3`.
+Plan: add only this observed target to the existing `0x00100b6c` direct-member
+target set, regenerate, rebuild with single-worker MSVC, run translation/runtime
+regressions, then replay the recorded route.  Do not root `0x002f46b0` or guess
+any unresolved dynamic call.  Backup: `%TEMP%/hg-backups/ee-2f4330-20261007/`.
+
+`0x002f4330` result (2026-10-07): config SHA-256 `d59ab6ac...` adds only the
+proved callback to the existing direct-member target set.  Generation reports
+384,442 reachable words / 5,016 unresolved items and emits the expected case in
+shard 17; unresolved transfers remain explicit.  Release executable
+`efc069fe1bb1f33e8c63e430b5051241a38610fbe894fd19aa4512affdc6aad4`
+has 155-input post-link provenance.  `translation_tests`, `runtime_tests`, and
+the configured Python tools suite pass.  The complete 354M/1,321-event route
+then reached its full capture boundary with no fault: 49,257 retained draws,
+25,026,636 rasterized and 24,977,379 retired.  Display, GS VRAM/state, EE RAM,
+VU data/defined/MicroMem/state, and console are byte-identical to the adjacent
+restored control (`6300b195...`, `68a4dd85...`, `013aab9c...`, `91648e2b...`).
+The hidden host lingered after publishing its completed dump and was closed only
+after capture verification, so its forced exit code is not a guest failure.
+Retain the root.  Next acceptance evidence is the corrected interactive route
+that originally selected this callback; capture and independently bound only a
+genuinely later explicit stop.
+
+Next live boundary (2026-10-07): the repaired interactive build sustained
+30--31 changed frames/s, passed `0x002f4330`, and stopped explicitly at EE
+`0x0010dcbc`: `VU broadcast product exceptional accumulator path is
+unimplemented`.  Original decode is `VMULA.xyzw` at `0x0010dcb8` followed by
+`VMADD.xyzw` at `0x0010dcbc`; the fault state has canonical `-MAX`
+(`0xffffffff`) in ACC.W.  Sony *VU User's Manual* 6.0 pp.39--43 specifies the
+MADD flag/result table for canonical +/-MAX ACC: a normal product retains ACC
+at +/-MAX with current overflow, while multiplication sign/zero contributes to
+sticky flags; product overflow selects saturated product sign and product
+underflow retains ACC while contributing zero/sign/underflow sticky state.
+Plan: extend only this documented canonical-MAX envelope in
+`State::vu_broadcast_product`; retain explicit faults for noncanonical exponent
+255 ACC and unverified addition overflow/underflow.  Add atomic/mask/destination,
+both-sign and normal/overflow/underflow product cases, rebuild, run focused and
+translation regressions, then relaunch the same manual route.  Backup:
+`%TEMP%/hg-backups/vu0-max-acc-madd-20261007/`.
+
+Canonical-MAX MADD result: `State::vu_broadcast_product` now implements only
+the Sony table's canonical `0x7fffffff/0xffffffff` ACC rows.  Normal and
+underflowed products retain saturated ACC; product overflow supplies its
+saturated sign; final current flags and multiplication sticky flags are kept
+separate.  Noncanonical exponent-255 ACC and addition overflow/underflow still
+fault.  Focused coverage crosses both operations, ACC signs, all masks,
+destination zero/aliasing, and normal/zero/product-overflow/product-underflow
+inputs while preserving atomic rejection tests.  `runtime_tests` and
+`translation_tests` pass.  Release executable SHA-256 is
+`48a803c3167d6e979f0eebf13084e18e08ff3fb1f6c54d1d19f64bf8be16c497`
+with refreshed 155-input provenance.  Next evidence is the same interactive
+route advancing beyond original `VMADD` at `0x0010dcbc`.
+
+Next live result and plan: canonical-MAX MADD cleared its former slice-53M stop;
+the interactive route advanced normally at about 30 changed frames/s to slice
+365M, then stopped at missing callback `0x002f4090`, again through object
+`0x00fc6fe0` / return `0x002f609c`.  Own decode bounds the function to
+`[0x002f4090,0x002f4328)`, return/delay `0x002f4320/24`, padding, then the
+already-rooted distinct `0x002f4330` prologue.  All 664 original bytes match
+retained live EE RAM, SHA-256
+`abe671bbfa2f52c5f30185425e2879ce995f6beac4fac96beca0238a7fb3146d`.
+Add only this observed member target, regenerate/rebuild, and rerun focused
+regressions.  The user's missing-audio report is also confirmed as launch
+configuration: the manual launcher omitted `--spu2-output-core`, and its log has
+no SPU2/speaker counters.  Restore existing opt-in core-0 WinMM presentation;
+this does not claim finished synthesis/mixing or repaired audio quality.  Backup:
+`%TEMP%/hg-backups/ee-2f4090-audio-launch-20261007/`.
+
+`0x002f4090` build result: the existing `0x00100b6c` direct-member target set
+now includes only this newly observed and independently bounded callback.
+Generation reports 384,608 reachable words / 5,022 unresolved items and emits
+the expected case in `translated-shard-0017.cpp`; unsupported transfers remain
+explicit.  `runtime_tests` and `translation_tests` pass.  Release executable
+SHA-256 is `6302643245a731db1006e98e1f66cc36dd6aade40bd4fccb8b1b7bbec888a476`
+with refreshed 155-input provenance.  The local interactive launcher SHA-256 is
+`93273232df919d0c252cad34ac6b7da018e31ed0f80fbbb6feee3fdbb8257035`
+and again passes `--spu2-output-core 0`.  This restores the existing raw core-0
+WinMM presentation path only; synthesis, effects, cross-core mixing, volume
+semantics, underruns, and audible quality remain unfinished and unverified.
+Next evidence is a manual run crossing `0x002f4090`, with the next genuine
+explicit stop captured rather than inferred from a visible frozen frame.
+
+Renderer-only 30 FPS continuation (2026-10-07): the user explicitly authorizes handmade renderer changes only and prohibits copied PCSX2/ps2recomp material. No manual door retest is requested again until gameplay is verified at 30 FPS. Current clean executable `5f86c145...` with already-validated `HG_VU_WORKERS=3` exceeds 37 original writer boundaries/s in the early 31M..33M window, but the exact recorded late route falls to 5--6 changed/presented frames/s by slices 335M..337M while stage C advances roughly 0.86--0.89 million draws per guest-million checkpoint. Thus VU parallelism is not the late bottleneck; the renderer consumer is.
+
+First bounded renderer candidate: replace `GsDraw`'s full 128-register (1 KiB) environment snapshot with the exact 16-register subset read by point/line/sprite/triangle rasterization for the draw's selected context. `GsDraw` already owns vertices, primitive state and XYOFFSET separately. Capture the raster register subset at draw construction; at delayed rasterization save/apply/restore only those same registers, preserving state ordering and every existing checked fallback/fault. Update renderer diagnostics/tests for the private representation and add a differential mutation-sensitive queued-state case. This is independently derived from this renderer's own `value[]` read inventory, not an external renderer. Gate on GIF state/fault comparisons, runtime, GPU/CPU renderer cases, and byte-identical final display/EE/GS-VRAM/VU state on the recorded route; reject unless the late changed-frame rate materially improves toward 30. Pre-edit exact backup: `%TEMP%/hg-backups/renderer-compact-draw-state-20261007/`.
+
+Continuation evidence (2026-10-07): the exact restored 2,064-byte TOC fixture and immutable 1,321-event route are again available outside the repository under `%TEMP%/haunting-toc-probe/`. HG-DIAG-096 disproved the reported 353M host freeze: the route reaches an explicit VU1 identity fault at EE `0x0010ca44`, entry zero, RA `0x001b86cc`, after retaining 32,073 draws / 24,747,786 rasterized / 24,715,713 retired. The first tested executable was stale relative to the newly generated scene12 config; its MicroMem dump was exactly configured program 13. Fresh provenance-matching build `9c96ace54c05b37eb865e6511301413fdef8d9662223dc20e1c51593fbf6065f` clears that identity and reaches the next program at the same publication boundary. Its MicroMem SHA-256 is `757b4fb550785f5d1119eed3b9dac8ab6aa299a7f5f4b1dd6a946ce168f0027c`: bank zero is replaced completely, bank one is a deterministic overlay, and the final 99 pairs remain scene12. Thus scene12 is confirmed forward progress; the new stop is a distinct program identity, not a recurrence or a renderer/device deadlock.
+
+Current differential plan before config changes: finish the same current build once with `--sync-devices` and require the same exact MicroMem image/fault before accepting a new AOT identity. The captured image is byte-for-byte assembled from six unique original-ELF ranges covering every pair without overlap: micro `0x0000` <- source `0x003a6118` x256; `0x0800` <- `0x003a6920` x94; `0x0af0` <- `0x003a4eb0` x18; `0x0b80` <- `0x003a2ba0` x106; `0x0ed0` <- `0x003aaf50` x38; `0x1000` <- `0x003ab088` x99. Their assembled 4,888-byte SHA-256 is `795330eb080f8283a906feb169f16046e021db2e64fe7c2dfcd6f38afb2aa34e`; structural decoding has no unsupported pairs or external direct branches, end markers at `0x0000/0x0ad0/0x0b60/0x0eb0/0x12f0`, and the same entry family `0x0000/0x0010/0x1300`. If the synchronous dump agrees, add only this exact composite, regenerate, run Python/runtime/translation/device/VU readiness gates, then replay once. If it differs, do not add the identity and instead trace MPG provenance/order. External backups: `%TEMP%/hg-backups/vu1-identity-differential-20261007/`, `%TEMP%/hg-backups/vu1-hybrid-composite-20261007/`, and `%TEMP%/hg-backups/diag096-postbuild-removal-20261007/`. The temporary automatic post-build replay and alternate executable name have been removed; normal `hg_game.exe` provenance is restored.
+
+The synchronous control agrees exactly: MicroMem SHA-256 `757b4fb550785f5d1119eed3b9dac8ab6aa299a7f5f4b1dd6a946ce168f0027c`, identical retained 32,073 / 24,747,786 / 24,715,713 GS counts, and the same entry-zero identity fault. The immediate synchronous fault is published at original EE `0x001b7960` rather than the asynchronous next-scheduling-boundary `0x0010ca44`, as designed. This exonerates coarse device ordering for the identity. Config now contains only the exact six-range `scene13_mscal0_composite`; regeneration reports 384,221 reachable words / 5,012 unresolved items and changes one generated file. Release `hg_game.exe` SHA-256 is `0e503c915f0460af268041db11704ce213eae5273460892be766b8a5d31cbcde` with 155 provenance inputs. All 135 Python tests, device-thread differential tests, runtime tests, translation tests, and VU readiness (262,144 fused-transform plus 81,920 full compiled state/fault comparisons) pass. An asynchronous `HG_VU_WORKERS=0` route replay is the current acceptance gate; progress beyond this identity is required before retaining it.
+
+The first composite replay clears the identity and executes entry zero, then stops explicitly on the same matched program at unconfigured resume entry decimal 2784 (`0x0ae0`). This is the architectural successor of exact END pair `0x0ad0`, not a new program. Batch the complete decoded END-successor family now: `0x0010`, `0x0ae0`, `0x0b70`, `0x0ec0`, `0x1300` plus MSCAL entry zero. Each is inside the exact captured/original-byte-backed image; there are no unsupported instructions or external direct branches. Regenerate and rerun the same gates once, then replay. This avoids serially discovering the other three resume boundaries while preserving the explicit fault for any entry not implied by the decoded END set.
+
+The batched resume build regenerates successfully with unchanged 384,221-word EE reachability / 5,012 unresolved items. All 135 Python tests, device-thread, runtime, translation, and 262,144/81,920 VU readiness comparisons pass again. Release `hg_game.exe` is `085d55388db24cf00df504b40f4b1fcb048dd414d358cf050fbeddf50edba8a8` with 155-input provenance. Its exact-route replay is active. HG-DIAG-096 has met its removal criterion: it proved continued loop/device progress and a synchronous-equivalent explicit VU boundary rather than a deadlock. Its source hooks, stage-C counters, environment checks, phase marks, automatic post-build replay and alternate executable name are removed for the next clean build; backup `%TEMP%/hg-backups/diag096-code-removal-20261007/`.
+
+Final scene13 result: the batched build cleared entry zero and every observed architectural resume and completed the exact 354,000,000-slice / 1,321-event route with no unexpected fault. After HG-DIAG-096 was physically removed, clean Release executable `5f86c145689872a5adc2ed9f7b1353581b731f8e7c0b707694b22bb372b7522f` (155-input provenance) repeated the full route. It retained 49,257 draws / 25,026,636 rasterized / 24,977,379 retired at display publication. Its EE RAM, GS VRAM/state, display, VU1 data/defined/MicroMem/state, metadata and console captures are byte-identical to the preceding successful build; raw IOP RAM differs at exactly `0x0bfcd1..0x0bfcd2`, the already verified RTC seconds/minutes payload. The unlimited producer temporarily peaked near 2.15 GiB working set while stage C drained, then returned to about 133 MiB before capture; this is host backlog evidence, not a paced-gameplay freeze or throughput result. External evidence prefix: `%TEMP%/haunting-toc-probe/vu1-scene13-clean-20261007`. Post-clean gates pass: all 135 Python tests, device-thread, runtime, translation, 1,159 NVIDIA GPU/CPU cases, and 262,144 fused-transform plus 81,920 compiled VU readiness comparisons. Full CTest is 28/29; only the unchanged known `gif` overlap assertion now reported at line 1339 fails. The reported post-door freeze route is therefore cleared through the complete recorded budget; next evidence is a fresh manual door transition on this clean executable, not another speculative callback/worker change.
+
+User priority is narrowed to completing the door transition. The exact live route is preserved externally as 506 controller events (`%TEMP%/hg-door-live2-20261006/door-input-events.txt`, SHA-256 `c70052c90b7f8d403baaaf62ca2eb4d4fcc6f7db40230d73dc9a7b45423e1d60`) and replays unattended with the authentic TOC. The separately disclosed diagnostic continuation releases the final held action, walks through the doorway, and returns neutral. The complete dynamically observed AOT callback chain is now rooted from independently verified original bytes, the retained display publishes the destination room, and the subsequent in-room GS STQ fault is repaired by a bounded exact 128-bit fallback. Two 300,000,000-slice replays completed beyond the door without an unexpected fault. Current next evidence is user-visible manual play through the same transition, followed by tracing any genuinely later explicit stop; do not reopen the cleared callback or STQ routes without new evidence. Do not alter guest clocks, weaken waits/faults, add an emulator fallback, or copy PCSX2 implementation. Pre-edit progress backup: `%TEMP%/hg-backups/door-transition-20261006/`.
+
+Pinned-PCSX2 guest observation at original CDVD cause-2 callback `0x00026ab8` recovered live DMA3 MADR/BCR/CHCR `0x33c94/0x00810004/0x40000200` and the real external 2,064-byte TOC record `%TEMP%/hg-door-real-toc-20261006.bin` (SHA-256 `1bcd3fd5348ab8dcfb5f8e5253912a51ab7505e2691191615d02f99be2d3e1d4`). Authentic TOC startup exposed an explicit native rejection of original ReadDvd packet `[16,0,0,0,1,0,0,0,16,131,0]`. Original CDVDMAN construction plus official PCSX2 commit `9fffbdbd...` agree that byte `0x83` is x4 CAV, not an invalid mode. `IopState::submit_cdvd_n_command` now admits only observed spindle profiles `0x02` and `0x83`; focused `iop_tests` passes. Release `hg_game.exe` provenance SHA-256 is `3b675fcd2df0fdc2e8316ff7357f6983f77997b5d007fabefd6f2500c6a663fb` (155 inputs). Interactive synchronous-device run PID 51416 passed the former stop and reached original disc streaming and GS draws; input/profile evidence is external under `%TEMP%/hg-door-live2-20261006/`. Await the user's door attempt before deciding whether the asynchronous device pipeline is implicated.
+
+The user's door attempt stopped explicitly at missing EE AOT target `0x001a8dc0`, RA `0x00127120`, not a timing deadlock. This synchronous-device result exonerates the asynchronous device pipeline for this stop. Captured global `0x0044e588` points to object `0x017b1b80`; its vtable is `0x0046abb0`, and slot `+0x18` is exactly `0x001a8dc0`, matching caller `0x001270f0..0x00127120`. Captured RAM and original ELF body `[0x001a8dc0,0x001a95ec)` are byte-identical (2,092 bytes, SHA-256 `e5e2b2f4fec43ec0c0d6dfd7ef9fab1af8569b44bf731695d865abf933e60a68`); return/delay are `0x001a95e4/0x001a95e8`, with the next prologue at `0x001a95f0`. The permitted shared non-rendering list contains the exact entry but only a truncated 16-byte analysis extent, so it corroborates the address and supplies no implementation/bounds. Plan before edit: add only this verified function root, regenerate AOT output, build, run translation/runtime regressions, then replay the newly captured input sequence with live input disabled. Acceptance is progress beyond `0x001a8dc0` without a new correctness fault; any next explicit missing target is a new bounded checkpoint, not proof that the door transition completed. External backup: `%TEMP%/hg-backups/door-transition-20261006/ee-1a8dc0/`.
+
+HG-DIAG-006 replay follow-up before edit: this live route contains 506 exact controller transitions, whose existing `--input-at` argv form is 39,428 characters and exceeds the Windows process command-line limit. Add only an opt-in `--input-events-file` startup parser for the same strict `slice pad:...` events (maximum 1,024, strictly increasing, no runtime file polling); keep the external game-derived file out of the repository and reject conflicts with all other diagnostic input sources. This changes guest input only when explicitly selected and has no disabled/runtime-loop cost. Validate accepted CRLF/LF, malformed, duplicate/out-of-order, over-limit and conflicting inputs before using the exact captured route. External backup: `%TEMP%/hg-backups/door-transition-20261006/input-replay-file/`.
+
+The exact 506-event unattended replay cleared `0x001a8dc0` and stopped at missing target `0x001a8380`, RA `0x00188cc8`. Original caller `0x00188ca4..0x00188cc4` loads the same global object and dispatches vtable slot `+0x3c`; captured object `0x017b1b80`, vtable `0x0046abb0`, selects exactly `0x001a8380`. Original/live body `[0x001a8380,0x001a8400)` is byte-identical (128 bytes, SHA-256 `d251b099ef650fc6f8b7bac626363a815f6a053116b6bda2dcefd8b6babc6d9f`) with return/delay `0x001a83f8/0x001a83fc` and next prologue `0x001a8400`. The permitted shared non-rendering config has no entry for this address. Plan: root only `0x001a8380`, regenerate/rebuild/test, and repeat the same external replay. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-1a8380/`.
+
+The next exact replay cleared `0x001a8380` and stopped explicitly at missing target `0x001a85e0`, RA `0x00127450`. Caller `0x00127428..0x0012744c` loads the same object from global `0x0044e588` and dispatches vtable slot `+0x20`; captured object `0x017b1b80`, vtable `0x0046abb0`, selects exactly `0x001a85e0`. Original/live body `[0x001a85e0,0x001a8960)` is byte-identical (896 bytes, SHA-256 `4a16dcbbc475338501ec0d67ea5e5cb4ce54b76905f7df51d935ac4c2c5d7e12`) with return/delay `0x001a8950/0x001a8954` and next prologue `0x001a8960`. The permitted shared non-rendering list corroborates the entry address but has only a truncated 12-byte extent, so it supplied neither bounds nor implementation. Plan before edit: root only `0x001a85e0`, regenerate and rebuild, then repeat the same 506-event external replay. Acceptance is progress beyond this callback without a new correctness fault; a later explicit missing target remains a bounded checkpoint rather than proof of visual completion. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-1a85e0/`.
+
+The rebuilt exact replay cleared `0x001a85e0` and next stopped at missing target `0x00196ef0`, RA `0x001a367c`. Caller `0x001a3670..0x001a3678` passes live `s3=0x01510c80` and descriptor `s3+0xa0=0x01510d20` to generic member helper `0x00100b40`; the captured descriptor is exactly `{0,-1,0x00196ef0}`. Original static record `0x003b28f8` contains the same three words. Original/live body `[0x00196ef0,0x00196fb8)` is byte-identical (200 bytes, SHA-256 `b9a63fdc25cee2e1d9a0226470c36cad0721a1d6993932441d8e09f3c0c8a9e6`) and is independently bounded by return/delay `0x00196fb0/0x00196fb4` and the next prologue at `0x00196fc0`. The permitted shared non-rendering config agrees on entry and end, but the root decision and evidence come from the original executable and captured state. Plan before edit: add only this verified member target, regenerate/rebuild, and replay the same route. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-196ef0/`.
+
+That replay cleared `0x00196ef0` and next selected `0x00196c20` through the same caller and live descriptor address. At the stop, `s3=0x01510c80` and `s3+0xa0` contains exactly `{0,-1,0x00196c20}`, matching original static record `0x003b2908`. Original/live body `[0x00196c20,0x00196ee8)` is byte-identical (712 bytes, SHA-256 `ebcb3a8c007a537b9904299fc2a52a3e77aabbeb12353467b0e5a83c6e744791`) and is bounded by return/delay `0x00196ee0/0x00196ee4`, padding, and the next prologue at `0x00196ef0`. The shared non-rendering config corroborates the entry/end; the independent capture and original bytes establish this root. Plan before edit: add only `0x00196c20`, regenerate/rebuild, and repeat the exact replay. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-196c20/`.
+
+The next exact replay cleared both repaired `0x00196...` members and stopped at `0x002789b0`, RA `0x001bbed8`. Caller `0x001bbebc..0x001bbed4` dispatches captured live object `0x00fc8aa0` through vtable `0x0046d800` slot `+0x0c`, whose value is exactly `0x002789b0`. Original/live body `[0x002789b0,0x00278d5c)` is byte-identical (940 bytes, SHA-256 `6c6d0802c877938513f049202b2494b7a2d56810599108ca340a4f2164f80591`) and is independently bounded by return/delay `0x00278d54/0x00278d58` and the next prologue at `0x00278d60`. The shared non-rendering config corroborates that end but supplies no implementation. Plan before edit: add only this captured vtable target, regenerate/rebuild, and replay again. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2789b0/`.
+
+Build `991413aeceb23bb76082c94071d2d8f7e99be0f5357453eb5ed427c093858013` cleared `0x002789b0` and completed the exact 506-event replay through the 270,000,000-slice budget with no EE fault. The retained 640x448 display under `%TEMP%/hg-door-replay-2789b0-20261006/` visibly shows the formerly blocking door open and Fiona standing within the doorway. This proves progress beyond the reported freeze, but not yet the post-door room publication. Next verification: replay the same immutable input through a longer budget and require a retained post-door scene or diagnose the exact wait/state if the open-door frame persists. Do not call the transition complete from the open-door frame alone.
+
+The 330,000,000-slice extension also completed without a fault and retained the same open-door pose. State comparison showed this was not a frozen CDVD/renderer path: the door object's active bytes at `+0x2a/+0x2b` cleared, its dynamic member advanced to `0x0019c600`, DMA/CDVD remained quiescent, and EE was sampled at the normal original `0x001beef0` display synchronization loop. The captured live route simply ends at slice `262901760` with the door button still held and contains no release or movement after the door opens. External-only diagnostic file `door-input-postopen-check.txt` therefore preserves the 506 exact events, adds a release at `262934528`, applies the immediately preceding recorded forward stick direction only from `275000000` to `290000000`, then returns neutral. This is intentionally guest-affecting validation input, not production behavior or evidence about automatic door timing.
+
+That post-open check crossed the doorway and stopped explicitly at missing target `0x002af020`, RA `0x0020957c`, proving the repaired door logic and threshold traversal advance into later game code. Caller `0x00209560..0x00209578` selects vtable slot `+0x0c` on captured object `0x017f3594`; its vtable is `0x0046e2c0` and the slot is exactly `0x002af020`. Original/live body `[0x002af020,0x002af02c)` is byte-identical (12 bytes, SHA-256 `a031729369dc884e907f3653fae4ac018cf06e5f234057b7b9e4b5cf887c4d90`) and is a three-instruction accessor returning original static pointer `0x003ff170`. Plan before edit: root only this observed post-door accessor, regenerate/rebuild, and repeat the external post-open check. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2af020/`.
+
+The rebuilt post-open replay cleared `0x002af020` and stopped at `0x002af1a0`, RA `0x002032c4`. Caller `0x00203298..0x002032c0` selects slot `+0x28` on the same captured object `0x017f3594`; vtable `0x0046e2c0` contains exactly `0x002af1a0` there. Original/live thunk `[0x002af1a0,0x002af1c8)` is byte-identical (40 bytes, SHA-256 `7f6f04dc3790cb222da3885b704dbdf55352c07837439d46d87a53384e192074`) and tail-jumps to the original generic member helper. Its current index-zero descriptor at `0x01990a70` is `{0,-1,0x002af730}`, but that nested target has not yet executed and is not pre-rooted. Plan before edit: add only the observed thunk, regenerate/rebuild, and replay. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2af1a0/`.
+
+The next replay cleared the thunk and then stopped at its actually selected nested target `0x002af730`, RA still `0x002032c4`. The live index-zero descriptor at `0x01990a70` is exactly `{0,-1,0x002af730}`. Original/live body `[0x002af730,0x002af7d4)` is byte-identical (164 bytes, SHA-256 `704acc92b9e6e3bee282ef6de12fae346fd52d646ea554b115447447b42fd9f6`) and is bounded by return/delay `0x002af7cc/0x002af7d0` plus padding before the next prologue at `0x002af7e0`. The retained frame shows Fiona moving through the open doorway rather than frozen in front of it. Plan before edit: root only this now-observed nested member, regenerate/rebuild, and repeat the post-open route until the next room is published or another explicit boundary appears. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2af730/`.
+
+The rebuilt replay cleared `0x002af730` and reached that member's first child-object virtual call: missing target `0x002b6310`, RA `0x002af7bc`. Captured child object `0x017f5350` has vtable `0x0046ea40`, whose slot `+0x0c` is exactly `0x002b6310`. Original/live body `[0x002b6310,0x002b6324)` is byte-identical (20 bytes, SHA-256 `bb811281db16a0146b04ad6630625368f53ba4a96061e61c15c77e20c3365db7`) and is bounded by return/delay `0x002b631c/0x002b6320` before padding. Plan before edit: root only this observed five-instruction child method, regenerate/rebuild, and repeat the post-open route. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2b6310/`.
+
+The next replay cleared `0x002b6310` and reached another method on that same live child: target `0x002b6130`, RA `0x00266ca4`. Caller `0x00266c80..0x00266ca0` dispatches object `0x017f5350` through vtable `0x0046ea40` slot `+0x18`, which is exactly `0x002b6130`. Original/live body `[0x002b6130,0x002b613c)` is byte-identical (12 bytes, SHA-256 `05c12dc64f2d358f293ca46211496a81c367e46ccc1a18227d2f6c221ab64154`) and ends at return/delay `0x002b6134/0x002b6138`. Plan before edit: root only this observed three-instruction method, regenerate/rebuild, and repeat the post-open route. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2b6130/`.
+
+The rebuilt replay cleared `0x002b6130` and next stopped at target `0x002af070`, RA `0x001fbeec`. Caller `0x001fbed0..0x001fbee8` selects slot `+0x24` on live object `0x017f3594`; captured vtable `0x0046e2c0` contains exactly `0x002af070` there. Original/live indexed accessor `[0x002af070,0x002af088)` is byte-identical (24 bytes, SHA-256 `d02aaf39b17e3d4719822d9974f59578c353942970f78fa85d37aa59c8a94051`) and is bounded by return/delay `0x002af080/0x002af084` before padding. Plan before edit: root only this observed accessor, regenerate/rebuild, and repeat the post-open route. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2af070/`.
+
+The next replay cleared `0x002af070` and returned to the already-rooted indexed thunk `0x002af1a0`, which selected missing member `0x002af4e0` with RA `0x002032c4`. The thunk overwrites `a1` before its tail jump; its original index was two, independently confirmed by live descriptor `0x01990a88 = {0,-1,0x002af4e0}` (not the index-zero descriptor at `0x01990a70`). Original/live body `[0x002af4e0,0x002af678)` is byte-identical (408 bytes, SHA-256 `36b4d210c432ff165839972d30bc400111c91fbe93655261a7b102a7dbd9de9c`) and is bounded by return/delay `0x002af670/0x002af674` before padding and the next prologue at `0x002af680`. Plan before edit: root only this observed index-two member, regenerate/rebuild, and replay again. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2af4e0/`.
+
+The rebuilt replay cleared `0x002af4e0` until that member dispatched child object `0x017f53f0`; it stopped at target `0x00319b10`, RA `0x002af574`. Captured vtable `0x00472f60` contains exactly `0x00319b10` in slot `+0x0c`. Original/live body `[0x00319b10,0x00319b18)` is byte-identical (8 bytes, SHA-256 `6d64edf91449c1b17746c1ef18afa2eb25c70bdf1322ab3df5a2630993b7e2f1`) and is the original two-instruction empty virtual (`jr ra; nop`), not a guessed no-op substitute. Plan before edit: root only this observed original method, regenerate/rebuild, and replay again. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-319b10/`.
+
+The next replay cleared `0x00319b10` and reached slot `+0x18` on the same child object: target `0x00317c70`, RA `0x00266ca4`. Captured object `0x017f53f0` and vtable `0x00472f60` select exactly that method. Original/live body `[0x00317c70,0x00317d34)` is byte-identical (196 bytes, SHA-256 `69ae7eba37ff6502af6d4b98603824328ae0e7a2e4adb2fb1e8acba5d2312b32`) and is bounded by return/delay `0x00317d2c/0x00317d30`, padding, and the next prologue at `0x00317d40`. Plan before edit: root only this observed method, regenerate/rebuild, and repeat the post-open route. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-317c70/`.
+
+The rebuilt replay cleared `0x00317c70` and returned to indexed thunk `0x002af1a0`, which selected missing member `0x002af300`, RA `0x002032c4`. The overwritten entry index is independently recovered as four from live descriptor `0x01990aa0 = {0,-1,0x002af300}`. Original/live body `[0x002af300,0x002af49c)` is byte-identical (412 bytes, SHA-256 `75e87b4b7648c9c67bf6eddeff8a512740c4349d92d00511c29b1e5fb4c5db78`) and is bounded by return/delay `0x002af494/0x002af498` and the next distinct routine at `0x002af4a0`. Plan before edit: root only this observed index-four member, regenerate/rebuild, and replay again. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2af300/`.
+
+The next post-open replay cleared `0x002af300` and stopped at `0x002af030`, RA `0x002091a0`. Original caller `0x00209184..0x0020919c` selects slot `+0x30` on live object `0x017f3594`; captured vtable `0x0046e2c0` contains exactly `0x002af030` there. Original/live body `[0x002af030,0x002af03c)` is byte-identical (12 bytes, SHA-256 `b81c3374fcad520c1f5b2d1a1479bcfc6250905449b3295349a18b3a35f27c75`) and is the original three-instruction getter returning `0x003ff200`. The permitted shared non-rendering config independently corroborates this exact boundary; it supplies no implementation. Plan before edit: root only this observed accessor, regenerate/rebuild, and repeat the post-open route. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2af030/`.
+
+That replay cleared `0x002af030` and next stopped at `0x002af060`, RA `0x0020962c`. Original caller `0x00209610..0x00209628` selects slot `+0x18` on the same live object `0x017f3594`; captured vtable `0x0046e2c0` contains exactly `0x002af060`. Original/live body `[0x002af060,0x002af06c)` is byte-identical (12 bytes, SHA-256 `47f900d023193581dbe73448eb60ddb0cce493504aa0a3d1bd5927e2f2f7af38`) and is the original three-instruction getter returning `0x003ff810`. The permitted shared non-rendering config independently corroborates this exact boundary. Plan before edit: root only this observed accessor, regenerate/rebuild, and repeat the post-open route. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2af060/`.
+
+The rebuilt route cleared `0x002af060` and stopped at child-object target `0x002b6140`, RA `0x002671c4`. Original caller `0x002671a8..0x002671c0` loads a child from the post-door list and dispatches vtable slot `+0x14`; captured object `0x017f5350`, vtable `0x0046ea40`, selects exactly `0x002b6140`. Original/live body `[0x002b6140,0x002b62c8)` is byte-identical (392 bytes, SHA-256 `5e22472081e695b36597278350d58f7f0135c2bafa1daf35d7a47580e4e83509`) and is bounded by return/delay `0x002b62c0/0x002b62c4`, padding, and the next prologue at `0x002b62d0`. The shared non-rendering analysis independently corroborates the entry and `0x002b62c8` boundary. Plan before edit: root only this observed child method, regenerate/rebuild, and replay again. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2b6140/`.
+
+That replay cleared `0x002b6140`, advanced to another child in the same list, and stopped at `0x00317d40`, RA `0x002671c4`. Captured child object `0x017f5490` has vtable `0x00472f60`; slot `+0x14` is exactly `0x00317d40`. Original/live body `[0x00317d40,0x00319af4)` is byte-identical (7,604 bytes, SHA-256 `e834f3be33b8f57aa6beb32eae44d9f1c1cc5a3f8900a035ce40f975aaedc85b`) and is independently bounded by the shared epilogue return/delay `0x00319aec/0x00319af0`, padding, and the distinct tiny routine at `0x00319b00`. The shared non-rendering manual list corroborates this complete extent; its truncated automatic analysis extent is not used. Plan before edit: root only this observed child method, regenerate/rebuild, and replay again. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-317d40/`.
+
+The next replay executed `0x00317d40`, increased the retained GS work, and then stopped at `0x002af040`, RA `0x002095e4`. Caller `0x002095c8..0x002095e0` selects slot `+0x10` on live object `0x017f3594`; captured vtable `0x0046e2c0` contains exactly `0x002af040`. Original/live body `[0x002af040,0x002af04c)` is byte-identical (12 bytes, SHA-256 `969318d43eaaf05f9e1966297468d05ec8dda3cbdc7804c63880ff8a2ebc834b`) and is the original three-instruction getter returning `0x003ff340`. The retained frame still shows Fiona crossing the open doorway rather than the destination room, so visual acceptance is not yet met. The permitted shared non-rendering config corroborates the exact getter boundary. Plan before edit: root only this observed accessor, regenerate/rebuild, and replay again. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2af040/`.
+
+That replay cleared `0x002af040` and immediately stopped at sibling getter `0x002af050`, RA `0x00209608`. Caller `0x002095ec..0x00209604` selects slot `+0x14` on the same live object `0x017f3594`; captured vtable `0x0046e2c0` contains exactly `0x002af050`. Original/live body `[0x002af050,0x002af05c)` is byte-identical (12 bytes, SHA-256 `fac83cfdc3db21cf096ae7aec1c2c97b542786ce4ca7e7bf4bf8e152c78ddf82`) and is the original three-instruction getter returning `0x003ff650`. The permitted shared non-rendering config corroborates the exact boundary. Plan before edit: root only this observed accessor, regenerate/rebuild, and replay again. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2af050/`.
+
+The rebuilt replay cleared all three observed resource getters and returned to indexed thunk `0x002af1a0`, which selected missing member `0x002af680`, RA `0x002032c4`. Live descriptor index one at `0x01990a7c` is exactly `{0,-1,0x002af680}`; neighboring captured indices remain distinct and are not pre-rooted. Original/live body `[0x002af680,0x002af72c)` is byte-identical (172 bytes, SHA-256 `c2f8c7cb43a1cf4a1b9772b29f1e952fd7261a6ddc9b5704859515c420c01d31`) and is bounded by return/delay `0x002af724/0x002af728` before padding and the `0x002af730` prologue. The shared non-rendering analysis independently corroborates this complete extent. Plan before edit: root only this observed index-one member, regenerate/rebuild, and replay again. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2af680/`.
+
+That replay cleared `0x002af680` and reached child-object method `0x002b62d0`, RA `0x00267224`. Caller `0x00267208..0x00267220` dispatches vtable slot `+0x10`; captured object `0x017f5350`, vtable `0x0046ea40`, selects exactly `0x002b62d0`. Original/live body `[0x002b62d0,0x002b6308)` is byte-identical (56 bytes, SHA-256 `283bfa679956815d89050e61bc2874e98d724b5295c0594e149f5a1386763271`) and is bounded by return/delay `0x002b6300/0x002b6304` before padding and the already-rooted `0x002b6310` method. The shared non-rendering analysis corroborates this complete extent. Plan before edit: root only this observed child method, regenerate/rebuild, and replay again. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-2b62d0/`.
+
+The next replay cleared `0x002b62d0` and reached the matching slot `+0x10` method on captured child `0x017f5490`: target `0x00319b00`, RA `0x00267224`, through vtable `0x00472f60`. Original/live `[0x00319b00,0x00319b08)` is byte-identical (8 bytes, SHA-256 `6d64edf91449c1b17746c1ef18afa2eb25c70bdf1322ab3df5a2630993b7e2f1`) and is the original `jr ra; nop` virtual, distinct from the already-rooted identical method at `0x00319b10`. Plan before edit: root only this dynamically observed original method, regenerate/rebuild, and replay again. Backup: `%TEMP%/hg-backups/door-transition-20261006/ee-319b00/`.
+
+Build `b0b712683e241d49e5de460596fefe215934c633fe87db6cbbca336859ae22f5` clears the entire observed missing-AOT chain and publishes the destination-room frame. External retained capture `%TEMP%/hg-door-postopen-319b00-20261006/door-state.ram.display.ppm` visibly shows Fiona walking inside the new room with the open doorway behind her. This satisfies the visual door-transition milestone. The same bounded forward-input continuation then stops later at original PC `0x001b7960` with the existing explicit renderer fault `GS perspective STQ exponent spread requires validation`; draw counts advanced to 1,506,852 sprites and 6,486,971 triangles before the stop. Treat this as a new in-room GS correctness blocker, not a recurrence of the door transition or an AOT gap. Focused Release translation, runtime, IOP, and device-thread suites pass after the complete callback chain. Next action: capture the exact triangle STQ/Q/edge-weight operands behind an opt-in external diagnostic, compare the required perspective interpolation behavior against GS specifications and the pinned PCSX2 oracle as behavioral evidence only, then implement and differentially test an independently derived wider exact accumulator. Do not weaken or suppress the fault without proof.
+
+Pre-edit in-room STQ plan: saved GS state identifies the faulting pending draw exactly as index `29429`, a normal textured Gouraud triangle. Its T operands span approximately `5.48e-10..0.00354`, Q remains `0.00902..0.00935`, and the checked result exceeds only the current 64-bit aligned-mantissa intermediate. The GS specification requires ordinary perspective `sum(w*T)/sum(w*Q)`; read-only PCSX2 inspection corroborates that this class is treated as ordinary perspective STQ interpolation, but no implementation or algorithm is copied. Add a renderer-private two-limb unsigned magnitude used only when the existing 64-bit weighted sum cannot represent an aligned term. Retain the current fast path, exact signs/scales and explicit faults; support exact right-shift-with-sticky before division and native/portable 128-by-64 division, with a bounded exact fallback when the denominator is also wide. Values outside 128 bits remain explicit. Add synthetic differential cases covering the observed exponent geometry, signs, cancellation, discarded-bit rounding, wide denominator, and retained overflow. Disproof is any mismatch against an independent big-integer oracle, changed old-case fault behavior outside the newly supported envelope, or failure to clear the exact replay. External preimages: `%TEMP%/hg-backups/door-stq-wide-20261006/`.
+
+Final STQ result: the existing signed-64 fast path is unchanged, while only unrepresentable aligned sums retry through the independently derived two-limb exact path. Native/portable 128-by-64 division, wide-denominator quotient search, signed cancellation, discarded-bit rounding and the retained beyond-128 fault have synthetic coverage. Release executable SHA-256 `0f3c3c1103a5092444d0684b1efe9d21b2336dcfe6937912f3d2c81970eb50bd` completed the exact 300,000,000-slice post-door replay with no fault: retained capture `640x448`, `34219` draws, `48036569` rasterized, `48002350` retired, `1830841` GPU sprites and `13825553` GPU triangles. External evidence is `%TEMP%/hg-door-postopen-stq-wide-final-20261006/`; game-derived packet/state data remains outside the repository. Focused runtime and translation suites pass, as do all `1159` GPU/CPU cases. `gif_tests` passes the new STQ cases and retains only the unchanged pre-existing overlap assertion (`overlap.host_vu_stalled && !overlap.pending.empty()`, now line 1339). This clears the later in-room renderer stop without weakening its explicit-fault envelope.
+
+Manual retest selected a different later state and stopped explicitly at missing EE target `0x001a5750`, RA `0x001a9fc0`; it was not a renderer freeze. External dump `%TEMP%/hg-door-manual-20261006-stq-final/` shows live object/member `0x017b1b80/0x017b1b90` and dynamic descriptor `0x017c1bdc = {0,-1,0x001a5750}`. The already-rooted caller `0x001a9fb8` reaches that descriptor through member helper `0x00100b40`. Original and captured body `[0x001a5750,0x001a5bb0)` are byte-identical (1,120 bytes, SHA-256 `ad3147717f9876c9a8b6fcd98163894876716ff69a3083ed0c217c7948312ff7`); own decoding proves return/delay at `0x001a5ba8/0x001a5bac` and the next prologue at `0x001a5bb0`. Only after that independent proof, the permitted shared non-rendering function list corroborated the same complete boundary (its analysis-only prefix was shorter). Plan: root only this dynamically observed target, regenerate AOT output, build the Release game plus focused runtime/translation regressions, and relaunch the same live route. A later explicit stop remains a new bounded checkpoint. Pre-edit copies: `%TEMP%/hg-backups/door-manual-1a5750-20261006/`.
+
+The `0x001a5750` build (`hg_game.exe` SHA-256 `c2ada554b7ad9d8ec9282de61d9f7aad84ff06806fc4bcb1fe3eb3c68ba67a44`, 155-input provenance) passed runtime and translation regressions. The profiled live retest captured 1,321 game-delivered controller transitions and cleared that target, then stopped at missing EE target `0x002ee120`, RA `0x0029ef5c`; external dump/log is `%TEMP%/hg-door-manual-1a5750-fixed-20261006/`. The process was identity-checked and closed.
+
+Requested batch pivot: fresh `major-scan` reports 377,555 EE words / 4,942 explicit boundaries and identifies `0x002ee120` inside installed-table candidate `0x004702d0`. Independent live/original evidence promotes this candidate beyond a scanner lead: captured object `0x00cba300` contains vptr `0x004702d0`; original caller `0x0029ef4c..0x0029ef58` dispatches slot `+0x0c`; original installer `0x00170da0..0x00170db0` stores that exact table; and original/live `[0x004702d0,0x00470390)` are byte-identical (192 bytes, SHA-256 `9235b26b7185d08e82be447666efa6ffa8811cb16ddb39b20cf70b60a4a24847`) with two trailing zero words after the last method slot. Of its 44 nonzero entries, 33 are already compiled and 11 are missing: `0x002ecfd0`, `0x002ed160`, `0x002ed190`, `0x002ed210`, `0x002ed220`, `0x002ed230`, `0x002ed240`, `0x002ed250`, `0x002edf80`, `0x002ee110`, and the observed `0x002ee120`. Own decoding verifies all eleven as original function entries/thunks; only afterward the permitted shared non-rendering list corroborated ten complete extents. Plan: root this whole independently bounded live-used method family in one batch, emit once, require every address to be reachable with no unresolved instruction inside its bounded body, run focused runtime/translation tests plus the Python analysis suite, then replay the captured route. Do not promote any other major-scan candidate without equivalent table extent/installation/live-use proof. Pre-edit copies: `%TEMP%/hg-backups/major-table-4702d0-20261006/`.
+
+Batch result: emission adds 917 reachable original words in one shard. All eleven entries are reachable; ten bodies contain no analysis boundary, while `0x002ed190` has one ordinary virtual call at `0x002ed1a4` through receiver slot `+0x2c`, whose concrete live-table target `0x002ed160` is included in the same batch. The post-change major scan reports all 44 nonzero `0x004702d0` table entries compiled. All 133 Python analysis tests and native runtime/translation regressions pass. Build provenance SHA-256 is `080e1e45dabc708a4ae686767febef85678aaa125340927359eb5db8331922f4` before the replay-cap-only follow-up rebuild.
+
+HG-DIAG-006 replay-cap follow-up plan: the retained live log contains 1,321 strictly ordered game-delivered pad transitions, exceeding the original 1,024-event startup cap solely because exact analog-stick changes were preserved. Raise only the diagnostic vector admission cap to 2,048, retain all parsing/order/conflict rules and default-off behavior, rebuild, and replay the external route without host input through a budget beyond its `352191488` final observed event. No production guest behavior changes. Pre-edit copies: `%TEMP%/hg-backups/input-replay-2048-20261006/`.
+
+The cap-only parser accepts a synthetic 1,321-event file and rejects 2,049 events; native runtime/translation regressions still pass. External exact route `%TEMP%/hg-door-manual-1a5750-fixed-20261006/route-input-events.txt` contains all 1,321 observed transitions, strictly increasing from slice `301446144` through `352191488`, SHA-256 `05fed5c7b107ccf7c0ccc15036d0b683ece766cdf7abcf945e816adcaf1514e4`. Release executable SHA-256 is `a4e279cfc9373a9906a518685235176956e092497ff731fd464f6750ef1d9076` with 155-input provenance.
+
+Unattended 360M replay `%TEMP%/hg-major-table-4702d0-replay-20261006/` applied the exact route, cleared observed target `0x002ee120` and progressed to a different missing target `0x002af0a0`, RA `0x001ffe80`. Retained GS totals match the live fault prefix exactly (`62275` draws, `23992874` rasterized, `23930599` retired), confirming route reproduction. The process was identity-checked and closed after the dump.
+
+Second batch plan: the new target belongs to the already-live door object `0x017f3594`, whose captured vptr is `0x0046e2c0`; the earlier door work compiled ten of its methods individually. Original installer `0x0020a7d8..0x0020a7e4` stores exactly `0x0046e2c0`. Original/live table `[0x0046e2c0,0x0046e300)` is byte-identical (64 bytes, SHA-256 `c8b22949619a4eaafa652d9946993eba183c0247970f6a9f7aab4919531e8e79`) and ends where the next distinct table begins. The major scan identifies four remaining methods: destructor `0x002aefc0`, getter `0x002af090`, observed indexed getter `0x002af0a0`, and bounded member-thunk `0x002af0c0`. Own decoding establishes their complete returns/tail transfer and next prologues; the shared non-rendering list is only later corroboration for the first three. Root all four together, emit and require complete reachable bodies, rerun the major scan/tests, then replay the same external route. Pre-edit copies: `%TEMP%/hg-backups/major-table-46e2c0-20261006/`.
+
+Second batch result: emission adds 960 reachable original words and the major scan reports all sixteen nonzero `0x0046e2c0` slots compiled. All 133 Python analysis tests and native runtime/translation regressions pass. Release executable SHA-256 is `25a6352615ba66bc7fbfc2da33f340635a0d83eb1453661be62007c30e0ba9b2`. Unattended replay `%TEMP%/hg-major-table-46e2c0-replay-20261006/` clears `0x002af0a0`, advances retained GS work to `21726` draws / `24017842` rasterized / `23996116` retired, and stops at a different missing target `0x002ba9f0`, RA `0x0011fb04`; the process was identity-checked and closed.
+
+Third batch plan: caller `0x0011fafc` reaches the generic member helper with live object `0x018ed4c0`, whose captured vptr is `0x0046eae0`; selected slot `+0x10` is exactly the observed `0x002ba9f0`. Original installer `0x00176c60..0x00176c6c` constructs and stores `0x0046eae0`. Original/live `[0x0046eae0,0x0046eb10)` are byte-identical (48 bytes, SHA-256 `2b970497daacab2fe71ed69a470d826eb251d65ab50c397636054d323bbbd94e`) and contain two null header words, eight method pointers, then two zero words before the distinct table at `0x0046eb10`. Three methods are already compiled; the five missing entries are `0x002ba670`, `0x002ba6e0`, `0x002ba730`, `0x002ba980`, and `0x002ba9f0`. Own decoding establishes complete bodies ending respectively at `0x002ba6d4`, `0x002ba724`, `0x002ba974`, `0x002ba9ec`, and `0x002bab50`; the permitted shared non-rendering list only corroborates the last boundary. Root the five-method family together, emit and audit every bounded body, rerun the major scan plus Python/native regressions, then replay the same immutable external route. Pre-edit copies: `%TEMP%/hg-backups/major-table-46eae0-20261006/`.
+
+Third batch result: emission reaches 379,847 original words / 4,956 explicit boundaries and the major scan reports all eight nonzero `0x0046eae0` table slots compiled. The three smaller bodies have no unresolved analysis edge. The two larger bodies contain only ordinary virtual calls; captured receivers resolve them to already-compiled `0x001bb780`, `0x001bbc20`, `0x001f44a0`, `0x002265d0`, `0x00226620`, `0x00226640`, `0x002266d0`, and `0x002b6e50`. All 133 Python tests and native runtime/translation regressions pass. Release executable SHA-256 is `870fdbe69e3972f453549ff990861bec78897803db0fdb3f98f5f54ec4c683b3`. Unattended replay `%TEMP%/hg-major-table-46eae0-replay-20261006/` clears `0x002ba9f0`, advances retained GS work to `46694` draws / `24042810` rasterized / `23996116` retired, and stops at local label `0x00200004`, RA `0x00203f28`.
+
+Fourth batch plan: the new stop is not an independent function. Direct caller `0x00203f20` enters already-rooted method `0x001ffe00`, whose original code at `0x001fff90..0x001fffb4` bounds an unsigned selector below 13 and indexes initialized table `[0x00456980,0x004569b4)`. Original/live table bytes are identical (52 bytes, SHA-256 `37a20a86cff4e8964a5e0fd061644a0f944ec1ec890c807583dde594f4db6eab`); its thirteen executable labels are `0x001fffbc`, `0x001fffdc`, `0x00200004`, `0x00200044`, `0x00200064`, `0x002000c8`, `0x0020010c`, `0x00200148`, `0x002001ec`, `0x00200234`, `0x00200274`, `0x00200318`, and `0x002002b4`, all local to the same bounded body and followed by zero table words. Add the complete independently decoded switch, emit/audit all thirteen cases and downstream live targets, rerun the analysis/native gates, then replay the immutable route again. Pre-edit copies: `%TEMP%/hg-backups/major-switch-456980-20261006/`.
+
+Fourth batch result: emission reaches 380,233 original words / 4,978 explicit boundaries; all thirteen switch labels are compiled and no unresolved group remains at dispatch site `0x001fffb4`. The remaining edges inside the cases are ordinary checked virtual/member calls, not suppressed fallbacks. All 133 Python tests and native runtime/translation regressions pass. Release executable SHA-256 is `4e4f10a60e633f5454f3636dd19265241653e2def795504375658dafac804e4e`. Unattended replay `%TEMP%/hg-major-switch-456980-replay-20261006/` clears `0x00200004`, advances retained GS work to `25218` draws / `24217586` rasterized / `24192368` retired, and then stops at `0x002cb9a0`, RA `0x0020005c`.
+
+Next member plan: switch case `0x00200044` calls compiled vtable method `0x002cbfe0` on captured object `0x017f3d28`; that original thunk tail-transfers through member helper `0x00100b40` using object descriptor `+0x2a0`. Live descriptor `0x017f3fc8` is exactly `{0,-1,0x002cb9a0}` and is byte-identical to initialized original record `0x00412900` (12 bytes, SHA-256 `0a1e837849cb4b6ff2ca3b0c08879a46c8e853d5b89fc3192b5626664e402ad6`). Original/live function `[0x002cb9a0,0x002cbbdc)` is byte-identical (572 bytes, SHA-256 `6592b1bf135cbd1d7fbafd3960c2f134deb2726112dca6de2cc480676abf67b9`) with return/delay `0x002cbbd4/0x002cbbd8` and the next prologue at `0x002cbbe0`. The shared non-rendering list is consulted only after independent proof and corroborates the exact end while its analysis prefix is truncated. Root this one observed member; adjacent static descriptors are not promoted without live-use evidence. Emit/audit its complete body, run the same gates, then resume the immutable replay. Pre-edit copies: `%TEMP%/hg-backups/major-member-2cb9a0-20261006/`.
+
+Member result: emission reaches 380,376 original words / 4,982 explicit boundaries. The only four analysis edges in `0x002cb9a0` are normal virtual calls; captured receivers resolve them to already-compiled `0x0016bbd0` and `0x002cc830`. All 133 Python tests and native runtime/translation regressions pass. Release executable SHA-256 is `681438514d11da094e365a6ae4bcb320827452bd1057558d873e47528fbc09f1`. Unattended replay `%TEMP%/hg-major-member-2cb9a0-replay-20261006/` clears `0x002cb9a0`, advances retained GS work to `50186` draws / `24242554` rasterized / `24192368` retired, and stops at `0x002cb6c0`, RA `0x0020005c`.
+
+State-family batch plan: the captured object descriptor at `0x017f3fc8` changed exactly from original record `0x00412900 = {0,-1,0x002cb9a0}` to original record `0x00412920 = {0,-1,0x002cb6c0}`. Own decoding proves this is an ordered member-state chain: `0x002cb9a0` copies record `0x00412920`; `0x002cb6c0` copies `0x00412930 -> 0x002cb500`; `0x002cb500` copies `0x00412940 -> 0x002cafb0`; and the intervening record `0x00412910` supplies bounded reset member `0x002cbfd0`. Original/live complete bodies are byte-identical: `[0x002cafb0,0x002cb4fc)` 1,356 bytes SHA-256 `4a919a6fe5ec60a1af563e09af49cc317c459bafda18291a9c75da55a856ae17`; `[0x002cb500,0x002cb6bc)` 444 bytes `3bb869f07a19cfa06a073f34e18b8ee5c1c5c4e19eb55c8d7252aa943c758246`; `[0x002cb6c0,0x002cb994)` 724 bytes `9a44f801e62925a8b0e2becd19a92082f73c838746fcd7f00cf9de549530399f`; and `[0x002cbfd0,0x002cbfd8)` 8 bytes `cec0194ac25eae0e3bed8ac100b1ff4b3c86f5226cf38ff21e9690198ace9c94`. The shared non-rendering list only later corroborates these exact ends. Root all four linked members together, audit their internal edges, run the full analysis/native gates, then replay once rather than waiting for three more manual freezes. Pre-edit copies: `%TEMP%/hg-backups/major-member-state-chain-20261006/`.
+
+State-family batch result: emission reaches 381,513 original words / 5,015 explicit boundaries. The four complete member bodies are reachable; `0x002cbfd0` is statically closed and the other three retain only ordinary checked virtual calls. All 133 Python tests and native runtime/translation regressions pass. Release executable SHA-256 is `b55083723af827616cb9fe8f04a9326dfd1df362c01976dc53fa4a596c10aa66`. One unattended replay `%TEMP%/hg-major-member-state-chain-replay-20261006/` clears the observed `0x002cb6c0` and traverses the linked state family far enough to advance retained GS work to `59574` draws / `24317458` rasterized / `24257884` retired. It next stops at local label `0x002cc5c8`, RA `0x002cb84c`.
+
+Fifth batch plan: the stop comes from already-compiled direct helper `0x002cc5a0`, called at `0x002cb844`. Original `0x002cc5a0..0x002cc5c0` bounds unsigned selector `a1` below 26, indexes initialized table `[0x0045d3d0,0x0045d438)`, and jumps through the selected entry; the replay selected entry one. Original/live table bytes are identical (104 bytes, SHA-256 `8d951b18e3ce39fb20d1b38266b06adbae21145e92b9ecb31207fdb0e95297d0`) and contain 26 executable labels local to the same bounded body, spanning `0x002cc5c8..0x002cc690`, followed by two zero words. Add the complete switch table, audit all case labels, run the same analysis/native gates, and replay once. Pre-edit copies: `%TEMP%/hg-backups/major-switch-45d3d0-20261006/`.
+
+Fifth batch build result: emission reaches 381,563 original words / 5,014 explicit boundaries. All 26 unique case labels are compiled and dispatch site `0x002cc5c0` no longer appears as an unresolved edge. All 133 Python analysis tests and native runtime/translation regressions pass. Release executable SHA-256 is `21f5590aeac2b149dc4b19c0f29eed50b6cc1fcfa0822f6747c06fc445b9803e`. Exact next action is one unattended 360M replay with the immutable 1,321-event route, then promote only the next independently proven table/member family if an explicit boundary remains; do not return to manual per-freeze input collection.
+
+Fifth batch replay result: `%TEMP%/hg-major-switch-45d3d0-replay-20261006/` clears selected case `0x002cc5c8` and advances substantially beyond the prior state-family stop. Cumulative GPU totals reach 1,782,129 sprite draws and 6,639,584 triangle draws; the retained boundary has 1,233 pending draws / 24,716,946 rasterized / 24,715,713 retired, consistent with a later scene/state publication rather than the former prefix. The next explicit AOT stop is `0x002af1d0`, RA `0x002032c4`, reached through the already-rooted indexed member thunk. Own decoding shows a bounded ordinary function beginning at `0x002af1d0` with return/delay `0x002af248/0x002af24c` and the next prologue at `0x002af250`; the permitted shared list corroborates `[0x002af1d0,0x002af250)`. Next continuation should first recover the exact live descriptor index/record and scan its sibling member family before deciding a batch, rather than root this one function reflexively.
+
+Sixth batch plan: original thunk `0x002af1a0` masks its index to eight bits, computes `index * 12`, and selects the packed live descriptor array at `0x01990a70`. The captured array has seven `{0,-1,target}` records followed by a terminator and is an exact per-record copy of initialized original records `[0x00400b80,0x00400bf0)`; targets are `0x002af730`, `0x002af680`, `0x002af4e0`, `0x002af4a0`, `0x002af300`, `0x002af250`, and observed index-six target `0x002af1d0`. Four were already compiled from earlier dynamic indices. Independently bounded original/live bodies for the three remaining siblings are byte-identical: `[0x002af1d0,0x002af250)` 128 bytes SHA-256 `0211385a89d3e0147033cb836dfbc4925342ebb0a900d6ac08029bb71c0eb372`; `[0x002af250,0x002af2f4)` 164 bytes `e8fa5fcb98623611d5a385f9936125846ae75cbe2942160850e187b29390df97`; `[0x002af4a0,0x002af4e0)` 64 bytes `045cbfd1280562a698db8cd12a6b65419b644f52d8a4b415c39a6fb5a6e9b168`. Shared non-rendering boundaries corroborate `0x002af1d0` and `0x002af4a0` only after own decoding; `0x002af250` is independently bounded by return/delay `0x002af2ec/0x002af2f0`, padding, and next prologue `0x002af300`. Root all three remaining family members, audit their internal calls, run the analysis/native gates, then replay once. Pre-edit copies: `%TEMP%/hg-backups/major-member-400b80-20261006/`.
+
+Sixth batch result: emission reaches 381,652 original words / 5,015 explicit boundaries. `0x002af1d0` and `0x002af4a0` are statically closed; `0x002af250` retains one ordinary checked virtual call at `0x002af2b8`. All 133 Python tests and native runtime/translation regressions pass. Release executable SHA-256 is `8b4b8dd690323c4efa8ff05376f84ed4bc78dcaec7dc1787181fe7f2d0eb48ce`. Replay `%TEMP%/hg-major-member-400b80-replay-20261006/` clears `0x002af1d0` and next stops at `0x00224740`, RA `0x00224c30`, with the same later-scene GS boundary (`1233` draws / `24716946` rasterized / `24715713` retired).
+
+Seventh member plan: original wrapper `0x00224c20` invokes member helper `0x00100b40` with captured object `0x017f4ff0` and descriptor at object `+0xe8 = 0x017f50d8`. The live descriptor is exactly `{0,-1,0x00224740}`, byte-identical to initialized original record `0x003e5250` (12 bytes, SHA-256 `7e4775878cf04468465fd46bc0a60c3c0f5d09bf3fa3cf2cfc78765f0b28d3fd`); neighboring record `0x003e5240` selects the already-compiled sibling `0x00224770`. Original/live `[0x00224740,0x00224768)` are identical (40 bytes, SHA-256 `93b4c24df7e64f6d1a88f2dd3dccc92e6590e77be75f8058d5dbdfac5221c1fc`) and end at the tail `jr t9` plus delay before padding and the `0x00224770` prologue. Root the only missing member in this two-record family, retain its downstream virtual dispatch, run the same gates, and replay once. Pre-edit copies: `%TEMP%/hg-backups/major-member-3e5240-20261006/`.
+
+Seventh member result: emission reaches 381,662 original words / 5,016 explicit boundaries. The tail dispatch resolves through captured global `0x0044fe10`, object `0x017f3d28`, vtable `0x0046ed30`, slot `+0x64` to already-compiled `0x002c9ea0`. All 133 Python tests and native runtime/translation regressions pass. Release executable SHA-256 is `602346fea88b10ffbb9aad154458b28d4351b44a8f1be1af3bc648e8f346833b`. Replay `%TEMP%/hg-major-member-3e5240-replay-20261006/` clears `0x00224740`, reaches 1,782,567 GPU sprites / 6,644,981 GPU triangles and retained boundary 20,991 draws / 24,736,704 rasterized / 24,715,713 retired, then stops at original PC `0x00227e90`, RA `0x0022a6b0`, on unsupported word `0xcf000000`.
+
+Instruction-family plan: `0xcf000000`, `0xcf000100`, and `0xcf000140` at `0x00227e90..0x00227e98` are opcode `0x33`, EE `PREF hint,offset(base)`, not a missing function. Sony's EE Core Instruction Set Manual version 6.0 specifies the exact encoding, says hints 1..31 are reserved with the same behavior as hint zero, and specifies no addressing exceptions; the cache prefetch is advisory and may be omitted. Implement the exact primary opcode in the offline decoder and emit a cache-neutral AOT instruction with no address translation or guest-state effect. Treat it as a known straight-line instruction in constant propagation. Add exhaustive decoder/emitter coverage across all 32 base registers, 32 hints and representative signed offsets, plus native synthetic execution using invalid/unmapped bases to prove there is no memory access or fault and no register/cache/memory mutation. Regenerate and rescan so any newly reachable PREF sites clear in one batch, run Python plus native runtime/translation gates, then replay the immutable route. Do not generalize any other unsupported opcode into a no-op. Pre-edit copies: `%TEMP%/hg-backups/ee-pref-20261006/`.
+
+PREF result: the exact opcode now decodes only as `pref`; the AOT emitter records an architecturally defined cache-neutral hint and performs no address calculation or memory operation. Exhaustive Python coverage checks 5,120 field combinations (32 bases, 32 hints, five signed offsets), exact emitted text and preservation of constant-propagation state. Native synthetic execution runs four hint/offset cases from unmapped base `0xffffffffffffffff` and proves no fault, GPR/HI/LO mutation, cache-epoch change or memory mutation. Regeneration finds 24 reachable PREF sites, clears all PREF issues, and expands the connected original body by 2,498 words to 384,160 reachable words / 5,015 boundaries. All 134 Python tests and native runtime/translation suites pass. Release executable SHA-256 is `162344f109fd862f86e003753530d0214444297b21cbf975442260b850664a59`. Exact next action is the immutable 360M replay; any later explicit stop is a new boundary, not a PREF workaround failure.
+
+DXIN continuation (2026-10-07): Project Link's exposed 360M `gameplay33m` replay task failed before guest execution because its externally pinned legacy `synthetic-index-pattern.bin` fixture is absent from the bounded artifact root. The archived project record says those creation bytes were not retained, so no replacement was invented. Fresh static analysis instead found the only two reachable raw unsupported EE words at `0x0026cb74` and `0x0026cbb0` (`0xbcd60000` / `0xbcd60001`). Sony's EE Core Instruction Set Manual v6.0 page 301 identifies operation field `0x16` as `CACHE DXIN`. The decoder, emitter and runtime now model that exact indexed invalidation explicitly; because the native coherent-cache abstraction already represents every data-cache line as invalid, clean and unlocked, DXIN performs no guest RAM transfer and does not mutate TagLo, registers or the cache epoch. Python coverage adds 160 base/offset decode/emission/constant-state cases, and translated synthetic execution runs `SYNC` plus DXIN from base `0xffffffffffffffff` with unchanged RAM, TagLo, GPR/HI/LO and cache epoch. `build_tests`, all 135 Python tests, runtime tests, translation tests and VU-readiness tests pass. Fresh analysis reports exactly two `cache_dxin` sites, zero raw unsupported EE words, 384,162 reachable words / 5,013 unresolved boundaries. Production regeneration changes only `out/translated-shard-0013.cpp` besides analysis/listing metadata, and that shard contains the helper only at the two real sites. Release `hg_game.exe` builds successfully with 155 provenance inputs, SHA-256 `24c126369e69d4da8f18c291069faf8092d9aeec0ee6a2c0e22d154934e806c2`. Follow-up fixed-point audit confirms the DXIN loop closes through its normal `jr ra`; `static_indirect_evidence` is empty, and remaining installed-table/direct-member candidates are diagnostic-only initialized-data evidence whose targets are not proven runtime transfers. They must not be swept into the CFG without live use or stronger immutable control-flow proof. The next route replay remains contingent on restoring the exact pinned runner fixture; do not fabricate or substitute a TOC input. Until then, continue only from independently proven static or newly captured dynamic evidence.
+
+## ACTIVE PROTOTYPE (2026-10-06): remove the second per-activation VU1 memory copy
+
+Observed cost: the qualified Linux speculative path copied each 17 KiB VU1 data/definedness snapshot twice per activation (stage-B dispatch into `VuJob::start_*`, then the worker into `VuJob::work`), approximately 730 MB/s at the measured gameplay activation rate. Hypothesis: snapshot live memory directly into the persistent job work buffer and retain only first-write undo values; this removes one full copy while preserving the exact dispatch image needed by rare validation failures. Proposed files: `runtime/include/hg/vif.hpp` (let the existing host-only first-write tracker attach to a speculative access log), `runtime/device_thread.cpp` (one snapshot, per-job undo, restore touched words/defined vectors before exact re-execution), `tests/device_thread_tests.cpp` (force stale-prediction re-execution where the speculative run writes a lane that the exact run does not), and this progress record. No guest clocks, packet ordering, renderer state, VU arithmetic, faults, or public interface change. Disproof: any differential state/fault/order mismatch, a test that cannot prove old-only speculative writes are restored, or no repeatable gain after the exact fixed replay becomes available. Validation before retention: MSVC device/runtime/translation/VU readiness/GPU suites, source mutation test of the undo path, then the original fixed replay once its externally pinned 2,064-byte input is recovered by exact SHA-256. Until that replay exists this remains opt-in through existing `HG_VU_WORKERS` and carries no production performance claim. Pre-edit dirty-state backup and hash manifest: `C:\Users\johnn\AppData\Local\Temp\hg-backups\vu-undo-copy-20261006\`.
+
+Prototype result: `VuJob::start_mem/start_defined` are removed. Dispatch now copies live VU data/definedness once directly into the persistent worker buffer. The speculative access log attaches the existing fixed-capacity `Vu1MemoryWriteTracker`; SQ/ISW capture each word and vector-defined mask only on its first write. A validation failure restores those touched locations to the dispatch image, applies ordered predecessor writes and later-UNPACK exclusions exactly as before, then performs the original sequential re-execution. The synchronous path retains a null access log and pays no new store work. Mutation check: temporarily disabling both restore loops made `device_thread_tests` fail nine VU memory/register/GS output comparisons; restoration returns the suite to passing, proving the existing memory-chain/partial-lane cases exercise the undo dependency. MSVC Release candidate executable SHA256 `5ce00e5ad5b79d6a8e6c005e4744661f74d36c83e1ed69d753deefc31ed068a2`, post-link provenance inputs=155. Passing: device-thread differential, runtime, translation, 262144 fused-transform + 81920 VU-readiness comparisons, NVIDIA RTX 5070 1159 GPU/CPU cases, and 133 Python tests. CTest remains 28/29 with only the unchanged pre-existing `gif` line-1276 overlap assertion. The exact TOC fixture is absent locally; archived history proves it was the quarantined synthetic HG-DIAG-007 input but does not retain its creation bytes. No replacement was invented, so original-replay correctness and speed remain unclaimed and the prototype stays behind `HG_VU_WORKERS`.
+
+## CONTINUATION (2026-10-06): Windows validation of pulled device/VU pipeline update
+
+Fast-forwarded `codex/console-speed-checks` from `ac894af` to `e42f415` (`Merge pull request #1 from superboo07/a-bunch-of-stuff`) with no local changes overwritten. Immediate gate before further optimization: build the new persistent device-thread/speculative-VU path with MSVC, run its differential tests and the existing runtime/translation/VU/GS suites, then qualify synchronous and `HG_VU_WORKERS=3` Windows replays if the fixed runner is available. The first MSVC build exposed POSIX-only `setenv`/`unsetenv` calls in `tests/device_thread_tests.cpp`; fix only the test environment shim, then resume the gate. External byte-for-byte backup: `C:\Users\johnn\AppData\Local\Temp\hg-backups\windows-portability-20261006\`.
+
+MSVC Release now builds the new targets and game. After removing HG-DIAG-093, `hg_game.exe` SHA256 is `21f1e03c1b6e23acbdc795f03b89a05e57ca46c8e8f32186affc5d574f785b09` with 155-input post-link provenance; the rebuilt `device_thread_tests` still passes and emits only the three expected synthetic fault summaries. `runtime_tests`, `translation_tests`, `vu_readiness_tests` (262144/81920), NVIDIA `gs_gpu_tests` (1159 cases), and all 133 Python tests pass. CTest is 28/29; only the documented pre-existing `gif` line-1276 overlap assertion fails. Project Link remains disconnected (tunnel-client absent), and the exact pinned TOC input is no longer present in its bounded evidence root, so no Windows 33M correctness/FPS claim is made. HG-DIAG-093's temporary scheduler ring was removed after this differential gate; byte backup: `C:\Users\johnn\AppData\Local\Temp\hg-backups\diag093-removal-20261006\`.
+
 ## ACTIVE MILESTONE (2026-10-05): speculative parallel VU1 activations (HG_VU_WORKERS) - exact, +32% gameplay FPS with HG_VU_WORKERS=3
 
 Stage B (VIF1+VU1 device thread) can now run VU1 batch activations on worker threads (`runtime/device_thread.cpp`, `VuJob`, `DeviceThread::dispatch/commit_oldest/validate/merge`). Enable with env `HG_VU_WORKERS=N` (default 0 = off, old behaviour); `HG_VU_INFLIGHT` overrides max in flight (default 2N+1). Each job runs the real AOT executor on a private snapshot (VU memory, predicted registers `view`, TOP, MicroMem by generation) with a recording GifPath; stage B commits in original order, validating: memory reads vs uncommitted predecessors' lane writes not replaced by later UNPACK; static live-in VF lanes/VI/ACC/I (emitted `vu1_aot_spec_info`); clip bits actually consumed by FCAND (`spec_clip_old_read`); Q/P only if an old value was read (`spec_q_fresh`); pending Q/P and live-lane relative readiness; MSCNT entry vs committed TPC. Mismatch or fault => exact sequential re-execution from reconstructed memory. Merge uses emitter per-block written masks (`spec_written_vf/misc`), MAC sentinel, status sticky merge (spec starts status=0), clip-history shift merge, clock rebase. Init entries (0) run inline on B when jobs are in flight (their result becomes `view`); MSCNT entry predicted from `view.tpc` (barrier hook `vif1_mscnt_barrier`; committed TPC restored at dispatch start). C-bound output waits in an ordered `out_queue` behind uncommitted jobs. Calls/transport reads/VIF register/GIF control writes drain all jobs first.
@@ -329,7 +2486,7 @@ Verifier job `e3bca4ed1fc44925a1a7a45100cf82eb` on current clean executable `5c7
 
 Original unpaced replay `30d4578a72774582b965f0d42f429f5f` reached33M,864 original display-writer events, no fault. Complete host-only phase scopes in heavy31M..33M measured wall **4.4590229s**, EE run/observation **0.4942611s**, IOP run/I-O **0.1860953s**, SIF **0.0537283s**. These scopes are disjoint from each other, but were not run simultaneously with HG-DIAG-049's exclusive VU/GIF/raster scopes, so their cross-run sums are approximate under drift and active timestamp overhead. Against HG-DIAG-049's ~1.310s complement they account for~0.734s, leaving roughly~0.576s other/overhead. Instrumented13.5333 interval rate is not qualified FPS. The measured CPU-side graphics work plus residual alone cannot bridge the >2s/60-frame gap to30FPS; VU and graphics preparation both require structural gains.
 
-HG-DIAG-076 header source was restored byte-exact to4efc1994 from archive4ad0e393683240ee8d04fa9fdfd2c436. Clean build5590280f succeeded, current game executable5c7d7f2081ec9eb51b3ab74e9fffb8d0c48d0ccb80a7853fb7b6f3faf56bc237 with post-link provenance. No076 probe remains and no active job. Next milestone: identify a structural overlap or removed-work route covering VU plus ordered GIF/GS packet service, with explicit original event/readback/fault boundaries. HG-DIAG-065's 56,877 joins made its coarse worker slower; do not repeat unchanged. Plan must prove fewer joins or substantially less copied work before implementation. Clean qualified baseline remains~12.6�13.7FPS depending host drift;30FPS unmet.
+HG-DIAG-076 header source was restored byte-exact to4efc1994 from archive4ad0e393683240ee8d04fa9fdfd2c436. Clean build5590280f succeeded, current game executable5c7d7f2081ec9eb51b3ab74e9fffb8d0c48d0ccb80a7853fb7b6f3faf56bc237 with post-link provenance. No076 probe remains and no active job. Next milestone: identify a structural overlap or removed-work route covering VU plus ordered GIF/GS packet service, with explicit original event/readback/fault boundaries. HG-DIAG-065's 56,877 joins made its coarse worker slower; do not repeat unchanged. Plan must prove fewer joins or substantially less copied work before implementation. Clean qualified baseline remains~12.6–13.7FPS depending host drift;30FPS unmet.
 
 ## HG-DIAG-076 plan before edit - 2026-09-27
 
@@ -339,7 +2496,7 @@ HG-DIAG-075's sparse slices missed bursty work. Measure complete31M..33M elapsed
 
 One original33M unpaced replay `5606cb4fd8f7422eb13429afe03ae645` reached budget with864 original writers and no fault. The existing1/256 slice sampler collected7,825 samples in31M..33M; scaled phase sum was only1.3766912s while measured heavy wall was4.3229158s. It missed ~2.946s of bursty work, so its per-phase proportions cannot divide the earlier1.31s exclusive-profile complement reliably. Do not use its apparent `ee_run` ~0.497s, IOP ~0.207s or graphics phase values as complete host attribution. Probe source runtime/include/hg/diagnostic_profile.hpp was restored byte-exact to4efc1994; clean build8f477dd0 succeeded, current executable9d108f69ac8e772d0d4b21770e59893df29010c380b48ba822aae38ac5bc688b with provenance. Instrumented13.8483 interval rate is not qualified FPS. Archivebbac1289ca114054a8b1ebab4d5b3392; no075 code remains.
 
-Current obstacle:30FPS needs a large reduction from ~4.3�4.7s/60 original heavy-window frames to~2s. Reliable exclusive categories remain VU~1.91s, complete GIF~0.74s, whole raster~0.51s, other~1.31s, with probe overhead/host drift. HG-DIAG-073/074 establish VU1 hot loop~0.67s and distributed other programs~1.16s. Next action should use complete scoped timing of one plausible shared CPU preparation operation, or a structural design that demonstrably eliminates/overlaps hundreds of ms without ~56,877 synchronous packet joins seen in065. No active job; no diagnostic source remains; user-visible30FPS is unmet.
+Current obstacle:30FPS needs a large reduction from ~4.3–4.7s/60 original heavy-window frames to~2s. Reliable exclusive categories remain VU~1.91s, complete GIF~0.74s, whole raster~0.51s, other~1.31s, with probe overhead/host drift. HG-DIAG-073/074 establish VU1 hot loop~0.67s and distributed other programs~1.16s. Next action should use complete scoped timing of one plausible shared CPU preparation operation, or a structural design that demonstrably eliminates/overlaps hundreds of ms without ~56,877 synchronous packet joins seen in065. No active job; no diagnostic source remains; user-visible30FPS is unmet.
 
 ## HG-DIAG-075 plan before edit - 2026-09-27
 
@@ -349,7 +2506,7 @@ Reuse the existing1/256 host `DiagnosticProfile` sampler for a bounded31M..33M p
 
 One unpaced original33M replay `cbaf2baee4534b08afdec5e0e71c2684` sampled1/16 completed AOT VU1 activations by verified static program identity during31M..33M. It reached budget/no fault with864 original display-writer events. The13 programs' sampled time totals116,284,000ns, fixed16x ~**1.860544s**, close to independent HG-DIAG-049 exclusive VU1.907775s. Program1 contributed43,948,300ns sampled/~0.703173s and111,840 activations, consistent with HG-DIAG-073 hot-loop ~0.667296s. Other programs together ~1.157371s: program3 ~0.238402s, program8 ~0.229874s, program9 ~0.194954s, program5 ~0.161112s; each remaining program <0.1s. These estimates include nested XGKICK VU body service and sample/clock bias; instrumented interval14.0165Hz is not qualified FPS. No single overlooked program can close the30FPS gap. Need a shared-cost structural improvement or concurrency that preserves all ordering/readback/faults; avoid another isolated VU operation from count alone.
 
-The four HG-DIAG-074 files were restored byte-exact (runner12d9ef7c, emitter2759ccd9, vu_matrix.cpp910f850d, header9f57f985), `hg_emit` job95cf88d0 regenerated clean `out/translated.cpp`2f8f8ff3, and clean build3760695c produced executable eff6806b2dc484fa4a3785652723608ccf6a5a676b825b08679941aab456ddc9 with post-link provenance. No074 probe remains. Archives: runnercbc483977b354e77ae1e6badea055f9f, emitter8da0311185f54314b0247d039595c375, vu_matrix.cppb5fd38615ed642829708d33c739b5402, headerc581b5ca986b4c23b14cd5c0e169f5a0. Python tests and build passed; no new qualified clean FPS measurement, existing exact-source qualified range12.59�13.72FPS remains. Next measurable milestone: isolate CPU-side GIF/GS preparation and the ~1.31s non-VU/non-GIF/non-raster complement within the same heavy window; select a change capable of saving at least several hundred ms before coding. No active job.
+The four HG-DIAG-074 files were restored byte-exact (runner12d9ef7c, emitter2759ccd9, vu_matrix.cpp910f850d, header9f57f985), `hg_emit` job95cf88d0 regenerated clean `out/translated.cpp`2f8f8ff3, and clean build3760695c produced executable eff6806b2dc484fa4a3785652723608ccf6a5a676b825b08679941aab456ddc9 with post-link provenance. No074 probe remains. Archives: runnercbc483977b354e77ae1e6badea055f9f, emitter8da0311185f54314b0247d039595c375, vu_matrix.cppb5fd38615ed642829708d33c739b5402, headerc581b5ca986b4c23b14cd5c0e169f5a0. Python tests and build passed; no new qualified clean FPS measurement, existing exact-source qualified range12.59–13.72FPS remains. Next measurable milestone: isolate CPU-side GIF/GS preparation and the ~1.31s non-VU/non-GIF/non-raster complement within the same heavy window; select a change capable of saving at least several hundred ms before coding. No active job.
 
 ## HG-DIAG-074 plan before edit - 2026-09-26
 
@@ -359,7 +2516,7 @@ Sample 1/16 complete AOT VU1 activations in31M..33M by original verified static 
 
 One unpaced `gameplay33m --profile` replay `7ce957bf0f4a44c0b5efc30d488e6132` sampled 1/64 original program1 fast-loop attempts in31M..33M. It reached the33M budget,864 original display-writer events and no fault. Of2,798,220 loop attempts,43,722 completed samples accumulated10,426,500ns whole-loop and4,380,700ns nested fused-transform time. Fixed64x estimates are **0.667296s** loop and **0.280365s** transform, leaving ~0.386931s other loop work; timer overhead and sampling bias make these approximate, and the instrumented13.083 host interval rate is not qualified FPS. The loop is ~35% of the earlier ~1.908s heavy exclusive VU bucket and ~15% of the adjacent ~4.49s heavy host interval. Optimizing its arithmetic alone cannot deliver30FPS; remaining VU work, GIF/front-end and pending raster also matter.
 
-HG-DIAG-073 sources were restored byte-exact: runner12d9ef7c, emitter2759ccd9, vu_matrix.cpp910f850d, vu_matrix.hpp9f57f985. Clean `hg_emit` joba1d8fb99 and build8d9b507c succeeded; current game executable SHA7576d75f710ae9223bd677dee8c01a885ffe679e50cc35c4dd917e1d51ee45e3 with post-link provenance. No073 probe or guest effect remains. Probe archives: runner2f9db7577e9946f6b6866654a2a4900c, emitter463c98417b0243ba924b4806777446c8, vu_matrix.cpp3528e01552884f6a9a0a068f13aa5540, headerca71fea4681f4f3b88fc3d103619c8cc. Next measurable milestone: attribute the remaining ~1.24s exclusive VU work by static program entry or host phase, then choose an operation that removes a large measured cost while preserving exact guest state; revisit renderer CPU-side service only with a measured eliminable bucket. Qualified clean baseline remains12.58608�13.72106FPS under host drift;30FPS unmet. No active job.
+HG-DIAG-073 sources were restored byte-exact: runner12d9ef7c, emitter2759ccd9, vu_matrix.cpp910f850d, vu_matrix.hpp9f57f985. Clean `hg_emit` joba1d8fb99 and build8d9b507c succeeded; current game executable SHA7576d75f710ae9223bd677dee8c01a885ffe679e50cc35c4dd917e1d51ee45e3 with post-link provenance. No073 probe or guest effect remains. Probe archives: runner2f9db7577e9946f6b6866654a2a4900c, emitter463c98417b0243ba924b4806777446c8, vu_matrix.cpp3528e01552884f6a9a0a068f13aa5540, headerca71fea4681f4f3b88fc3d103619c8cc. Next measurable milestone: attribute the remaining ~1.24s exclusive VU work by static program entry or host phase, then choose an operation that removes a large measured cost while preserving exact guest state; revisit renderer CPU-side service only with a measured eliminable bucket. Qualified clean baseline remains12.58608–13.72106FPS under host drift;30FPS unmet. No active job.
 
 ## HG-DIAG-072 closed flat; clean production restored - 2026-09-26
 
@@ -2647,10 +4804,10 @@ Deliver current function/module cost shares and one source-grounded optimization
 hypothesis with invariants and falsification criteria. No speed improvement assumed.
 Update PERFORMANCE/DIAGNOSTICS with evidence; preserve inherited dirty work.
 
-## Authoritative handoff � 2026-09-20, user requested handoff
+## Authoritative handoff — 2026-09-20, user requested handoff
 
 Goal: continue toward30 changed presented images/s while preserving verified
-behavior. Current measured accepted samples:8.979�9.104 changed images/s; internal
+behavior. Current measured accepted samples:8.979–9.104 changed images/s; internal
 FPS is not independently measured. Target remains unmet. Do not present the small
 retained gains below as a substantial FPS breakthrough or full console fidelity.
 
@@ -2709,7 +4866,7 @@ hg-vu-add4-exact-rates.py, hg-gameplay-cost-profile.py/sample.py. Latest launche
 43760 completed all6 XYZ runs (2warmups+4measured); no live sessions remain.
 Synthetic TOC HG-DIAG-007 and issue-slot timing HG-DIAG-008 remain material limits.
 
-## Active plan � reuse exact packed addition in existing XYZ helpers
+## Active plan — reuse exact packed addition in existing XYZ helpers
 
 Accepted full-lane add4 with exact24-bit conversion normalization:16M cases over4
 MXCSR rounding modes, no host FP exceptions; existingVU checks and914GPU both modes
@@ -2725,7 +4882,7 @@ contains dirty source/docs/map/acceptedbinary+hashes. Existing295168 VU referenc
 cases and original state comparisons cover flags/alias/invalid cases. Four warmed
 original pairs against this new accepted baseline decide retention. Goal30 unmet.
 
-## Active refinement � exact 24-bit normalization count
+## Active refinement — exact 24-bit normalization count
 
 General packed add passed4M arithmetic cases, existingVU checks,914GPU both modes
 and4originals RTC-only, but scene8.972->9.03045s(+0.65%). Not accepted. Candidate
@@ -2740,7 +4897,7 @@ alignment remain integers. Test4M cases in each of4MXCSR rounding modes, verify 
 host exception flags change, then original matched pairs against vu-add4-baseline.
 No new CPU ISA requirement. No performance claim before measured scene results.
 
-## Active plan � exact four-lane AVX2 integer addition for VU MADD
+## Active plan — exact four-lane AVX2 integer addition for VU MADD
 
 Measured Fpu::add remains a gameplay CPU cost. Add own fpu_add4.hpp, fpu_add4.cpp
 (host feature dispatch) and fpu_add4_avx2.cpp (separate ISA unit); integrate only
@@ -2757,7 +4914,7 @@ vu-add4-baseline saves dirty files and accepted write-only binary/map with hashe
 Change CMake, vu_products.cpp and fpu_tests.cpp; new three arithmetic files.
 No rendering, guest clock, scheduling or fault behavior changes. No gain assumed.
 
-## Current state � write-only raster scope retained; read/defer candidates reverted
+## Current state — write-only raster scope retained; read/defer candidates reverted
 
 Accepted scene gain this continuation is modest: write-only page ownership
 8.9539->8.89295s(-0.68%). Latest presentation samples8.97-9.11 changed images/s,
@@ -2772,7 +4929,7 @@ Failed candidates and hashes saved raster-read-deferred-rejected. HG-FAIL-014..0
 and HG-LEARN-026 record this continuation. Synthetic TOC/issue-slot timing limitations
 HG-DIAG-007/008 remain. No full physical-console fidelity or playability claim.
 
-## Active refinement � let resident memory hazards order CPU fallback
+## Active refinement — let resident memory hazards order CPU fallback
 
 Bounded reads alone remain UNACCEPTED:4 originals equal RTC-only,5760read/1920write
 cases and910GPU both pass,bytes~2.765GB->1.919GB but scene8.8659->8.90155s(+0.40%).
@@ -2788,7 +4945,7 @@ Current candidate backed up raster-deferred-flush-baseline (not accepted binary)
 No guest reorder unless physical page footprints prove operations commute. No
 clocks/arithmetic changes. Revert both read narrowing and deferred flush if no gain.
 
-## Active plan � precompute coalesced CPU raster input pages
+## Active plan — precompute coalesced CPU raster input pages
 
 Retained write-page scope:1920 footprint cases + focused checks +910 GPU cases
 both modes pass;4 original captures equal RTC-only. Warmed gameplay8.9539->8.89295s
@@ -2807,7 +4964,7 @@ Backup raster-read-pages-baseline contains dirty state and accepted exe/map hash
 Hypothesis reduce bulk readback footprint without earlier sparse-demand overhead.
 Goal30 still unmet; no new accepted changed-image rate measured yet.
 
-## Active plan � narrow CPU raster write ownership, preserve full readback
+## Active plan — narrow CPU raster write ownership, preserve full readback
 
 Selective VU LTCG reverted: all state equal RTC-only, gameplay8.95825->10.5671s
 (+17.96%). Candidate archived vu-ltcg-rejected; accepted binary/map restored.
@@ -2825,7 +4982,7 @@ sources/docs/accepted binary/map + hashes. Hypothesis: reduce false dirty pages
 and mirror comparisons without extra small downloads. Revert without scene gain.
 New helper header gs_raster_pages.hpp is new. No guest timing/arithmetic changes.
 
-## Active plan � selective MSVC VU link-time optimization
+## Active plan — selective MSVC VU link-time optimization
 
 Packed32 products reverted: warmed scene9.5522->9.48645s, but second pair flat
 and whole replay slower; no repeatable benefit. Saved vu-packed-products-rejected.
@@ -9417,17 +11574,3 @@ Next measured readback lead: display_image currently calls const vram.data() and
 - IOP dispatch fallthrough: heavy31M..33M profiling left about0.195s extrapolated in IOP run/I/O. A conservative generator candidate let only contiguous ordinary non-control instructions fall through adjacent C++ cases while preserving each original budget decrement, trace boundary, finish_instruction/load-delay commit and s.pc update; control/delay-slot/native/import/hook/fault/page boundaries were unchanged.132 Python/tool tests passed and the qualified candidate measured12.963275FPS with exact retained state. Restored byte-exactly. Adjacent qualified clean controls measured13.083097 and12.913251FPS, so this result is inside observed host drift and is not a demonstrated gain.
 - DMA source-qword native loads: IPU/GIF/VIF1/SIF1 source reads replaced sixteen scalar byte shifts with two portable little-endian uint64 memcpy loads after existing validation. Runtime, translation and65536 VU-readiness tests passed. Candidate executable e6fc98e6cdb1d9fb3308006df323df87b089e188d37a627c1d1515cbdbc6d78f in verifier8331d5997f994bc3a704d7f98f46f143 qualified864 original0x001bef84 writers with no validation failures and exact retained frame/EE/GS/VU/RTC-normalized IOP state, but measured13.005903FPS (13.004916..13.006889), also inside the clean12.913251..13.083097FPS band. Restored runtime.hpp,system.hpp and runtime_tests.cpp byte-exactly after measurement; the linked EXE remains the candidate until the next build, so do not label e6fc98e6... a clean binary.
 - Pre-edit evidence: artifacts/iop-switch-fallthrough-preedit-20260924.txt and artifacts/dma-qword-source-load-preedit-20260924.txt. Do not repeat either mechanism unchanged. Target a larger measured structural cost and require paired/repeatable improvement beyond the current drift band before retention.
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -23,8 +24,16 @@ struct GsDraw {
     std::uint64_t xyoffset=0;
     std::array<GsVertex,3> vertices{};
     std::uint8_t count=0;
-    std::array<std::uint64_t,0x80> environment{};
+    using Environment=std::array<std::uint64_t,0x80>;
+    // Runtime draws use the ordered state-event cursor.  The nullable owned
+    // snapshot is retained for isolated callers/tests that construct a draw.
+    std::shared_ptr<Environment> explicit_environment;
+    std::uint32_t environment_event_count=(std::numeric_limits<std::uint32_t>::max)();
     bool environment_captured=false;
+};
+struct GsDrawEnvironmentEvent {
+    std::uint64_t value=0;
+    std::uint8_t address=0;
 };
 struct GsTextureImage {
     std::uint32_t width=0,height=0;
@@ -293,6 +302,18 @@ struct GsRegisterState {
     std::uint32_t gif_q=0x3f800000; // GIF's documented per-tag initial Q = 1.0f.
     std::vector<GsVertex> vertex_queue;
     std::vector<GsDraw> draws;
+    // Two heap-backed snapshots keep the large register arrays out of every
+    // GsRegisterState stack frame while preserving ordinary deep-copy value semantics.
+    std::vector<GsDraw::Environment> draw_environment_storage;
+    std::vector<GsDrawEnvironmentEvent> draw_environment_events;
+    bool draw_environment_active=false;
+    std::size_t raster_environment_event_count=0,raster_environment_draw_index=0;
+    bool raster_environment_active=false;
+
+    GsDraw::Environment& draw_environment_base() {return draw_environment_storage.at(0);}
+    const GsDraw::Environment& draw_environment_base() const {return draw_environment_storage.at(0);}
+    GsDraw::Environment& raster_environment() {return draw_environment_storage.at(1);}
+    const GsDraw::Environment& raster_environment() const {return draw_environment_storage.at(1);}
     // Cumulative counts since GS reset; draws[0] follows retired_draw_count.
     // Completed history may be retired, but pending records must stay ordered.
     std::uint64_t rasterized_draw_count=0,retired_draw_count=0;
@@ -316,6 +337,22 @@ struct GsRegisterState {
     unsigned completed_transfer_format=0;
     std::uint32_t transfer_x=0, transfer_y=0, transfer_width=0, transfer_remaining=0;
 
+    void record_draw_environment_write(std::uint8_t address,std::uint64_t data) {
+        if(draw_environment_active)draw_environment_events.push_back({data,address});
+    }
+
+    GsDraw::Environment materialize_draw_environment(const GsDraw& draw) const {
+        if(draw.explicit_environment)return *draw.explicit_environment;
+        if(draw.environment_event_count==(std::numeric_limits<std::uint32_t>::max)())return value;
+        if(draw.environment_event_count>draw_environment_events.size())
+            throw std::runtime_error("invalid GS draw environment cursor");
+        auto result=draw_environment_base();
+        for(std::size_t n=0;n<draw.environment_event_count;++n) {
+            const auto& event=draw_environment_events[n];result[event.address]=event.value;
+        }
+        return result;
+    }
+
     void write_ad(std::uint8_t address, std::uint64_t data) {
         if (address >= value.size()) throw std::runtime_error("unsupported GS A+D register address");
         if(address==0x60&&(privileged_csr_events&1))
@@ -328,6 +365,7 @@ struct GsRegisterState {
             load_clut_from_tex0((value[6+(address-0x16)]&~mask)|(data&mask));
         }
         value[address] = data;
+        record_draw_environment_write(address,data);
         written[address] = true;
         if(address==0x60) {
             const auto mask=std::uint32_t(data>>32),id=std::uint32_t(data);
@@ -342,6 +380,7 @@ struct GsRegisterState {
             constexpr auto tex2_mask=(std::uint64_t{0x3f}<<20)|(~std::uint64_t{0}<<37);
             const auto tex0=std::uint8_t(6+(address-0x16));
             value[tex0]=(value[tex0]&~tex2_mask)|(data&tex2_mask);
+            record_draw_environment_write(tex0,value[tex0]);
             written[tex0]=true;
         }
         if(address==0) vertex_queue.clear(); // PRIM initializes the documented queue.
@@ -363,6 +402,27 @@ struct GsRegisterState {
         const auto completed=pending_draw_index();
         draws.erase(draws.begin(),draws.begin()+completed);
         retired_draw_count=rasterized_draw_count;
+        std::uint32_t first=(std::numeric_limits<std::uint32_t>::max)();
+        for(const auto& draw:draws)if(!draw.explicit_environment&&
+            draw.environment_event_count!=(std::numeric_limits<std::uint32_t>::max)())
+            first=std::min(first,draw.environment_event_count);
+        if(first==(std::numeric_limits<std::uint32_t>::max)()) {
+            draw_environment_events.clear();draw_environment_storage.clear();
+            draw_environment_active=false;raster_environment_active=false;
+        } else if(first) {
+            if(first>draw_environment_events.size())throw std::runtime_error("invalid retained GS draw environment cursor");
+            for(std::size_t n=0;n<first;++n) {
+                const auto& event=draw_environment_events[n];draw_environment_base()[event.address]=event.value;
+            }
+            draw_environment_events.erase(draw_environment_events.begin(),draw_environment_events.begin()+first);
+            for(auto& draw:draws)if(!draw.explicit_environment&&
+                draw.environment_event_count!=(std::numeric_limits<std::uint32_t>::max)())draw.environment_event_count-=first;
+            raster_environment()=draw_environment_base();raster_environment_event_count=0;
+            raster_environment_draw_index=0;raster_environment_active=true;
+        } else {
+            raster_environment()=draw_environment_base();raster_environment_event_count=0;
+            raster_environment_draw_index=0;raster_environment_active=true;
+        }
         return completed;
     }
 
@@ -378,7 +438,14 @@ struct GsRegisterState {
         GsDraw draw{};
         draw.primitive=primitive;draw.prim_state=prim_state;draw.xyoffset=value[0x18+context];
         draw.vertices={a,b,c};draw.count=std::uint8_t(count);
-        draw.environment=value;draw.environment_captured=true;
+        if(!draw_environment_active) {
+            draw_environment_storage.resize(2);draw_environment_base()=value;raster_environment()=value;
+            draw_environment_events.clear();draw_environment_active=true;
+            raster_environment_event_count=0;raster_environment_draw_index=0;raster_environment_active=true;
+        }
+        if(draw_environment_events.size()>(std::numeric_limits<std::uint32_t>::max)())
+            throw std::runtime_error("GS draw environment stream exceeds bounded capacity");
+        draw.environment_event_count=std::uint32_t(draw_environment_events.size());draw.environment_captured=true;
         draws.push_back(std::move(draw));
     }
     void kick_vertex(std::uint64_t data,bool has_fog,bool draw) {
@@ -873,6 +940,8 @@ struct GsRegisterState {
     // Varying depth and perspective STQ use these same exact weights.
     bool rasterize_triangle(const GsDraw& draw);
 
+    bool rasterize_draw_current(const GsDraw& draw);
+
     bool rasterize_draw(const GsDraw& draw);
 
     std::size_t rasterize_pending_draws();
@@ -978,6 +1047,7 @@ struct GsRegisterState {
             format==completed_transfer_format && (format==0||format==2||format==0x13||format==0x14);
     }
     bool write_image_psmt8_fast(std::uint64_t low,std::uint64_t high);
+    void write_image_transfers(const GifTransfer* transfers,std::size_t count);
     void write_image_qword(std::uint64_t low, std::uint64_t high) {
         if(completed_host_payload())return;
         const auto format = unsigned((value[0x50] >> 56) & 0x3f);
@@ -1039,7 +1109,8 @@ struct GsRegisterState {
 // documented PRIM write. Other descriptors remain explicit boundaries until
 // their vertex/register data formats are implemented.
 inline void apply_gif_register_transfers(const GifPacket& packet, GsRegisterState& gs) {
-    for (const auto& transfer : packet.transfers) {
+    for (std::size_t index=0;index<packet.transfers.size();) {
+        const auto& transfer=packet.transfers[index];
         if(transfer.reset_q)gs.gif_q=0x3f800000;
         if (transfer.kind == GifTransferKind::Prim) {
             gs.write_ad(0, transfer.low);
@@ -1048,10 +1119,15 @@ inline void apply_gif_register_transfers(const GifPacket& packet, GsRegisterStat
         } else if (transfer.kind == GifTransferKind::Reglist) {
             gs.write_reglist(transfer.descriptor, transfer.low);
         } else if (transfer.kind == GifTransferKind::Image) {
-            gs.write_image_qword(transfer.low, transfer.high);
+            auto end=index+1;
+            while(end<packet.transfers.size()&&packet.transfers[end].kind==GifTransferKind::Image&&
+                  !packet.transfers[end].reset_q)++end;
+            gs.write_image_transfers(packet.transfers.data()+index,end-index);
+            index=end;continue;
         } else {
             throw std::runtime_error("GIF transfer requires unimplemented GS descriptor handling");
         }
+        ++index;
     }
 }
 

@@ -2,11 +2,17 @@
 #include "hg/gs_acceleration.hpp"
 #include "hg/gs_math.hpp"
 #include "hg/gs_triangle_acceleration.hpp"
+#include "hg/native_indexed_draw.hpp" // HG-ARCH-002: passive contract, no active native draw dispatch.
+#include "hg/native_psmt8_pages.hpp" // HG-ARCH-004: passive page-footprint contract; no runtime dispatch.
+#include "hg/native_psmt8_texture.hpp" // HG-ARCH-005: passive byte-staging contract; no runtime dispatch.
+#include "hg/native_psmt8_cache.hpp" // HG-ARCH-006: passive epoch/cache contract; no production installs.
 #include "hg/gs_raster_pages.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <chrono>
 #include <bitset>
+#include <cmath>
+#include <cstring>
 
 namespace hg {
 
@@ -207,6 +213,69 @@ bool GsRegisterState::write_image_psmt8_fast(std::uint64_t low,std::uint64_t hig
     return true;
 }
 
+void GsRegisterState::write_image_transfers(const GifTransfer* transfers,std::size_t count) {
+    if(!transfers&&count)throw std::runtime_error("null GS IMAGE transfer run");
+    constexpr std::size_t bulk_threshold=256;
+    const auto format=unsigned((value[0x50]>>56)&0x3f);
+    if(format!=0x13||count<bulk_threshold) {
+        for(std::size_t n=0;n<count;++n)write_image_qword(transfers[n].low,transfers[n].high);
+        return;
+    }
+    const auto total=std::uint64_t(value[0x52]&0xfff)*((value[0x52]>>32)&0xfff);
+    const auto width=std::uint32_t((value[0x50]>>48)&0x3f)*64;
+    const auto base=std::uint32_t((value[0x50]>>32)&0x3fff)*64;
+    std::bitset<512> discard_pages,discarded_pages;
+    const auto rectangle_width=std::uint32_t(value[0x52]&0xfff);
+    const auto rectangle_height=std::uint32_t((value[0x52]>>32)&0xfff);
+    if(transfer_remaining==total&&std::uint64_t(count)*16>=total&&base%2048==0&&
+       width%128==0&&transfer_x%128==0&&transfer_y%64==0&&rectangle_width%128==0&&
+       rectangle_height%64==0&&transfer_x+rectangle_width<=2048&&transfer_y+rectangle_height<=2048) {
+        for(auto y=transfer_y;y<transfer_y+rectangle_height;y+=64)
+            for(auto x=transfer_x;x<transfer_x+rectangle_width;x+=128)
+                discard_pages.set(psmt8_word(base,width,x,y)/2048);
+    }
+    std::size_t n=0;
+    while(n<count) {
+        if(completed_host_payload()){++n;continue;}
+        if(!gif_to_vram_active||transfer_remaining<16||!transfer_width||!width||
+           total<transfer_remaining||vram.size()!=1024*1024) {
+            write_image_qword(transfers[n].low,transfers[n].high);++n;continue;
+        }
+        const auto written=total-transfer_remaining;
+        const auto column=std::uint32_t(written%transfer_width);
+        const auto x=transfer_x+column,y=transfer_y+std::uint32_t(written/transfer_width);
+        if((x&15)||transfer_width-column<16) {
+            write_image_qword(transfers[n].low,transfers[n].high);++n;continue;
+        }
+        const auto first=psmt8_word(base,width,x,y),page=first/2048;
+        auto* page_words=discard_pages[page]&&!discarded_pages[page]
+            ?vram.write_discard_span(page*2048,2048):vram.write_span(page*2048,2048);
+        discarded_pages.set(page);
+        do {
+            const auto low=transfers[n].low,high=transfers[n].high;
+            const auto current_written=total-transfer_remaining;
+            const auto current_column=std::uint32_t(current_written%transfer_width);
+            const auto current_x=transfer_x+current_column;
+            const auto current_y=transfer_y+std::uint32_t(current_written/transfer_width);
+            if((current_x&15)||transfer_width-current_column<16)break;
+            const auto current_first=psmt8_word(base,width,current_x,current_y);
+            if(current_first/2048!=page)break;
+            const auto shift=((current_y&2)>>1)*8,mask=0x00ff00ffu<<shift;
+            for(unsigned i=0;i<8;++i) {
+                const auto index=(current_first&~15u)+((current_first&15)^((i&1)+((i&6)*2)));
+                const auto pair=std::uint32_t((low>>(i*8))&255)|(std::uint32_t((high>>(i*8))&255)<<16);
+                auto& word=page_words[index-page*2048];
+                word=(word&~mask)|(pair<<shift);
+            }
+            transfer_remaining-=16;++n;
+            if(!transfer_remaining) {
+                gif_to_vram_active=false;host_transfer_completed=true;completed_transfer_format=0x13;
+                break;
+            }
+        } while(n<count);
+    }
+}
+
 GsDisplayImage GsRegisterState::display_image() const {
         const auto enabled=unsigned(privileged_pmode&3);
         if(enabled!=1&&enabled!=2)
@@ -351,11 +420,103 @@ struct DrawTexture {
         return gs_texture_function(texel,fragment,function,tcc);
     }
 };
-struct PerspectiveSum {bool negative=false,zero=true;std::uint64_t magnitude=0;int scale=0;};
+struct PerspectiveSum {
+    bool negative=false,zero=true;
+    std::uint64_t magnitude=0;
+    int scale=0;
+    std::uint64_t high=0;
+};
+struct WideMagnitude {std::uint64_t low=0,high=0;};
+int compare_wide(WideMagnitude a,WideMagnitude b) {
+    if(a.high!=b.high)return a.high<b.high?-1:1;
+    if(a.low!=b.low)return a.low<b.low?-1:1;
+    return 0;
+}
+WideMagnitude subtract_wide(WideMagnitude a,WideMagnitude b) {
+    return {a.low-b.low,a.high-b.high-std::uint64_t(a.low<b.low)};
+}
+bool add_wide(WideMagnitude& a,WideMagnitude b) {
+    const auto low=a.low+b.low,carry=std::uint64_t(low<a.low);
+    const auto maximum=(std::numeric_limits<std::uint64_t>::max)();
+    if(b.high>maximum-carry||a.high>maximum-b.high-carry)return false;
+    a={low,a.high+b.high+carry};return true;
+}
+bool shift_wide_left(WideMagnitude& value,unsigned shift) {
+    if(!shift)return true;
+    if(shift>=128)return !value.low&&!value.high;
+    if(shift>=64) {
+        if(value.high||(shift>64&&value.low>>(128-shift)))return false;
+        value={0,value.low<<(shift-64)};return true;
+    }
+    if(value.high>>(64-shift))return false;
+    value={value.low<<shift,(value.high<<shift)|(value.low>>(64-shift))};return true;
+}
+bool shift_wide_right(WideMagnitude& value,unsigned shift) {
+    if(!shift)return false;
+    if(shift>=128) {const bool discarded=value.low||value.high;value={};return discarded;}
+    if(shift>=64) {
+        const auto right=shift-64;
+        const bool discarded=value.low||(right&&((value.high&((std::uint64_t(1)<<right)-1))!=0));
+        value={value.high>>right,0};return discarded;
+    }
+    const bool discarded=(value.low&((std::uint64_t(1)<<shift)-1))!=0;
+    value={(value.low>>shift)|(value.high<<(64-shift)),value.high>>shift};return discarded;
+}
+WideMagnitude multiply_u64_u24(std::uint64_t value,std::uint32_t multiplier) {
+    const auto low=(value&0xffffffffu)*multiplier;
+    const auto upper=(value>>32)*multiplier;
+    const auto shifted=upper<<32,result=low+shifted;
+    return {result,(upper>>32)+std::uint64_t(result<low)};
+}
+bool multiply_wide_u32(WideMagnitude value,std::uint32_t multiplier,WideMagnitude& result) {
+    const auto a=multiply_u64_u24(value.low,multiplier);
+    const auto b=multiply_u64_u24(value.high,multiplier);
+    if(b.high)return false;
+    const auto high=a.high+b.low;
+    if(high<a.high)return false;
+    result={a.low,high};return true;
+}
 std::int32_t perspective_from_sums(const PerspectiveSum& numerator_sum,
                                  const PerspectiveSum& denominator_sum,unsigned dimension_shift) {
     if(denominator_sum.zero)throw std::runtime_error("GS perspective STQ division by zero");
     if(numerator_sum.zero)return 0;
+    if(numerator_sum.high||denominator_sum.high) {
+        WideMagnitude numerator{numerator_sum.magnitude,numerator_sum.high};
+        const WideMagnitude denominator{denominator_sum.magnitude,denominator_sum.high};
+        auto shift=numerator_sum.scale-denominator_sum.scale+int(dimension_shift);
+        bool has_remainder=false;
+        if(shift<0) {has_remainder=shift_wide_right(numerator,unsigned(-shift));shift=0;}
+        else if(!shift_wide_left(numerator,unsigned(shift)))
+            throw std::runtime_error("GS perspective STQ exponent spread requires validation");
+        const bool negative=numerator_sum.negative!=denominator_sum.negative;
+        const std::uint64_t limit=negative?0x80000000ull:0x7fffffffull;
+        std::uint64_t quotient=0,remainder=0;
+        if(!denominator.high) {
+            if(!gs_divide_128(numerator.high,numerator.low,denominator.low,quotient,remainder)||quotient>limit)
+                throw std::runtime_error("GS perspective STQ coordinate outside signed texel range");
+            has_remainder=has_remainder||remainder!=0;
+        } else {
+            std::uint32_t lower=0,upper=std::uint32_t(limit);
+            while(lower<upper) {
+                const auto middle=lower+(upper-lower+1)/2;
+                WideMagnitude product{};
+                if(!multiply_wide_u32(denominator,middle,product)||compare_wide(product,numerator)>0)
+                    upper=middle-1;
+                else lower=middle;
+            }
+            quotient=lower;WideMagnitude product{};
+            if(!multiply_wide_u32(denominator,lower,product))
+                throw std::runtime_error("GS perspective STQ coordinate outside signed texel range");
+            const auto rest=subtract_wide(numerator,product);
+            has_remainder=has_remainder||rest.low||rest.high;
+        }
+        auto magnitude=quotient;
+        if(negative&&has_remainder) {
+            if(magnitude==limit)throw std::runtime_error("GS perspective STQ coordinate outside signed texel range");
+            ++magnitude;
+        }
+        return negative?std::int32_t(-std::int64_t(magnitude)):std::int32_t(magnitude);
+    }
     const auto numerator=numerator_sum.magnitude,denominator=denominator_sum.magnitude;
     const auto shift=numerator_sum.scale-denominator_sum.scale+int(dimension_shift);
     const bool negative=numerator_sum.negative!=denominator_sum.negative;
@@ -406,15 +567,17 @@ std::int32_t perspective_from_sums(const PerspectiveSum& numerator_sum,
     return negative?std::int32_t(-std::int64_t(magnitude)):std::int32_t(magnitude);
 }
 
+enum class PreparedPerspectiveFailure {none,dimension,nonfinite,shift,product};
 struct PreparedCoordinate {
     std::array<std::int64_t,3> coefficient{};
     int scale=0;
-    bool prepare(const std::array<std::uint32_t,3>& values,std::uint64_t area) {
+    PreparedPerspectiveFailure failure=PreparedPerspectiveFailure::none;
+    bool prepare(const std::array<std::uint32_t,3>& values,std::uint64_t area,bool require_area_bound=true) {
         std::array<std::uint32_t,3> mantissa{};
         std::array<int,3> exponent{};bool any=false;
         for(unsigned i=0;i<3;++i) {
             const auto e=(values[i]>>23)&255,fraction=values[i]&0x7fffff;
-            if(e==255)return false; // Let the checked scalar path report the fault.
+            if(e==255){failure=PreparedPerspectiveFailure::nonfinite;return false;} // Let the checked scalar path report the fault.
             mantissa[i]=e?(fraction|0x800000u):fraction;
             exponent[i]=e?int(e)-150:-149;
             if(mantissa[i]){if(!any||exponent[i]<scale)scale=exponent[i];any=true;}
@@ -422,11 +585,11 @@ struct PreparedCoordinate {
         constexpr auto limit=std::uint64_t((std::numeric_limits<std::int64_t>::max)());
         for(unsigned i=0;i<3;++i)if(mantissa[i]) {
             const auto shift=unsigned(exponent[i]-scale);
-            if(shift>=63||mantissa[i]>(limit>>shift))return false;
+            if(shift>=63||mantissa[i]>(limit>>shift)){failure=PreparedPerspectiveFailure::shift;return false;}
             const auto magnitude=std::uint64_t(mantissa[i])<<shift;
             // Nonnegative covered weights sum to area. This bounds every
             // product and every partial signed sum, including zero-weight edges.
-            if(magnitude>limit/area)return false;
+            if(require_area_bound&&!gs_unsigned_product_fits_i64(magnitude,area)){failure=PreparedPerspectiveFailure::product;return false;}
             coefficient[i]=(values[i]>>31)?-std::int64_t(magnitude):std::int64_t(magnitude);
         }
         return true;
@@ -440,14 +603,16 @@ struct PreparedCoordinate {
 struct PreparedTriangleStq {
     PreparedCoordinate s,t,q;
     bool ready=false;unsigned shift_u=0,shift_v=0;
+    PreparedPerspectiveFailure failure=PreparedPerspectiveFailure::none;
     void prepare(const GsVertex& a,const GsVertex& b,const GsVertex& c,
-                 std::uint64_t area,std::uint64_t tex0,bool linear) {
+                 std::uint64_t area,std::uint64_t tex0,bool linear,bool require_area_bound=true) {
         const auto tw=unsigned((tex0>>26)&15),th=unsigned((tex0>>30)&15);
-        if(tw>10||th>10)return;
+        if(tw>10||th>10){failure=PreparedPerspectiveFailure::dimension;return;}
         shift_u=tw+(linear?4:0);shift_v=th+(linear?4:0);
-        ready=s.prepare({std::uint32_t(a.st),std::uint32_t(b.st),std::uint32_t(c.st)},area)&&
-              t.prepare({std::uint32_t(a.st>>32),std::uint32_t(b.st>>32),std::uint32_t(c.st>>32)},area)&&
-              q.prepare({a.q,b.q,c.q},area);
+        if(!s.prepare({std::uint32_t(a.st),std::uint32_t(b.st),std::uint32_t(c.st)},area,require_area_bound)){failure=s.failure;return;}
+        if(!t.prepare({std::uint32_t(a.st>>32),std::uint32_t(b.st>>32),std::uint32_t(c.st>>32)},area,require_area_bound)){failure=t.failure;return;}
+        if(!q.prepare({a.q,b.q,c.q},area,require_area_bound)){failure=q.failure;return;}
+        ready=true;
     }
     std::pair<std::int32_t,std::int32_t> sample(std::int64_t a,std::int64_t b,std::int64_t c) const {
         const auto denominator=q.sum(a,b,c);
@@ -479,7 +644,7 @@ std::int32_t gs_stq_perspective_texel_coordinate(const std::array<std::uint32_t,
             any=true;
         }
         if(!any)return Sum{};
-        std::int64_t total=0;
+        std::int64_t total=0;bool needs_wide=false;
         for(unsigned index=0;index!=3;++index)if(weights[index]&&!parts[index].zero) {
             if(weights[index]==(std::numeric_limits<std::int64_t>::min)())
                 throw std::runtime_error("GS perspective STQ weight overflow");
@@ -489,23 +654,46 @@ std::int32_t gs_stq_perspective_texel_coordinate(const std::array<std::uint32_t,
             // weights fit this conservative bound, avoiding an integer divide
             // per operand while retaining the exact check for larger weights.
             constexpr auto safe_weight=std::uint64_t((std::numeric_limits<std::int64_t>::max)())>>24;
-            if(weight>safe_weight&&
-               weight>std::uint64_t((std::numeric_limits<std::int64_t>::max)())/parts[index].mantissa)
-                throw std::runtime_error("GS perspective STQ sum overflow");
+            if(weight>safe_weight&&weight>std::uint64_t((std::numeric_limits<std::int64_t>::max)())/parts[index].mantissa) {
+                needs_wide=true;break;
+            }
             auto magnitude=weight*parts[index].mantissa;
             const auto shift=unsigned(parts[index].scale-common_scale);
-            if(shift>=63||magnitude>(std::uint64_t((std::numeric_limits<std::int64_t>::max)())>>shift))
-                throw std::runtime_error("GS perspective STQ exponent spread requires validation");
+            if(shift>=63||magnitude>(std::uint64_t((std::numeric_limits<std::int64_t>::max)())>>shift)) {
+                needs_wide=true;break;
+            }
             const auto term=std::int64_t(magnitude<<shift);
             if(negative) {
-                if(total<(std::numeric_limits<std::int64_t>::min)()+term)
-                    throw std::runtime_error("GS perspective STQ sum overflow");
+                if(total<(std::numeric_limits<std::int64_t>::min)()+term) {needs_wide=true;break;}
                 total-=term;
             } else {
-                if(total>(std::numeric_limits<std::int64_t>::max)()-term)
-                    throw std::runtime_error("GS perspective STQ sum overflow");
+                if(total>(std::numeric_limits<std::int64_t>::max)()-term) {needs_wide=true;break;}
                 total+=term;
             }
+        }
+        if(needs_wide) {
+            WideMagnitude total_wide{};bool total_negative=false;
+            for(unsigned index=0;index!=3;++index)if(weights[index]&&!parts[index].zero) {
+                if(weights[index]==(std::numeric_limits<std::int64_t>::min)())
+                    throw std::runtime_error("GS perspective STQ weight overflow");
+                const bool negative=parts[index].negative!=(weights[index]<0);
+                const auto weight=std::uint64_t(weights[index]<0?-weights[index]:weights[index]);
+                auto term=multiply_u64_u24(weight,parts[index].mantissa);
+                if(!shift_wide_left(term,unsigned(parts[index].scale-common_scale)))
+                    throw std::runtime_error("GS perspective STQ exponent spread requires validation");
+                if(!term.low&&!term.high)continue;
+                if(!total_wide.low&&!total_wide.high) {total_wide=term;total_negative=negative;continue;}
+                if(total_negative==negative) {
+                    if(!add_wide(total_wide,term))throw std::runtime_error("GS perspective STQ sum overflow");
+                } else {
+                    const auto comparison=compare_wide(total_wide,term);
+                    if(!comparison){total_wide={};total_negative=false;}
+                    else if(comparison>0)total_wide=subtract_wide(total_wide,term);
+                    else {total_wide=subtract_wide(term,total_wide);total_negative=negative;}
+                }
+            }
+            if(!total_wide.low&&!total_wide.high)return Sum{};
+            return Sum{total_negative,false,total_wide.low,common_scale,total_wide.high};
         }
         if(!total)return Sum{};
         if(total==(std::numeric_limits<std::int64_t>::min)())
@@ -804,6 +992,7 @@ void GsRegisterState::write_packed(std::uint8_t descriptor,std::uint64_t low,std
         if(address==0x54) {
             write_hwreg(low);
             value[address]=low;
+            record_draw_environment_write(address,low);
             written[address]=true;
             return;
         }
@@ -1358,85 +1547,9 @@ bool GsRegisterState::rasterize_triangle(const GsDraw& draw) {
     }
     if(!has_sample)return false;
     --first_covered_y;
-    if(gs_triangle_accelerator&&(!textured||(!fst&&perspective.ready))&&!(draw.prim_state&(1u<<5))) {
-        const auto submit=[&] {
-            const auto frame=value[0x4c+context],zbuf=value[0x4e + context],test=value[0x47+context];
-            const auto tex0=value[6+context],clamp=value[8+context],alpha=value[0x42+context];
-            const auto width=unsigned((frame>>16)&63)*64,format=unsigned((tex0>>20)&63);
-            const auto zformat=unsigned((zbuf>>24)&15);
-            const auto l=std::max(left,x0),r=std::min(right,x1)+1,t=std::max(top,y0),bott=std::min(bottom,y1)+1;
-            if(l>=r||t>=bott||!width||r>width||std::uint64_t(width)*((bott+31)/32)*32>1024*1024)return false;
-            if(((frame>>24)&63)!=0||zformat>1||vram.size()!=1024*1024||(value[0x22]&3))return false;
-            if((test&0x4000)||!(test&0x10000)||((test>>17)&3)==0)return false;
-            if((test&1)&&(((test>>1)&7)!=7||((test>>12)&3)!=0))return false;
-            if(textured&&(format!=0&&format!=0x13&&format!=0x14&&format!=0x1b))return false;
-            // CT32 CLUT, CSM1; PSMT4 may select CSA<16 (same scope as DrawTexture).
-            if(textured&&(!((tex0>>14)&63)||(format==0x14?(((tex0>>51)&31)||((tex0>>56)&31)>=16):
-               (format!=0&&((tex0>>51)&0x3ff)))))return false;
-            if(textured&&(((clamp&3)==2&&((clamp>>4)&1023)>((clamp>>14)&1023))||
-               (((clamp>>2)&3)==2&&((clamp>>24)&1023)>((clamp>>34)&1023))))return false;
-            if(draw.prim_state&64)for(unsigned s=0;s<8;s+=2)if(((alpha>>s)&3)==3)return false;
-            GsTriangleJob job;auto& d=job.data;
-            const auto put64=[&](unsigned at,std::uint64_t n){d[at]=std::uint32_t(n);d[at+1]=std::uint32_t(n>>32);};
-            if(textured) {
-            const auto coordinate_shift=[&](const PreparedCoordinate& coordinate,unsigned dimension){
-                if(coordinate.coefficient==std::array<std::int64_t,3>{})return 0;
-                return coordinate.scale-perspective.q.scale+int(dimension);
-            };
-            const auto extra=std::max({0,-coordinate_shift(perspective.s,perspective.shift_u),
-                                       -coordinate_shift(perspective.t,perspective.shift_v)});
-            if(extra>=63)return false;
-            const auto coefficient_limit=std::uint64_t((std::numeric_limits<std::int64_t>::max)())/std::uint64_t(area);
-            const auto prepare_numerator=[&](const PreparedCoordinate& coordinate,unsigned at,unsigned dimension) {
-                const int shift=coordinate_shift(coordinate,dimension)+extra;
-                if(shift<0||shift>=63)return false;
-                const auto limit=std::uint64_t((std::numeric_limits<std::int64_t>::max)())/std::uint64_t(area);
-                for(unsigned i=0;i<3;++i){const auto n=coordinate.coefficient[i];const auto magnitude=std::uint64_t(n<0?-n:n);
-                    if(magnitude>(limit>>shift))return false;
-                    const auto scaled=std::int64_t(magnitude<<shift);
-                    put64(at+i*2,std::uint64_t(n<0?-scaled:scaled));}
-                return true;
-            };
-            for(unsigned i=0;i<3;++i)if(perspective.q.coefficient[i]<=0||
-                std::uint64_t(perspective.q.coefficient[i])>(coefficient_limit>>extra))return false;
-            if(!prepare_numerator(perspective.s,GsTriangleJob::S,perspective.shift_u)||
-               !prepare_numerator(perspective.t,GsTriangleJob::T,perspective.shift_v))return false;
-            // Same-sign Q makes every interior ratio a convex combination of
-            // vertex ratios. Check signed texel bounds at the vertices first.
-            for(unsigned i=0;i<3;++i){
-                const auto q=std::uint64_t(perspective.q.coefficient[i])<<extra;put64(GsTriangleJob::Q+i*2,q);
-                for(unsigned at:{unsigned(GsTriangleJob::S),unsigned(GsTriangleJob::T)}) {
-                    const auto n=std::int64_t(std::uint64_t(d[at+i*2])|(std::uint64_t(d[at+i*2+1])<<32));
-                    if(n<0){if(std::uint64_t(-n)/q>0x80000000ull||
-                        (std::uint64_t(-n)/q==0x80000000ull&&std::uint64_t(-n)%q))return false;}
-                    else if(std::uint64_t(n)/q>0x7fffffffull)return false;
-                }
-            }
-            if(format!=0){
-                const auto clut_base=format==0x14?unsigned((tex0>>56)&15)*16:0u,entries=format==0x14?16u:256u;
-                for(unsigned i=0;i<entries;++i){
-                    const auto entry=clut_base+i;
-                    if(!clut_valid[entry]||!clut_valid[entry+256])return false;
-                    job.palette[i]=std::uint32_t(clut[entry])|(std::uint32_t(clut[entry+256])<<16);
-                }
-            }
-            }
-            d[0]=std::uint32_t(pa.x);d[1]=std::uint32_t(pa.y);d[2]=std::uint32_t(pb.x);d[3]=std::uint32_t(pb.y);
-            d[4]=std::uint32_t(pc.x);d[5]=std::uint32_t(pc.y);d[6]=unsigned(l);d[7]=unsigned(t);d[8]=unsigned(r);d[9]=unsigned(bott);
-            d[10]=unsigned(frame&511)*2048;d[11]=width;d[12]=unsigned(zbuf&511)*2048;d[13]=zformat?0xffffffu:0xffffffffu;
-            d[14]=std::uint32_t(frame>>32);d[15]=(gouraud?1:0)|(linear?2:0)|((tex0&(1ull<<34))?4:0)|
-                ((draw.prim_state&64)?8:0)|((value[0x46]&1)?16:0)|((value[0x4a+context]&1)?32:0)|
-                ((value[0x49]&1)?64:0)|((zbuf&(1ull<<32))?0:128)|((test&1)?256:0)|
-                (textured?0:GsTriangleJob::untextured_flag);
-            d[16]=unsigned((test>>17)&3);d[17]=unsigned((test>>4)&255);d[18]=std::uint32_t(alpha);d[19]=unsigned((alpha>>32)&255);
-            d[20]=unsigned(tex0&0x3fff)*64;d[21]=unsigned((tex0>>14)&63)*64;d[22]=format;
-            d[23]=1u<<((tex0>>26)&15);d[24]=1u<<((tex0>>30)&15);d[25]=std::uint32_t(clamp);d[26]=std::uint32_t(clamp>>32);
-            d[28]=unsigned((tex0>>35)&3);d[29]=flat_fragment;
-            d[30]=a.rgba;d[31]=b.rgba;d[32]=c.rgba;d[33]=a.z;d[34]=b.z;d[35]=c.z;put64(36,std::uint64_t(area));
-            return gs_triangle_accelerator->render_triangle(job,vram);
-        };
-        if(submit())return true;
-    }
+    // HG-PERF-120: the exact own-pixel PSMT8H feedback class is detected before
+    // the GPU attempt; the GPU tile shader reads each pixel's own frame word in
+    // per-pixel submission order, exactly as the scalar path below does.
     bool cpu_self_feedback=false;std::uint32_t feedback_frame_base=0,feedback_frame_width=0;
     unsigned feedback_function=0;bool feedback_tcc=false;
     if(textured&&!fst&&!linear&&perspective.ready) {
@@ -1474,6 +1587,163 @@ bool GsRegisterState::rasterize_triangle(const GsDraw& draw) {
             if(cpu_self_feedback){feedback_frame_base=frame_base;feedback_frame_width=frame_width;
                 feedback_function=unsigned((tex0>>35)&3);feedback_tcc=(tex0&(1ull<<34))!=0;}
         }
+    }
+    const bool wide_product_candidate=gs_triangle_accelerator&&textured&&!fst&&!perspective.ready&&
+        perspective.failure==PreparedPerspectiveFailure::product&&gs_triangle_accelerator->accepts_native_float_stq();
+    if(gs_triangle_accelerator&&(!textured||(!fst&&(perspective.ready||wide_product_candidate)))&&!(draw.prim_state&(1u<<5))) {
+        const auto submit=[&] {
+            const auto frame=value[0x4c+context],zbuf=value[0x4e + context],test=value[0x47+context];
+            const auto tex0=value[6+context],clamp=value[8+context],alpha=value[0x42+context];
+            const auto width=unsigned((frame>>16)&63)*64,format=unsigned((tex0>>20)&63);
+            const auto zformat=unsigned((zbuf>>24)&15);
+            const auto l=std::max(left,x0),r=std::min(right,x1)+1,t=std::max(top,y0),bott=std::min(bottom,y1)+1;
+            if(l>=r||t>=bott||!width||r>width||std::uint64_t(width)*((bott+31)/32)*32>1024*1024)
+                return false;
+            if(((frame>>24)&63)!=0||zformat>1||vram.size()!=1024*1024||(value[0x22]&3))
+                return false;
+            if((test&0x4000)||!(test&0x10000)||((test>>17)&3)==0)
+                return false;
+            if((test&1)&&((test>>12)&3)!=0) // HG-PERF-116: any ATST, AFAIL KEEP only.
+                return false;
+            if(textured&&(format!=0&&format!=0x13&&format!=0x14&&format!=0x1b))
+                return false;
+            // CT32 CLUT, CSM1; PSMT4 may select CSA<16 (same scope as DrawTexture).
+            if(textured&&(!((tex0>>14)&63)||(format==0x14?(((tex0>>51)&31)||((tex0>>56)&31)>=16):
+               (format!=0&&((tex0>>51)&0x3ff)))))return false;
+            if(textured&&(((clamp&3)==2&&((clamp>>4)&1023)>((clamp>>14)&1023))||
+               (((clamp>>2)&3)==2&&((clamp>>24)&1023)>((clamp>>34)&1023))))
+                return false;
+            if(draw.prim_state&64)for(unsigned s=0;s<8;s+=2)if(((alpha>>s)&3)==3)
+                return false;
+            GsTriangleJob job;auto& d=job.data;bool prepacked_native_stq=false;
+            const auto put64=[&](unsigned at,std::uint64_t n){d[at]=std::uint32_t(n);d[at+1]=std::uint32_t(n>>32);};
+            if(textured) {
+            PreparedTriangleStq wide_perspective;const PreparedTriangleStq* packed=&perspective;
+            const auto top_bit=[](std::uint64_t n){int bit=-1;while(n){++bit;n>>=1;}return bit;};
+            if(!perspective.ready) {
+                wide_perspective.prepare(a,b,c,std::uint64_t(area),tex0,linear,false);
+                if(!wide_perspective.ready)return false;
+                for(const auto q:wide_perspective.q.coefficient)if(q<=0)return false;
+                // The scalar helper widens coefficient*weight arithmetic to 128 bits.
+                // Prove its worst covered sum and any numerator scale-up remain in range.
+                const int area_bit=top_bit(std::uint64_t(area));
+                const auto weighted_top=[&](const PreparedCoordinate& coordinate){
+                    int top=-1;for(const auto n:coordinate.coefficient)if(n)
+                        top=std::max(top,top_bit(std::uint64_t(n<0?-n:n))+area_bit+1);
+                    return top;
+                };
+                if(weighted_top(wide_perspective.q)>=128)return false;
+                const auto ratio_wide_safe=[&](const PreparedCoordinate& coordinate,unsigned dimension){
+                    const auto top=weighted_top(coordinate);
+                    const int shift=coordinate.scale-wide_perspective.q.scale+int(dimension);
+                    return top<0||shift<=0||top+shift<128;
+                };
+                if(!ratio_wide_safe(wide_perspective.s,wide_perspective.shift_u)||
+                   !ratio_wide_safe(wide_perspective.t,wide_perspective.shift_v))return false;
+                const auto weights_for=[](unsigned vertex){std::array<std::int64_t,3> w{};w[vertex]=1;return w;};
+                try {
+                    for(unsigned i=0;i<3;++i) {
+                        const auto weights=weights_for(i);
+                        (void)gs_stq_perspective_texel_coordinate(
+                            {std::uint32_t(a.st),std::uint32_t(b.st),std::uint32_t(c.st)},
+                            {a.q,b.q,c.q},weights,1u<<((tex0>>26)&15),linear?4:0);
+                        (void)gs_stq_perspective_texel_coordinate(
+                            {std::uint32_t(a.st>>32),std::uint32_t(b.st>>32),std::uint32_t(c.st>>32)},
+                            {a.q,b.q,c.q},weights,1u<<((tex0>>30)&15),linear?4:0);
+                    }
+                } catch(const std::runtime_error&) {return false;}
+                packed=&wide_perspective;prepacked_native_stq=true;
+            }
+            const auto coordinate_shift=[&](const PreparedCoordinate& coordinate,unsigned dimension){
+                if(coordinate.coefficient==std::array<std::int64_t,3>{})return 0;
+                return coordinate.scale-packed->q.scale+int(dimension);
+            };
+            if(prepacked_native_stq) {
+                int peak=-10000;
+                const auto observe=[&](const PreparedCoordinate& coordinate,unsigned dimension){
+                    for(const auto n:coordinate.coefficient)if(n) {
+                        const auto magnitude=std::uint64_t(n<0?-n:n);
+                        peak=std::max(peak,coordinate.scale+int(dimension)+top_bit(magnitude));
+                    }
+                };
+                observe(packed->s,packed->shift_u);observe(packed->t,packed->shift_v);observe(packed->q,0);
+                if(peak==-10000)return false;
+                const int normalization=peak-30;
+                const auto put_float=[&](const PreparedCoordinate& coordinate,unsigned dimension,unsigned at) {
+                    const int exponent=coordinate.scale+int(dimension)-normalization;
+                    for(unsigned i=0;i<3;++i) {
+                        const auto n=coordinate.coefficient[i];
+                        const float value=std::ldexp(static_cast<float>(n),exponent);
+                        if(!std::isfinite(value)||(n&&value==0.0f))return false;
+                        std::memcpy(&d[at+i*2],&value,sizeof(value));d[at+i*2+1]=0;
+                    }
+                    return true;
+                };
+                if(!put_float(packed->s,packed->shift_u,GsTriangleJob::S)||
+                   !put_float(packed->t,packed->shift_v,GsTriangleJob::T)||
+                   !put_float(packed->q,0,GsTriangleJob::Q))return false;
+            } else {
+                const auto extra=std::max({0,-coordinate_shift(packed->s,packed->shift_u),
+                                           -coordinate_shift(packed->t,packed->shift_v)});
+                if(extra>=63)return false;
+                const auto coefficient_limit=std::uint64_t((std::numeric_limits<std::int64_t>::max)())/std::uint64_t(area);
+                const auto prepare_numerator=[&](const PreparedCoordinate& coordinate,unsigned at,unsigned dimension) {
+                    const int shift=coordinate_shift(coordinate,dimension)+extra;
+                    if(shift<0||shift>=63)return false;
+                    const auto limit=std::uint64_t((std::numeric_limits<std::int64_t>::max)())/std::uint64_t(area);
+                    for(unsigned i=0;i<3;++i){const auto n=coordinate.coefficient[i];const auto magnitude=std::uint64_t(n<0?-n:n);
+                        if(magnitude>(limit>>shift))return false;
+                        const auto scaled=std::int64_t(magnitude<<shift);
+                        put64(at+i*2,std::uint64_t(n<0?-scaled:scaled));}
+                    return true;
+                };
+                for(unsigned i=0;i<3;++i)if(packed->q.coefficient[i]<=0||
+                    std::uint64_t(packed->q.coefficient[i])>(coefficient_limit>>extra))
+                        return false;
+                if(!prepare_numerator(packed->s,GsTriangleJob::S,packed->shift_u)||
+                   !prepare_numerator(packed->t,GsTriangleJob::T,packed->shift_v))
+                    return false;
+                // Same-sign Q makes every interior ratio a convex combination of
+                // vertex ratios. Check signed texel bounds at the vertices first.
+                for(unsigned i=0;i<3;++i){
+                    const auto q=std::uint64_t(packed->q.coefficient[i])<<extra;put64(GsTriangleJob::Q+i*2,q);
+                    for(unsigned at:{unsigned(GsTriangleJob::S),unsigned(GsTriangleJob::T)}) {
+                        const auto n=std::int64_t(std::uint64_t(d[at+i*2])|(std::uint64_t(d[at+i*2+1])<<32));
+                        if(n<0){if(std::uint64_t(-n)/q>0x80000000ull||
+                            (std::uint64_t(-n)/q==0x80000000ull&&std::uint64_t(-n)%q))
+                                return false;}
+                        else if(std::uint64_t(n)/q>0x7fffffffull)
+                            return false;
+                    }
+                }
+            }
+            if(format!=0){
+                const auto clut_base=format==0x14?unsigned((tex0>>56)&15)*16:0u,entries=format==0x14?16u:256u;
+                for(unsigned i=0;i<entries;++i){
+                    const auto entry=clut_base+i;
+                    if(!clut_valid[entry]||!clut_valid[entry+256])
+                        return false;
+                    job.palette[i]=std::uint32_t(clut[entry])|(std::uint32_t(clut[entry+256])<<16);
+                }
+            }
+            }
+            d[0]=std::uint32_t(pa.x);d[1]=std::uint32_t(pa.y);d[2]=std::uint32_t(pb.x);d[3]=std::uint32_t(pb.y);
+            d[4]=std::uint32_t(pc.x);d[5]=std::uint32_t(pc.y);d[6]=unsigned(l);d[7]=unsigned(t);d[8]=unsigned(r);d[9]=unsigned(bott);
+            d[10]=unsigned(frame&511)*2048;d[11]=width;d[12]=unsigned(zbuf&511)*2048;d[13]=zformat?0xffffffu:0xffffffffu;
+            d[14]=std::uint32_t(frame>>32);d[15]=(gouraud?1:0)|(linear?2:0)|((tex0&(1ull<<34))?4:0)|
+                ((draw.prim_state&64)?8:0)|((value[0x46]&1)?16:0)|((value[0x4a+context]&1)?32:0)|
+                ((value[0x49]&1)?64:0)|((zbuf&(1ull<<32))?0:128)|((test&1)?256:0)|
+                (textured?0:GsTriangleJob::untextured_flag)|(prepacked_native_stq?GsTriangleJob::native_float_stq_flag:0)|
+                (cpu_self_feedback?GsTriangleJob::self_feedback_flag:0);
+            d[16]=unsigned((test>>17)&3);d[17]=unsigned((test>>4)&255);d[18]=std::uint32_t(alpha);d[19]=unsigned((alpha>>32)&255);
+            d[20]=unsigned(tex0&0x3fff)*64;d[21]=unsigned((tex0>>14)&63)*64;d[22]=format;
+            d[23]=1u<<((tex0>>26)&15);d[24]=1u<<((tex0>>30)&15);d[25]=std::uint32_t(clamp);d[26]=std::uint32_t(clamp>>32);
+            d[27]=unsigned((test>>1)&7);d[28]=unsigned((tex0>>35)&3);d[29]=flat_fragment;
+            d[30]=a.rgba;d[31]=b.rgba;d[32]=c.rgba;d[33]=a.z;d[34]=b.z;d[35]=c.z;put64(36,std::uint64_t(area));
+            return gs_triangle_accelerator->render_triangle(job,vram);
+        };
+        const auto submitted=submit();
+        if(submitted)return true;
     }
     if(gs_sprite_accelerator)gs_sprite_accelerator->flush();
     const auto triangle_write_pages=gs_raster_write_pages(*this,context,clipped_left,first_covered_y,clipped_right+1,clipped_bottom+1);
@@ -1545,7 +1815,7 @@ bool GsRegisterState::rasterize_triangle(const GsDraw& draw) {
     return drawn;
 }
 
-bool GsRegisterState::rasterize_draw(const GsDraw& draw) {
+bool GsRegisterState::rasterize_draw_current(const GsDraw& draw) {
     const auto primitive=[&] {
         if(draw.primitive==0)return rasterize_point(draw);
         if(draw.primitive==1||draw.primitive==2)return rasterize_line(draw);
@@ -1563,10 +1833,14 @@ bool GsRegisterState::rasterize_draw(const GsDraw& draw) {
         ++raster_calls[draw.primitive];
         return result;
     };
-    if(!draw.environment_captured)return dispatch();
+    return dispatch();
+}
+
+bool GsRegisterState::rasterize_draw(const GsDraw& draw) {
+    if(!draw.environment_captured)return rasterize_draw_current(draw);
     const auto live=value;
-    value=draw.environment;
-    try {const auto result=dispatch();value=live;return result;}
+    value=materialize_draw_environment(draw);
+    try {const auto result=rasterize_draw_current(draw);value=live;return result;}
     catch(...) {value=live;throw;}
 }
 
@@ -1574,15 +1848,58 @@ std::size_t GsRegisterState::rasterize_pending_draws() {
     std::size_t completed=0;
     auto* accelerator=gs_sprite_accelerator;
     if(accelerator)accelerator->begin_batch();
+    const auto live=value;
+    if(draw_environment_storage.empty()) {
+        draw_environment_storage.resize(2);draw_environment_base()=live;raster_environment()=live;
+    }
+    const auto first=pending_draw_index();
+    if(!raster_environment_active||raster_environment_draw_index!=first) {
+        raster_environment()=draw_environment_base();raster_environment_event_count=0;
+        raster_environment_draw_index=0;raster_environment_active=true;
+        while(raster_environment_draw_index<first) {
+            const auto& earlier=draws[raster_environment_draw_index];
+            if(earlier.explicit_environment)raster_environment()=*earlier.explicit_environment;
+            else if(earlier.environment_event_count!=(std::numeric_limits<std::uint32_t>::max)()) {
+                if(earlier.environment_event_count<raster_environment_event_count||
+                   earlier.environment_event_count>draw_environment_events.size())
+                    throw std::runtime_error("invalid prior GS draw environment cursor");
+                while(raster_environment_event_count<earlier.environment_event_count) {
+                    const auto& change=draw_environment_events[raster_environment_event_count++];
+                    raster_environment()[change.address]=change.value;
+                }
+            } else raster_environment()=live;
+            ++raster_environment_draw_index;
+        }
+    }
+    value=raster_environment();
+    std::size_t event=raster_environment_event_count;
+    bool runtime_environment=true;
     try {
-    for(auto pending=pending_draw_index();pending<draws.size();++pending) {
+    for(auto pending=first;pending<draws.size();++pending) {
+        const auto& draw=draws[pending];
+        if(draw.explicit_environment){value=*draw.explicit_environment;runtime_environment=false;}
+        else if(draw.environment_event_count!=(std::numeric_limits<std::uint32_t>::max)()) {
+            if(!runtime_environment){value=draw_environment_base();event=0;runtime_environment=true;}
+            if(draw.environment_event_count<event||draw.environment_event_count>draw_environment_events.size())
+                throw std::runtime_error("invalid ordered GS draw environment cursor");
+            while(event<draw.environment_event_count) {
+                const auto& change=draw_environment_events[event++];value[change.address]=change.value;
+            }
+        } else {value=live;runtime_environment=false;}
         // Advance only after the draw returns; an explicit unsupported
         // rasterizer fault leaves the queue position available to inspect.
-        rasterize_draw(draws[pending]);
+        rasterize_draw_current(draw);
+        // HG-ARCH-003: read-only, completed-draw shadow seam. No callback on faults.
+        if(native_indexed_draw_observer)
+            native_indexed_draw_observer->observe_completed_draw(draw,value,*this);
         ++rasterized_draw_count;
         ++completed;
+        raster_environment()=value;raster_environment_event_count=event;
+        raster_environment_draw_index=pending+1;
+        raster_environment_active=runtime_environment;
     }
-    } catch(...) {if(accelerator)accelerator->end_batch();throw;}
+    } catch(...) {value=live;if(accelerator)accelerator->end_batch();throw;}
+    value=live;
     if(accelerator)accelerator->end_batch();
     return completed;
 }

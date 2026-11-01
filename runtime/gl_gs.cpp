@@ -2,7 +2,9 @@
 #include "gl_gs.hpp"
 #include "gl_triangle_shader.hpp"
 #include "hg/gs_triangle_acceleration.hpp"
+#include "hg/native_psmt8_cache.hpp" // HG-ARCH-008: optional resident epoch observer.
 #include <bitset>
+#include <chrono>
 #include <cstring>
 
 namespace hg {
@@ -198,6 +200,17 @@ class Accelerator final:public GsSpriteAccelerator,public GsTriangleAccelerator 
     std::uint32_t* queued_vram=nullptr;
     std::uint32_t* resident_vram=nullptr;
     bool resident=false,native_relaxed=false;
+    // HG-PERF-115: resident flushes defer glGetError to the next coherence point
+    // (download/finish/owner switch/teardown), before any CPU-visible GPU output.
+    bool gl_errors_unchecked=false;
+    void check_gl_errors(const char* failure) {
+        gl_errors_unchecked=false;
+        if(glGetError()!=GL_NO_ERROR){
+            if(native_epochs)native_epochs->invalidate_unknown();
+            throw std::runtime_error(failure);
+        }
+    }
+    std::shared_ptr<NativeVramPageEpochs> native_epochs; // Null in production.
     struct Observer final:GsMemoryObserver {
         Accelerator* target;
         explicit Observer(Accelerator* owner):target(owner){}
@@ -209,6 +222,9 @@ class Accelerator final:public GsSpriteAccelerator,public GsTriangleAccelerator 
         }
         bool masked_write(std::uint32_t* p,const std::uint32_t* indices,const std::uint32_t* values,std::size_t count,std::uint32_t mask) override {
             return target&&target->masked_write(p,indices,values,count,mask);
+        }
+        bool discard_write(std::uint32_t* p,std::size_t first,std::size_t count) override {
+            return target&&target->discard_write(p,first,count);
         }
         void forget(std::uint32_t* p) noexcept override {if(target)target->forget_memory(p);}
     };
@@ -235,7 +251,11 @@ class Accelerator final:public GsSpriteAccelerator,public GsTriangleAccelerator 
             for(auto page=first;page<p;++page)uploaded_valid.set(page);
             downloaded_bytes+=std::uint64_t(p-first)*8192;
         }
-        if(glGetError()!=GL_NO_ERROR)throw std::runtime_error("GS resident readback failed");
+        check_gl_errors(gl_errors_unchecked?"GS compute dispatch/readback failed":"GS resident readback failed");
+        // The readback, unlike glFlush, is a completed visibility fence for
+        // every pending producer of these exact pages. Multiple enqueues may
+        // collapse to this single physical transfer.
+        if(native_epochs)native_epochs->gpu_completed_visible_pages(dirty);
         gpu_dirty&=~dirty;
         readback_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
     }
@@ -246,7 +266,9 @@ class Accelerator final:public GsSpriteAccelerator,public GsTriangleAccelerator 
         if((visible&queued_writes).any()||(writes&queued_reads).any())flush();
         const auto dirty=visible&gpu_dirty;
         if(dirty.any()){++bulk_dirty_scopes;bulk_dirty_pages+=dirty.count();}
-        download(visible);cpu_dirty|=writes;return true;
+        download(visible);cpu_dirty|=writes;
+        if(native_epochs)native_epochs->cpu_mutable_pages(writes);
+        return true;
     }
     void cpu_access(std::uint32_t* p,std::size_t first,std::size_t count,bool write) {
         if(p!=resident_vram)return;
@@ -257,12 +279,15 @@ class Accelerator final:public GsSpriteAccelerator,public GsTriangleAccelerator 
             // Order every real dependency before a read or read/modify/write.
             if(queued_writes[page]||(write&&queued_reads[page]))flush();
             if(gpu_dirty[page]){std::bitset<512> one;one.set(page);download(one);}
-            if(write)cpu_dirty.set(page);
+            if(write){cpu_dirty.set(page);if(native_epochs)native_epochs->cpu_mutable_access(first,count);}
             return;
         }
         const auto affected=pages(first,count);
         if((affected&queued_writes).any()||(write&&(affected&queued_reads).any()))flush();
-        download(affected);if(write)cpu_dirty|=affected;
+        download(affected);if(write){
+            cpu_dirty|=affected;
+            if(native_epochs)native_epochs->cpu_mutable_access(first,count);
+        }
     }
     void clear_masked() noexcept {
         if(!masked_queued)return;
@@ -278,6 +303,7 @@ class Accelerator final:public GsSpriteAccelerator,public GsTriangleAccelerator 
         // combine masks; no two shader invocations perform competing RMWs.
         if(!commands.empty()||!triangle_data.empty()||queued_data.size()+count*3>1024*1024)flush();
         if(masked_index.empty())masked_index.resize(1024*1024);
+        if(native_epochs){std::bitset<512> dirty;dirty.set(page);native_epochs->gpu_queued_write(dirty);}
         masked_queued=true;queued_vram=p;queued_writes.set(page);queued_reads.set(page);
         for(std::size_t i=0;i<count;++i){
             auto& slot=masked_index[indices[i]];
@@ -286,24 +312,43 @@ class Accelerator final:public GsSpriteAccelerator,public GsTriangleAccelerator 
         }
         masked_words+=count;return true;
     }
+    bool discard_write(std::uint32_t* p,std::size_t first,std::size_t count) {
+        if(!resident||p!=resident_vram||!count||first%2048||count%2048||first+count>1024*1024)return false;
+        const auto affected=pages(first,count);
+        if((affected&queued_writes).any()||(affected&queued_reads).any())flush();
+        gpu_dirty&=~affected;cpu_dirty|=affected;uploaded_valid&=~affected;
+        // HG-ARCH-009: queued users were submitted above; old GPU output for
+        // these pages is never downloaded, so stop counting it as pending.
+        if(native_epochs){native_epochs->gpu_superseded_pages(affected);native_epochs->cpu_mutable_pages(affected);}
+        return true;
+    }
     void forget_memory(std::uint32_t* p) noexcept {
         // Destroying/replacing a memory owner discards its unobservable storage.
         // Submitted GL commands own their buffer storage, never this host pointer.
         if(p!=resident_vram)return;
+        if(native_epochs)native_epochs->invalidate_unknown();
         if(queued_vram==p){clear_masked();commands.clear();queued_data.clear();clear_triangles();queued_reads.reset();queued_writes.reset();queued_vram=nullptr;}
         resident_vram=nullptr;cpu_dirty.reset();gpu_dirty.reset();uploaded_valid.reset();
     }
     void select_memory(std::uint32_t* p) {
         if(p==resident_vram)return;
-        flush();download(gpu_dirty);resident_vram=p;cpu_dirty.set();gpu_dirty.reset();
+        flush();download(gpu_dirty);
+        if(gl_errors_unchecked)check_gl_errors("GS compute dispatch/readback failed");
+        resident_vram=p;cpu_dirty.set();gpu_dirty.reset();
         uploaded_copy.resize(1024*1024);uploaded_valid.reset();
+        // A new owner is fully CPU-visible after old-owner flush/download;
+        // CPU write notifications are already installed on this observer.
+        if(native_epochs)native_epochs->begin_after_coherent_fence();
     }
     void clear_triangles() {
         triangle_data.clear();for(auto& tile:tile_jobs)tile.clear();
         triangle_frames.reset();triangle_depths.reset();triangle_textures.reset();triangle_rows=0;tile_entries=0;
     }
 public:
-    explicit Accelerator(bool keep_resident,bool triangles,bool relaxed):resident(keep_resident),native_relaxed(relaxed),observer(std::make_shared<Observer>(this)) {
+    bool accepts_native_float_stq() const noexcept override {return false;}
+    explicit Accelerator(bool keep_resident,bool triangles,bool relaxed,std::shared_ptr<NativeVramPageEpochs> epochs):
+        resident(keep_resident),native_relaxed(relaxed),native_epochs(std::move(epochs)),observer(std::make_shared<Observer>(this)) {
+        if(native_epochs&&!resident)throw std::invalid_argument("Native page epochs require resident GL");
         const auto shader=compile_shader(gl,compute_shader,source);
         program=gl.create_program();gl.attach_shader(program,shader);gl.link_program(program);gl.delete_shader(shader);
         GLint okay=0;gl.get_program_iv(program,GL_LINK_STATUS_,&okay);
@@ -335,6 +380,7 @@ public:
     ~Accelerator() override {
         try {finish();}catch(const std::exception& e){std::cerr<<"GS coherence cleanup failed: "<<e.what()<<'\n';std::terminate();}
         observer->target=nullptr;
+        if(native_epochs)native_epochs->invalidate_unknown(); // No longer observing CPU writes.
         std::cerr<<"GS GPU sprites: draws="<<draws<<" pixels="<<pixels<<" alias_rejections="<<alias_rejections
                  <<" flushes="<<flushes<<" flush_ns="<<flush_ns<<" upload_bytes="<<uploaded_bytes
                  <<" download_bytes="<<downloaded_bytes<<" readback_ns="<<readback_ns
@@ -347,7 +393,10 @@ public:
     }
     void begin_batch() override {++batch_depth;}
     void end_batch() override {if(batch_depth)--batch_depth;if(!resident)flush();}
-    void finish() override {flush();if(resident)download(gpu_dirty);}
+    void finish() override {
+        flush();
+        if(resident){download(gpu_dirty);if(gl_errors_unchecked)check_gl_errors("GS compute dispatch/readback failed");}
+    }
     void flush() override {
         if(commands.empty()&&triangle_data.empty()&&!masked_queued)return;
         const auto start=std::chrono::steady_clock::now();
@@ -399,7 +448,10 @@ public:
             downloaded_bytes+=std::uint64_t(page-first)*8192;
         }
         clear_masked();commands.clear();queued_data.clear();if(!triangle_data.empty())clear_triangles();queued_reads.reset();queued_writes.reset();queued_vram=nullptr;
-        if(glGetError()!=GL_NO_ERROR)throw std::runtime_error("GS compute dispatch/readback failed");
+        // HG-PERF-115: the resident post-glFlush poll blocked stage C in the
+        // driver (~14.5% of its samples); nonresident flushes read back here.
+        if(resident)gl_errors_unchecked=true;
+        else check_gl_errors("GS compute dispatch/readback failed");
         ++flushes;flush_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
     }
     bool render(const GsSpriteJob& job,GsLocalMemory& memory) override {
@@ -487,6 +539,7 @@ public:
         if(indexed){job_data[palette_offset+256]=job.texture_base;job_data[palette_offset+257]=job.texture_width;}
         if((queued_vram&&queued_vram!=vram)||queued_data.size()+words>1024*1024||commands.size()>=256)flush();
         job_data[21]=GLuint(queued_data.size()+palette_offset);
+        if(native_epochs)native_epochs->gpu_queued_write(writes); // Before original GPU dispatch.
         queued_vram=vram;queued_writes|=writes;queued_reads|=reads;
         commands.push_back({GLuint(queued_data.size()),job.width,job.height});
         queued_data.insert(queued_data.end(),job_data.begin(),job_data.begin()+words);
@@ -519,26 +572,32 @@ public:
         mark(reads,d[20],d[20]+((maxx>>xs)+(maxy>>ys)*(d[21]>>xs))*2048+2047);
         }
         const auto writes=frames|((d[15]&128)?depths:std::bitset<512>{});
+        // HG-PERF-120: an own-pixel feedback job reads only the frame word its
+        // invocation later writes; tile lists keep per-pixel submission order.
+        if(d[15]&GsTriangleJob::self_feedback_flag)reads.reset();
         if((reads&writes).any())return false;
         const std::array<std::uint32_t,3> mapping{d[10],d[11],d[12]};
-        if(!commands.empty()||(!triangle_data.empty()&&(mapping!=triangle_mapping||
+        const bool needs_flush=!commands.empty()||(!triangle_data.empty()&&(mapping!=triangle_mapping||
             (reads&queued_writes).any()||(writes&triangle_textures).any()||
             (frames&triangle_depths).any()||(depths&triangle_frames).any()))||
-            triangle_data.size()>=1024*320||tile_entries>=512*1024)flush();
+            triangle_data.size()>=1024*320||tile_entries>=512*1024;
+        if(needs_flush)flush();
         if(resident)memory.observe(observer);
         auto* vram=resident?memory.backend_data():memory.data();
         if(resident)select_memory(vram);
         if(queued_vram&&queued_vram!=vram)flush();
+        if(native_epochs)native_epochs->gpu_queued_write(writes); // Include depth writes.
         queued_vram=vram;queued_reads|=reads|depths;queued_writes|=writes;
         triangle_mapping=mapping;triangle_frames|=frames;triangle_depths|=depths;triangle_textures|=reads;
         const auto offset=GLuint(triangle_data.size());
         triangle_data.insert(triangle_data.end(),d.begin(),d.end());
         if(native_relaxed&&!(d[GsTriangleJob::FLAGS]&GsTriangleJob::untextured_flag)) {
+            const bool prepacked=(d[GsTriangleJob::FLAGS]&GsTriangleJob::native_float_stq_flag)!=0;
             triangle_data[offset+GsTriangleJob::FLAGS]|=GsTriangleJob::native_float_stq_flag;
             const unsigned coefficients[]{GsTriangleJob::S,GsTriangleJob::S+2,GsTriangleJob::S+4,
                 GsTriangleJob::T,GsTriangleJob::T+2,GsTriangleJob::T+4,
                 GsTriangleJob::Q,GsTriangleJob::Q+2,GsTriangleJob::Q+4};
-            for(const auto at:coefficients) {
+            if(!prepacked)for(const auto at:coefficients) {
                 const auto encoded=std::uint64_t(triangle_data[offset+at])|
                     (std::uint64_t(triangle_data[offset+at+1])<<32);
                 std::int64_t coefficient=0;std::memcpy(&coefficient,&encoded,sizeof(coefficient));
@@ -557,6 +616,9 @@ public:
     }
 };
 }
-std::unique_ptr<GsSpriteAccelerator> make_gl_sprite_accelerator(bool resident,bool triangles,bool native_relaxed){return std::make_unique<Accelerator>(resident,triangles,native_relaxed);}
+std::unique_ptr<GsSpriteAccelerator> make_gl_sprite_accelerator(bool resident,bool triangles,bool native_relaxed,
+        std::shared_ptr<NativeVramPageEpochs> native_epochs){
+    return std::make_unique<Accelerator>(resident,triangles,native_relaxed,std::move(native_epochs));
+}
 }
 

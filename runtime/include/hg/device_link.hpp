@@ -12,7 +12,7 @@ namespace hg {
 // before any guest observation of that state. No guest clock or ordering change.
 enum class DeviceKind : std::uint32_t {
     vif_qword,vif_tag,gif_qword,gs_privileged,gs_csr_events,gs_imr,vif_register,gif_control,rasterize,call,
-    gif_words // Internal: a = qword count; the payload entries follow.
+    gif_words // Internal: a = owned contiguous word-block pointer; b = qword count.
 };
 struct DeviceCommand {std::uint64_t a=0,b=0;std::uint32_t kind=0,x=0;};
 

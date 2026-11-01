@@ -1,5 +1,30 @@
 # Haunting Ground static recompilation
 
+An independent ahead-of-time static recompilation of Haunting Ground (USA, SLUS-210.75)
+for Windows: the original PS2 game code is translated to native code at build time and
+runs on our own runtime services, with OpenGL graphics. It is not an emulator and has no
+interpreter or JIT.
+
+**This repository contains no game files.** No ISO, ELF, IOP modules, BIOS, memory cards
+or generated game-derived source. You need your own legally obtained copy of the game;
+the build translates it locally. Everything derived from the game stays in ignored
+folders (`Haunting Ground (USA)/`, `out/`, `build/`, `builds/`).
+
+## Current status
+
+Playable on the development PC, but not finished and not yet played start to finish.
+
+- Speed: 30 fps on the heavy benchmark route on the development PC.
+- Game logic: 12 sample save slots match the PCSX2 reference at frame 3000 (about 100
+  seconds each) and one matches through frame 5000, with a comparison-only switch on.
+- Known issues: right-channel music static after some music underruns at track changes;
+  the last-bit rules of multiply, divide and square root are not yet hardware-exact.
+- Windows only for now; Linux is not currently verified.
+
+Detailed state and evidence: `docs/PROGRESS.md`. Older notes further down this README are
+historical and may be out of date.
+
+
 Current native viewer: build target `hg_game` (requires generated translations and
 OpenGL dependencies), then run `build/Release/hg_game.exe`. It runs the AOT game
 in-process and presents directly through OpenGL; the GS rasterizer remains on the
@@ -353,6 +378,28 @@ with a boundary at `0x001001c8`. `--verify-prefix` checks this boundary and retu
 operation. Use `--elf path` for an input outside the default dump folder.
 This program has no game asset loader or full kernel/device implementation.
 Do not distribute generated source, ELF files or game assets with the toolchain.
+
+## Hardware captures and oracle checks
+
+Float rules are checked against our own capture programs run on a real PS2
+(`tools/hwtest/`, built with the ps2sdk Docker image `ps2dev/ps2dev:v2.0.0`, e.g.
+`docker run --rm -v <tools/hwtest>:/src -w /src ps2dev/ps2dev:v2.0.0 make EE_BIN=struct_capture.elf EE_OBJS=struct_capture.o`).
+`struct_capture` embeds our IOP module `spu2probe/` (SPU2 envelope probe):
+`make EE_BIN=struct_capture.elf EE_OBJS="struct_capture.o spu2probe_irx.o"`.
+Each writes a `.BIN` to `mc0:/HGFPU/`; captures stay out of version control.
+`build/Release/fpu_vector_check <vectors-dir> RESULTS.BIN VU0.BIN` compares our model
+with them and `python tools/hwtest/analyze_struct.py STRUCT.BIN` summarizes the
+structured capture. Results and fitted rules are in `docs/SOURCES.md`.
+
+Save-based section checks against the PCSX2 oracle (`docs/ORACLE.md`):
+
+```sh
+HG_CHECK_LIMIT=200000000 HG_CHECK_FRAME=2100 HG_CHECK_DETAIL=1 python tools/oracle/section_check.py 7
+```
+
+Both sides load the same memory-card save and pause at the same game-frame counter
+write (our side: HG-DIAG-124). PCSX2's VU0 adder is not the console's; add
+`HG_PCSX2_VU0_ADD=1` (HG-DIAG-126) only to look past that known emulator difference.
 
 ## Manual function configuration
 

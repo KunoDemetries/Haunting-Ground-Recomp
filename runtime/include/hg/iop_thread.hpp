@@ -18,6 +18,14 @@ template<class Run> bool service_iop_thread(IopState& s,Run run,std::uint64_t qu
         if(t.ready && t.priority<priority){chosen=index;priority=t.priority;}
         if(++index==thread_count)index=0;
     }
+    // THREADMAN has no time slicing: a running worker keeps the CPU until it blocks,
+    // yields or a strictly higher-priority worker becomes ready. Rotating equal
+    // priorities every quantum let CRI's report thread run between its copy thread's
+    // left and right blocks (right-channel music static, docs/PROGRESS.md 2026-10-25).
+    if(s.owner_thread && s.owner_thread<=thread_count) {
+        const auto& owner=s.threads[s.owner_thread-1];
+        if(owner.ready && !(owner.delayed) && owner.priority<=priority)chosen=s.owner_thread-1;
+    }
     if(s.locked_thread)chosen=s.locked_thread-1;
     if(chosen==s.threads.size())return false;
     if(!s.threads[chosen].initialized) {
@@ -34,6 +42,7 @@ template<class Run> bool service_iop_thread(IopState& s,Run run,std::uint64_t qu
     if(s.threads[chosen].context.pc==0x1f0020) {
         s.threads[chosen].ready=false;s.thread_cursor=(chosen+1)%s.threads.size();return false;
     }
+    const auto reschedules_before=s.thread_reschedule_count;
     const auto saved=s.save_cpu();s.current_thread=std::uint32_t(chosen+1);
     s.restore_cpu(s.threads[chosen].context);
     for(std::uint64_t step=0;step<quantum;++step) {
@@ -54,6 +63,11 @@ template<class Run> bool service_iop_thread(IopState& s,Run run,std::uint64_t qu
     // an original wait boundary releases the CPU to another ready worker;
     // interrupt delivery itself remains masked.
     s.locked_thread=(!s.interrupts_enabled && s.threads[chosen].ready)?std::uint32_t(chosen+1):0u;
+    // Ownership survives only an uninterrupted quantum; blocking, exiting and explicit
+    // reschedule requests (threadman_reschedule clears owner_thread) release it.
+    const bool still_running=s.threads[chosen].ready && s.pc!=0x1f0020;
+    if(!still_running)s.owner_thread=0;
+    else if(s.thread_reschedule_count==reschedules_before)s.owner_thread=std::uint32_t(chosen+1);
     s.restore_cpu(saved);s.current_thread=0;s.thread_cursor=(chosen+1)%s.threads.size();
     return true;
 }

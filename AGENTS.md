@@ -71,6 +71,7 @@ interpreter, JIT, emulator execution backend, or an emulator dependency.
   new evidence or a relevant change justifies them. Speed must not weaken correctness,
   independence constraints or explicit-stop diagnostics. Report substantive runtime
   progress and remaining blockers concisely.
+- 2026-10-11: user requested work "until fps is 30". Met for the pinned heavy route on the dev host (paced 30, unlimited ~42, byte-exact). Broader scene/host qualification is pending; see PROGRESS.
 - Current user priority (2026-09-23): pursue renderer throughput using the newly authorized native-renderer freedom before returning to VU/EE micro-optimization. Preserve game-visible behavior and visual output, use the existing strict renderer/`v1/` as reference, and prefer structural GPU-native wins over more exact-GS micro-tuning. The in-process OpenGL host and direct presentation/input remain required.
 
 ## Active work and continuation
@@ -109,6 +110,9 @@ before acting; dated historical notes do not override newer verified state.
 2. `README.md`: build and analysis workflow.
 3. `docs/ARCHITECTURE.md`: execution model and staged roadmap.
 4. `docs/SOURCES.md`: specification sources and provenance rules.
+5. `docs/WORLD_EDITOR.md`: standalone world editor plan and room/texture/geometry format evidence.
+6. `docs/NATIVE_RENDERER_PLAN.md`: 2026-10-11 independent research and native renderer draw-seam architecture proposal; no performance claim or external renderer implementation.
+7. 2026-10-11 HG-ARCH-007/008 renderer-native progress: `native_psmt8_texture.hpp` stages only observer-coherent 8 KiB source pages; `native_psmt8_cache.hpp` tracks source generations and completed-readback GPU producer pages; optional resident `gl_gs.cpp` observer forwards CPU writes, GPU enqueue and completed readback, but the factory epoch parameter defaults null. HG-ARCH-009: `gs_gpu_tests --native-epochs` (also part of every `--resident` run) qualifies the live resident GL hook in 14 cases; discarded pages are superseded rather than left pending. HG-ARCH-010: `runtime/gl_native_indexed.{hpp,cpp}` (gs_gpu_tests only) holds GL_R8UI indices and palette SSBOs keyed by minted `content_id`/palette `identity`; `gs_gpu_tests --native-texture` gives 50,412 exact point samples. Native triangle pixel/Z parity remains unqualified. Build tests from Git Bash with `MSYS_NO_PATHCONV=1 cmake --build build --config Release --target <t> -- -m:1`. Preserve the existing GL observer/barriers and frozen `v1/`.
 
 ## Map
 - `runtime/include/hg/controls_panel.hpp`: host-only F1 keyboard-reference panel,
@@ -130,6 +134,16 @@ before acting; dated historical notes do not override newer verified state.
   A source-only revert or a test-only build is not a current game executable.
   Manifest hashing is outside native timing; inspect intended machine-code changes
   separately and regenerate after emitter/config changes before building.
+- Performance benchmark (HG-PERF-114): pinned `gameplay180m_authentic` inputs run
+  threaded (no `--profile`) with `--frame-rate-probe` (HG-DIAG-114). The metric is the
+  30-writer checkpoint rate over 150M–179M (839 writers; report median/p10/count
+  below 29.9 across several interleaved pairs; host variance is large). `--profile`
+  forces synchronous devices and understates threaded play about 2×. Verified
+  2026-10-11 on EXE e053f17b…: unlimited ~42/s, `--realtime` locked at 30. Control refreshed 2026-10-14
+  (`20261014-control-73201b00`) after the IOP masking/timer fixes changed guest timing.
+  `runtime/host_sampler.cpp` (HG-DIAG-115, `HG_SAMPLE_FILE`, window
+  `HG_SAMPLE_FROM/TO`) plus CMake `-DHG_HOST_SYMBOLS=ON` (PDBs, profiling only;
+  production OFF) give per-thread stack attribution.
 - `docs/DIAGNOSTICS.md`: diagnostic/probe inventory, activation, performance cost
   and cleanup criteria; distinguish observation from guest-affecting experiments.
 - `tools/hgtool/`: independent ELF parser, EE decoder, CFG/callback discovery, C++ emitter.
@@ -150,11 +164,16 @@ before acting; dated historical notes do not override newer verified state.
   consuming boundaries; preserve lower operations, Q/P timing, readiness and
   checked CFG fallback. HG-DIAG-061 / HG-LEARN-053;262144 arithmetic and81920
   full-state/fault comparisons. Paired eight-lane follow-up062 was rejected.
-- `tools/hgtool/vu_emit.py`: omit SQ snapshots only for nonoverlapping VF lanes;
+- `tools/hgtool/vu_emit.py`: VU1 program identity is per activation entry over its reachable pairs (HG-LEARN-090). Omit SQ snapshots only for nonoverlapping VF lanes;
   conservative basic-block VF readiness proof skips already-satisfied guards,
   retaining original checks after clock wrap. All pipeline advances remain.
   `tests/generate_vu_readiness.py` / `vu_readiness_tests` compares emitted baseline
   and optimized CFGs, including wrap/branch/fault states. HG-LEARN-031/033.
+- `runtime/include/hg/gs_math.hpp` / `runtime/gs.cpp`: prepared triangle S/T/Q
+  coefficient bounds use exact native 64x64->128 product overflow checks on
+  MSVC x64 and GCC/Clang, with the quotient definition as portable fallback.
+  This removes up to nine variable divisions per textured triangle without
+  changing readiness, admission or faults; HG-DIAG-102 / HG-LEARN-081.
 - `runtime/vu_xyz.cpp` / `runtime/include/hg/vu_xyz.hpp`: scalar XYZ broadcast
   helpers selected by AOT VU emission; exact arithmetic and original fault fallbacks.
   No dynamic decoding. Small measured benefit; see PERFORMANCE/HG-LEARN-025.
@@ -169,22 +188,34 @@ before acting; dated historical notes do not override newer verified state.
 - `runtime/gs.cpp` / `gl_gs.cpp` / `gs_memory.hpp`: resident PSMT8 masked-word
   uploads merge repeated bit writes before unique-word GPU dispatch. CPU consumers,
   later draws, copy and teardown retain coherence; CPU-owned pages use scalar
-  stores. Validated1042 GPU cases per mode and original captures; HG-LEARN-030.
+  stores. Large complete IMAGE runs instead materialize each physical page once
+  and apply ordered lane writes directly; proven complete aligned replacements
+  may discard old resident contents after ordering prior GPU users (HG-LEARN-080).
+  Short/partial runs retain masked dispatch. Validated differential cases and
+  exact original captures.
 - `runtime/include/hg/gs_raster_pages.hpp`: conservative clipped frame/depth
   write-page bounds for CPU sprites/triangles. Full readback and eager GPU flush
   remain; texture-read narrowing/deferred flush were rejected (HG-FAIL-018).
 - `tools/hg.py analyze --triage`: groups boundaries and reports installed object-table
   candidates with store provenance, slot offsets and compiled/missing targets.
   Bounded pointer runs require independent extent/live-use verification; never auto-root them.
+  Scoped exception (user-requested 2026-10-11): installer-proven object-table targets
+  that pass automated entry/body checks were batch-rooted (`vtable_batch_*`, 2,720
+  targets; see PROGRESS). Rerun the same checks for future batches; never root
+  rejected targets blindly. User approval 2026-10-14 extends this to unreferenced
+  frame-allocating prologues that pass the same checks (`sweep_*`, 740), conditional on
+  keeping 30 FPS on the pinned benchmark; `analysis.max_instructions` must stay above
+  the executable segment (emit fails on exhaustion).
 - `config/haunting_ground_us.toml`: executable identity, manual functions/targets, pointer tables and static overlays.
 - `runtime/include/hg/`: portable state, memory, FPU, timers, INTC and DMA/SIF0 primitives, including checked EE word/doubleword unaligned merges.
 - `runtime/device_thread.cpp` / `device_link.hpp`: host device threads (VIF1+VU1 stage,
   GIF+GS+GL stage) fed by ordered SPSC rings from the EE thread; joins only at guest
   observations; IMR/CSR/BUSDIR mirror; `--sync-devices`/`HG_SYNC_DEVICES=1` fallback.
   `tests/device_thread_tests.cpp` checks sync equivalence. HG-LEARN-076.
-- `runtime/include/hg/vu1_spec.hpp` / `device_thread.cpp` `VuJob`: opt-in speculative
-  parallel VU1 activations (`HG_VU_WORKERS=N`, best measured N=3 on 8 CPUs; default
-  off). Workers run the same AOT programs on snapshots; stage B commits in order,
+- `runtime/include/hg/vu1_spec.hpp` / `device_thread.cpp` `VuJob`: speculative
+  parallel VU1 activations, **default on since HG-PERF-119** (3 workers with ≥8 host
+  threads, 2 with ≥6, else 0; `HG_VU_WORKERS=N` overrides, `0` disables). Required
+  for 30 FPS heavy gameplay (without: ~24/s). Workers run the same AOT programs on snapshots; stage B commits in order,
   validating lane-granular memory reads (`Vu1AccessLog`), emitter live-in VF/VI/ACC/I
   (`vu1_aot_spec_info`), consumed clip bits, Q/P and readiness, else re-executes
   exactly. Transport reads/calls drain jobs (fault ordering). HG-LEARN-077.
@@ -198,9 +229,9 @@ before acting; dated historical notes do not override newer verified state.
   bounded source chains; fromSPR chain/interleave and cycle-accurate arbitration
   remain unfinished.
 - `runtime/system_diagnostic.cpp` / `runtime/include/hg/system.hpp`: connected EE/IOP startup, checked IOP reboot, original service startup and FIFO servicing; `--verify-loadfile` checks native LOADFILE RPC registration before reboot.
-- `runtime/include/hg/iop_interrupt.hpp`: cooperative AOT IOP DMA interrupt delivery.
+- `runtime/include/hg/iop_interrupt.hpp`: cooperative AOT IOP DMA/CDVD/SIO2/timer interrupt delivery, gated by `iop_cpu_interruptible` (no delivery while a masked runnable worker owns the CPU; HG-LEARN-092).
 - `runtime/include/hg/iop_reboot.hpp`: validated native reboot request callback; lifecycle remains in progress.
-- `runtime/include/hg/iop_thread.hpp`: cooperative native worker scheduling and reserved stacks.
+- `runtime/include/hg/iop_thread.hpp`: cooperative native worker scheduling and reserved stacks. THREADMAN owner rule (2026-10-25): the running worker keeps the CPU against equal-priority ready workers until it blocks, yields (reschedule) or exits; no time slicing.
 - `runtime/include/hg/iop.hpp`: IOP state/services, event wakeups, partial CD/DVD command protocol and RTC profile.
 - Buffered IOP inputs retain verified source bytes through `iop_image.cpp`; AOT entry hooks select static allocation plans before the original MODLOAD body executes.
 - Connected MODLOAD scratch, worker stacks and HEAPLIB arenas use original
@@ -211,8 +242,8 @@ before acting; dated historical notes do not override newer verified state.
   with original IRQ17 delivery. `controller.hpp` / `runtime/controller.cpp` retain
   virtual DualShock2 config, axes, pressure and motor-map state; partial reply
   a one-block absent-card DMA probe is bounded. Partial reply masks, general
-  DMA and saves remain unfinished; native keyboard movement is user-verified; gamepad input awaits verification.
-- SPU2 in `iop.hpp` / `spu2_input.hpp`: bounded one-shot DMA and paced stereo input halves; raw input capture is separate from unfinished synthesis/mixing/output.
+  DMA and saves remain unfinished; native keyboard movement and gamepad input are user-verified (gamepad 2026-10-13).
+- SPU2 in `iop.hpp` / `spu2_input.hpp` / `spu2_voices.hpp`: bounded one-shot DMA, paced stereo input halves, and 48-voice synthesis/mixing (ADPCM, Gaussian, ADSR, sweep, noise, loop/ENDX, VMIX/MMIX, core0->core1) feeding the speaker; reverb (Hall network, ESA work area); sound-data output areas not synthesized (HG-DIAG-119); `spu2_voice_tests`. IOP timers honor mode bit 3 reset-at-target (SNDDRV 240 Hz sequencer clock).
 - `runtime/include/hg/ee_interrupt.hpp`: resumable native EE SIF0 callback dispatch/context restoration.
 - `runtime/include/hg/display_timing.hpp`: configured interlaced NTSC field edges;
   `ee_interrupt.hpp` now also dispatches ordered EE INTC callback chains.
@@ -253,6 +284,30 @@ before acting; dated historical notes do not override newer verified state.
   Bilinear UV wrapping/rounding oracle evidence is recorded in `docs/ORACLE.md`.
   Completed host transfers retain measured surplus-payload state separately
   from uninitialized/cancelled transfers; limitations are in `docs/ORACLE.md`.
+- `editor/`: standalone world editor (user requirement 2026-10-19: separate from the game).
+  `hg_world_editor` (GLFW/OpenGL, CMake `HG_WORLD_EDITOR`) reads the user's DATA.CVM or
+  .iso read-only and links no game runtime; `editor/hgworld/` holds the Python reference
+  parsers/exporters (outputs outside the repo or under `out/`). `editor/src/edit.hpp` (structural
+  add/remove, resizable rooms), `library.hpp` (object library), `character.hpp` (PCK character models as library entries), `ui.hpp`/`font5x7.hpp` (own 2D UI).
+  Plan, stages and format
+  evidence: `docs/WORLD_EDITOR.md`. Getting edits into the game needs a host file-override
+  hook that is not built; ask the user before changing the game host for it.
+- `tools/naming/`: evidence-only function naming (EE self-naming strings + syscall wrappers;
+  IOP export/import tables) from `ps2tek_names.json`; outputs in ignored `out/`. `hg.py emit`
+  embeds an EE symbol table (`runtime/include/hg/symbols.hpp`) used only by stop messages.
+  Never assign a name without evidence; record the evidence with each name.
+- `tools/oracle/`: PCSX2 memory-oracle drivers (`pcsx2_drive.py` PINE/DebugServer/keys;
+  `section_check.py` save-slot checks that pause both sides at the same frame-counter write;
+  `watch_trace.py`). Our side uses HG-DIAG-124/125. PCSX2 is not hardware-exact for VU0 adds
+  or DIV/SQRT rounding (`docs/ORACLE.md`); HG-DIAG-126 `HG_PCSX2_VU0_ADD=1` mirrors its VU0
+  adder for comparisons only. `tools/saves/`: .max unpacker and memory-card injector.
+- `tools/hwtest/`: our ps2sdk capture programs for the user's real PS2 (`fpu_capture.c`,
+  `vu0_capture.c`, `struct_capture.c` with the embedded IOP SPU2 envelope probe `spu2probe/`;
+  build in `ps2dev/ps2dev:v2.0.0`), analyzers
+  (`analyze.py`, `analyze_struct.py`) and `tools/fpu_vector_check.cpp`. Captures (*.BIN) and
+  build outputs stay out of version control; results and fitted rules are in `docs/SOURCES.md`.
+- `runtime/include/hg/autopilot.hpp`: HG-DIAG-123 scripted synthetic input; routes from
+  `editor/hgworld/route.py`.
 - `tools/hg.py inspect`: own-decoder instruction/caller views of external native snapshots.
 - `tools/hg.py assets`: read-only CVM/ECMA-119 index and streaming asset hashes.
 - `tools/hg.py modules`: IRX import/export/relocation inventory and build-time relocation dry-run.

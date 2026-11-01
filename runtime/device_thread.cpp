@@ -5,6 +5,7 @@
 #include "hg/device_thread.hpp"
 #include "hg/gs_acceleration.hpp"
 #include "hg/gs_triangle_acceleration.hpp"
+#include "hg/host_sampler.hpp"
 #include "hg/vif.hpp"
 #include "hg/vu1_spec.hpp"
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -128,8 +130,7 @@ struct VuJob {
     };
     Vif1Path work; // Persistent; vu_micro_mem refreshes by generation.
     std::uint64_t micro_generation=~std::uint64_t(0);
-    std::array<std::uint32_t,4096> start_mem{};
-    std::array<std::uint8_t,1024> start_defined{};
+    Vu1MemoryWriteTracker undo; // Dispatch values for lanes the speculative run overwrites.
     Vu1State start; // Committed registers at dispatch: the prediction.
     std::uint32_t top=0;
     std::uint16_t entry=0;
@@ -169,7 +170,6 @@ class DeviceThread final : public DeviceLink, GifForward {
     bool stopped=false;
     std::atomic<std::uint64_t> b_job_wait_ns{0},b_inline_ns{0},b_steal_ns{0}; // HG-DIAG-091: B waiting on VU1 workers (stats only).
     std::uint64_t join_wait_ns=0,space_wait_ns=0,c_space_wait_ns=0,space_waits=0,transport_reads=0;
-
     void c_publish() {
         if(c_produced==c_published)return;
         c_write.store(c_produced,std::memory_order_seq_cst);c_published=c_produced;c.notify();
@@ -194,30 +194,28 @@ class DeviceThread final : public DeviceLink, GifForward {
     void forward_qword(std::uint64_t low,std::uint64_t high) override {
         c_push({low,high,std::uint32_t(DeviceKind::gif_qword),0});
     }
+    using GifWords=std::vector<std::uint32_t>;
+    void forward_words_owned(GifWords&& words) {
+        if(words.empty())return;
+        if(words.size()%4)throw std::logic_error("host GIF block is not qword aligned");
+        auto block=std::make_unique<GifWords>(std::move(words));
+        const auto qwords=block->size()/4;
+        auto* raw=block.release();
+        // One ordered ring command owns the complete contiguous payload. Stage C
+        // consumes and destroys it after applying the existing GIF parser.
+        c_push_raw({std::uint64_t(reinterpret_cast<std::uintptr_t>(raw)),qwords,
+                    std::uint32_t(DeviceKind::gif_words),0});
+    }
     void forward_words(const std::uint32_t* words,std::size_t qwords) override {
+        if(!qwords)return;
         if(out_queue.empty()) {forward_words_raw(words,qwords);return;}
         OutEntry entry;entry.type=OutEntry::kind_words;entry.words.assign(words,words+qwords*4);
         out_queue.push_back(std::move(entry));
     }
     void forward_words_raw(const std::uint32_t* words,std::size_t qwords) {
-        // One header plus inline payload entries, published only as a whole.
-        const auto need=std::uint64_t(qwords)+1;
-        if(need>capacity)throw std::runtime_error("host GIF block exceeds device ring capacity");
-        if(c_produced+need-c_read_cache>capacity) {
-            const auto start=now_ns();
-            c_publish();
-            while(c_produced+need-c_read.load(std::memory_order_acquire)>capacity)std::this_thread::yield();
-            c_read_cache=c_read.load(std::memory_order_acquire);
-            c_space_wait_ns+=now_ns()-start;
-        }
-        c_ring[c_produced&mask]={qwords,0,std::uint32_t(DeviceKind::gif_words),0};
-        for(std::size_t n=0;n<qwords;++n,words+=4) {
-            auto& entry=c_ring[(c_produced+1+n)&mask];
-            entry.a=std::uint64_t(words[0])|(std::uint64_t(words[1])<<32);
-            entry.b=std::uint64_t(words[2])|(std::uint64_t(words[3])<<32);
-        }
-        c_produced+=need;
-        if(c_produced-c_published>=512)c_publish();
+        if(!qwords)return;
+        GifWords block(words,words+qwords*4);
+        forward_words_owned(std::move(block));
     }
     // ---- Speculative VU1 activations (HG_VU_WORKERS; HG-LEARN-077) ----
     struct OutEntry {
@@ -226,7 +224,6 @@ class DeviceThread final : public DeviceLink, GifForward {
         std::vector<std::uint32_t> words;
     };
     std::deque<OutEntry> out_queue;
-    std::vector<std::uint32_t> c_words; // Stage C: one contiguous GIF block.
     Vu1AotExecutor executor=nullptr; // The real AOT executor.
     unsigned worker_count=0;
     std::uint64_t max_inflight=1,next_seq=0,committed_seq=0;
@@ -257,21 +254,8 @@ class DeviceThread final : public DeviceLink, GifForward {
     static inline thread_local DeviceThread* b_owner=nullptr;
 
     VuJob& slot(std::uint64_t seq) {return *slots[seq%slots.size()];}
-    // HG-DIAG-093 (temporary): last scheduler events, dumped on a VU1 fault.
-    struct TraceEvent {char kind;std::uint64_t seq;unsigned entry,tpc,generation,flags;};
-    std::array<TraceEvent,64> trace{};
-    std::uint64_t trace_count=0;
-    void note(char kind,std::uint64_t seq,unsigned entry,unsigned tpc,unsigned flags) {
-        trace[trace_count++%trace.size()]={kind,seq,entry,tpc,unsigned(vif1.host_micro_generation),flags};
-    }
-    void dump_trace() {
-        for(auto n=trace_count>trace.size()?trace_count-trace.size():0;n<trace_count;++n) {
-            const auto& e=trace[n%trace.size()];
-            std::fprintf(stderr,"  HG-DIAG-093 %c seq=%llu entry=0x%x tpc=0x%x gen=%u flags=0x%x\n",e.kind,(unsigned long long)e.seq,e.entry,e.tpc,e.generation,e.flags);
-        }
-    }
-    static void begin_spec(Vu1State& u,Vu1AccessLog& log) {
-        log=Vu1AccessLog{};u.access_log=&log;
+    static void begin_spec(Vu1State& u,Vu1AccessLog& log,Vu1MemoryWriteTracker* undo=nullptr) {
+        log=Vu1AccessLog{};log.undo=undo;u.access_log=&log;
         u.spec_written_vf={};u.spec_written_misc=0;
         u.spec_q_fresh=u.spec_p_fresh=false;u.spec_old_q_read=u.spec_old_p_read=false;
         u.spec_clip_shifts=0;u.spec_clip_set=false;u.spec_clip_old_read=0;
@@ -283,10 +267,10 @@ class DeviceThread final : public DeviceLink, GifForward {
     }
     void run_job(VuJob& job) {
         auto& w=job.work;
-        w.vu_mem=job.start_mem;w.vu_mem_defined=job.start_defined;
+        job.undo.clear();
         // Status starts clear so its sticky bits are exactly this job's; VU code
         // never reads status. MAC starts at an impossible value to detect writes.
-        w.vu1=job.start;begin_spec(w.vu1,job.log);w.vu1.mac=mac_sentinel;w.vu1.status=0;
+        w.vu1=job.start;begin_spec(w.vu1,job.log,&job.undo);w.vu1.mac=mac_sentinel;w.vu1.status=0;
         w.top=job.top;
         job.recorder.words.clear();job.gif=GifPath{};job.gif.forward=&job.recorder;
         job.error=nullptr;
@@ -430,10 +414,10 @@ class DeviceThread final : public DeviceLink, GifForward {
     void flush_job_output(VuJob& job) {
         if(out_queue.empty()||out_queue.front().type!=OutEntry::kind_job)throw std::logic_error("host VU1 output queue out of order");
         out_queue.pop_front();
-        if(!job.recorder.words.empty())forward_words_raw(job.recorder.words.data(),job.recorder.words.size()/4);
+        if(!job.recorder.words.empty())forward_words_owned(std::move(job.recorder.words));
         while(!out_queue.empty()&&out_queue.front().type!=OutEntry::kind_job) {
             auto& entry=out_queue.front();
-            if(entry.type==OutEntry::kind_words)forward_words_raw(entry.words.data(),entry.words.size()/4);
+            if(entry.type==OutEntry::kind_words)forward_words_owned(std::move(entry.words));
             else c_push_raw(entry.command);
             out_queue.pop_front();
         }
@@ -451,16 +435,22 @@ class DeviceThread final : public DeviceLink, GifForward {
             merge(R,job.start,job.work.vu1);
         } else {
             count(reexecute_reasons[std::size_t(reason)]);
-            // Rebuild the exact memory at this activation: the dispatch snapshot
-            // plus each earlier uncommitted job's writes not overwritten by UNPACK.
+            // Rebuild the exact memory at this activation: undo this job's first
+            // speculative writes to recover its dispatch snapshot, then apply
+            // each earlier uncommitted job's writes not overwritten by UNPACK.
             auto& w=job.work;
-            w.vu_mem=job.start_mem;w.vu_mem_defined=job.start_defined;
+            for(const auto raw:job.undo.word_indices) {
+                const auto index=std::size_t(raw);w.vu_mem[index]=job.undo.baseline_words[index];
+            }
+            for(const auto raw:job.undo.vector_indices) {
+                const auto vector=std::size_t(raw);w.vu_mem_defined[vector]=job.undo.baseline_defined[vector];
+            }
             for(auto i=job.first_inflight;i<job.seq;++i) {
                 const auto& predecessor=slot(i);
                 apply_lanes(w.vu_mem,w.vu_mem_defined,predecessor.work,predecessor.dirty.writes,unpack_between(i,job.seq));
             }
             job.dirty.writes=job.log.writes;
-            w.vu1=R;job.log=Vu1AccessLog{};w.vu1.access_log=&job.log;
+            w.vu1=R;begin_spec(w.vu1,job.log);
             w.top=job.top;
             job.recorder.words.clear();job.gif=GifPath{};job.gif.forward=&job.recorder;
             if(job.mscnt)job.entry=R.tpc; // MSCNT resumes at the committed TPC.
@@ -469,12 +459,11 @@ class DeviceThread final : public DeviceLink, GifForward {
             for(unsigned word=0;word<64;++word)job.dirty.writes[word]|=job.log.writes[word];
             end_spec(w.vu1);
             if(failure) {
-                dump_trace();
                 std::fprintf(stderr,"Host VU1 re-executed job fault: seq=%llu entry=0x%x mscnt=%d reason=%d committed_tpc=0x%x\n",
                              (unsigned long long)job.seq,unsigned(job.entry),int(job.mscnt),reason,unsigned(job.start.tpc));
                 // Already-validated XGKICK output precedes the fault, as before.
                 out_queue.pop_front();
-                if(!job.recorder.words.empty())forward_words_raw(job.recorder.words.data(),job.recorder.words.size()/4);
+                if(!job.recorder.words.empty())forward_words_owned(std::move(job.recorder.words));
                 // Sequential state at the fault: this activation's memory and registers.
                 const auto later=unpack_between(job.seq,next_seq);
                 for(unsigned vector=0;vector<1024;++vector) {
@@ -492,7 +481,6 @@ class DeviceThread final : public DeviceLink, GifForward {
         // Memory: this job's lane writes, except what a later UNPACK replaced.
         apply_lanes(vif1.vu_mem,vif1.vu_mem_defined,job.work,job.dirty.writes,unpack_between(job.seq,next_seq));
         record_tpc(job.entry,R.tpc);
-        note('C',job.seq,job.entry,R.tpc,(reason<0?0:0x100|unsigned(reason))|(job.mscnt?1:0));
         flush_job_output(job);
         if(++committed_seq==next_seq)vif1_unpack_log=nullptr;
         return true;
@@ -522,11 +510,10 @@ class DeviceThread final : public DeviceLink, GifForward {
             count(sync_activations);
             try {executor(v,entry,path,state);}
             catch(...) {
-                dump_trace();
                 std::fprintf(stderr,"Host VU1 in-order activation fault: entry=0x%x mscnt=%d inflight=%d\n",unsigned(entry),int(mscnt),int(inflight));
                 throw;
             }
-            record_tpc(entry,v.vu1.tpc);note('S',next_seq,entry,v.vu1.tpc,mscnt?1:0);return;
+            record_tpc(entry,v.vu1.tpc);return;
         }
         while(next_seq-committed_seq>=max_inflight)
             if(!commit_oldest())throw std::runtime_error("host VU1 activation after an earlier failure");
@@ -534,7 +521,9 @@ class DeviceThread final : public DeviceLink, GifForward {
         if(job.micro_generation!=v.host_micro_generation) {
             job.work.vu_micro_mem=v.vu_micro_mem;job.micro_generation=v.host_micro_generation;
         }
-        job.start_mem=v.vu_mem;job.start_defined=v.vu_mem_defined;
+        // Snapshot once, directly into the buffer the worker executes. First
+        // writes are undo-logged only if exact re-execution becomes necessary.
+        job.work.vu_mem=v.vu_mem;job.work.vu_mem_defined=v.vu_mem_defined;
         job.start=view;job.top=v.top;job.entry=entry;job.mscnt=mscnt;job.info=info;
         if(!view_exact_timing) {
             // An uncommitted batch runs for many cycles first: predict that every
@@ -546,7 +535,6 @@ class DeviceThread final : public DeviceLink, GifForward {
         job.seq=next_seq;job.first_inflight=committed_seq;
         job.unpack_after=Vu1UnpackLog{};job.dirty=Vu1AccessLog{};
         vif1_unpack_log=&job.unpack_after;
-        note('D',next_seq,entry,view.tpc,(mscnt?1:0)|(entry?0:2));
         ++next_seq;count(spec_jobs);
         {OutEntry marker;marker.type=OutEntry::kind_job;out_queue.push_back(std::move(marker));}
         if(!entry) {
@@ -573,7 +561,6 @@ class DeviceThread final : public DeviceLink, GifForward {
     static void mscnt_barrier() {
         auto& self=*b_owner;
         if(self.committed_seq<self.next_seq&&self.view_tpc_known) {
-            self.note('M',self.next_seq,self.view.tpc,self.vif1.vu1.tpc,0);
             // activate_mscnt reads the prediction; dispatch restores R.tpc first.
             self.committed_tpc=self.vif1.vu1.tpc;
             self.vif1.vu1.tpc=self.view.tpc;self.mscnt_predicted=true;return;
@@ -650,20 +637,17 @@ class DeviceThread final : public DeviceLink, GifForward {
             delete call;return 1;
         }
         if(kind==DeviceKind::gif_words) {
-            const auto qwords=command.a;
-            if(!c.has_failed()) {
-                try {
-                    c_words.resize(std::size_t(qwords)*4);
-                    for(std::uint64_t n=1;n<=qwords;++n) {
-                        const auto& entry=c_ring[(at+n)&mask];
-                        auto* w=c_words.data()+(n-1)*4;
-                        w[0]=std::uint32_t(entry.a);w[1]=std::uint32_t(entry.a>>32);
-                        w[2]=std::uint32_t(entry.b);w[3]=std::uint32_t(entry.b>>32);
-                    }
-                    gif.submit_words(c_words.data(),std::size_t(qwords),gs);
-                } catch(...) {c.fail();}
+            auto* raw=reinterpret_cast<GifWords*>(std::uintptr_t(command.a));
+            std::unique_ptr<GifWords> words(raw);
+            const auto qwords=std::size_t(command.b);
+            if(!words || words->size()!=qwords*4) {
+                try {throw std::logic_error("host GIF block ownership/size mismatch");} catch(...) {c.fail();}
+                return 1;
             }
-            return qwords+1;
+            if(!c.has_failed()) {
+                try {gif.submit_words(words->data(),qwords,gs);} catch(...) {c.fail();}
+            }
+            return 1;
         }
         if(c.has_failed())return 1;
         try {
@@ -673,7 +657,9 @@ class DeviceThread final : public DeviceLink, GifForward {
             case DeviceKind::gs_privileged:gs.write_privileged(command.x,command.a);break;
             case DeviceKind::gs_csr_events:gs.privileged_csr_events|=command.x;break;
             case DeviceKind::gs_imr:gs.privileged_imr=command.a;break;
-            case DeviceKind::rasterize:gs.rasterize_pending_draws();break;
+            case DeviceKind::rasterize:{
+                gs.rasterize_pending_draws();
+                break;}
             default:throw std::runtime_error("invalid host GS command");
             }
         } catch(...) {c.fail();}
@@ -716,15 +702,25 @@ public:
         // The real path may already hold a partial packet; mirror its boundary state.
         if(!gif.pending.empty())throw std::runtime_error("host device thread requires an idle GIF path");
         executor=vif1.vu1_executor;
+        // HG-PERF-119: speculative VU1 workers commit in original order and
+        // re-execute exactly on any mismatch (HG-LEARN-077); heavy gameplay needs
+        // them to keep VU1 off the critical path. Default on with spare host
+        // threads; HG_VU_WORKERS overrides (0 disables).
         if(const char* value=std::getenv("HG_VU_WORKERS"))worker_count=unsigned(std::strtoul(value,nullptr,10));
+        else {
+            const auto host_threads=std::thread::hardware_concurrency();
+            worker_count=host_threads>=8?3u:host_threads>=6?2u:0u;
+        }
         if(worker_count && executor && vu1_spec_info_query) {
             max_inflight=2ull*worker_count+1;
             if(const char* value=std::getenv("HG_VU_INFLIGHT"))max_inflight=std::max<std::uint64_t>(1,std::strtoull(value,nullptr,10));
             for(std::uint64_t n=0;n<2*max_inflight+2;++n)slots.push_back(std::make_unique<VuJob>());
-            for(unsigned n=0;n<worker_count;++n)workers.emplace_back([this]{worker_loop();});
+            for(unsigned n=0;n<worker_count;++n)workers.emplace_back([this]{host_sampler_register_current("VU");worker_loop();});
+            std::fprintf(stderr,"Host VU1 speculation workers=%u\n",worker_count);
             vif1.vu1_executor=&dispatch_trampoline;
         } else worker_count=0;
         c.thread=std::thread([this] {
+            host_sampler_register_current("C"); // HG-DIAG-115 (no-op unless HG_SAMPLE_FILE).
             if(context)context(true);
             gs_sprite_accelerator=sprite;gs_triangle_accelerator=triangle;
             c.run(c_write,c_read,[this](std::uint64_t at){return execute_c(at);},[]{return false;});
@@ -732,6 +728,7 @@ public:
             if(context)context(false);
         });
         b.thread=std::thread([this] {
+            host_sampler_register_current("B");
             b_owner=this;
             if(worker_count)vif1_mscnt_barrier=&mscnt_barrier;
             b.run(write_index,read_index,[this](std::uint64_t at){return execute_b(at);},

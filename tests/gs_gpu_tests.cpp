@@ -2,7 +2,323 @@
 #include "gl_gs.hpp"
 #include "hg/gs.hpp"
 #include "hg/gs_triangle_acceleration.hpp"
+#include "hg/native_psmt8_cache.hpp"
+#include "gl_native_indexed.hpp"
+#include <algorithm>
+#include <initializer_list>
 #include <iostream>
+#include <optional>
+
+namespace {
+// HG-ARCH-009: drive the optional HG-ARCH-008 page-epoch hooks through real
+// resident GL queues, submission, readback, CPU scopes and faults. The tracker
+// is observation-only; every step also compares VRAM with the scalar renderer.
+void epoch_require(bool ok,const char* what) {
+    if(!ok)throw std::runtime_error(std::string("HG-ARCH-009/010 native renderer gate: ")+what);
+}
+std::bitset<512> page_set(std::initializer_list<unsigned> pages) {
+    std::bitset<512> result;for(const auto p:pages)result.set(p);return result;
+}
+std::bitset<512> pending_pages(const hg::NativeVramPageEpochs& epochs) {
+    std::bitset<512> result;
+    for(unsigned p=0;p<512;++p)if(epochs.gpu_pending(page_set({p})))result.set(p);
+    return result;
+}
+unsigned native_epoch_gate() {
+    unsigned cases=0;
+    auto epochs=std::make_shared<hg::NativeVramPageEpochs>();
+    auto gpu=hg::make_gl_sprite_accelerator(true,true,false,epochs);
+    struct CountedTriangles final:hg::GsTriangleAccelerator {
+        hg::GsTriangleAccelerator& target;unsigned accepted=0;
+        explicit CountedTriangles(hg::GsTriangleAccelerator& backend):target(backend){}
+        bool render_triangle(const hg::GsTriangleJob& job,hg::GsLocalMemory& memory) override {
+            const bool result=target.render_triangle(job,memory);accepted+=result;return result;
+        }
+    } triangles(*dynamic_cast<hg::GsTriangleAccelerator*>(gpu.get()));
+    const auto on_gpu=[&](auto&& operation) {
+        hg::gs_sprite_accelerator=gpu.get();hg::gs_triangle_accelerator=&triangles;
+        try{operation();}catch(...){hg::gs_sprite_accelerator=nullptr;hg::gs_triangle_accelerator=nullptr;throw;}
+        hg::gs_sprite_accelerator=nullptr;hg::gs_triangle_accelerator=nullptr;
+    };
+    hg::GsRegisterState initial;initial.ensure_vram();
+    for(unsigned i=0;i<initial.vram.size();++i)initial.vram[i]=0x6b43a9b5u*i+(i>>11);
+    initial.value[0x4c]=2ull<<16;initial.value[0x4e]=1ull<<32;
+    initial.value[0x47]=0x30000;initial.value[0x46]=1;
+    initial.value[0x40]=(127ull<<16)|(95ull<<48);
+    initial.value[6]=8192ull|(2ull<<14)|(7ull<<26)|(7ull<<30)|(1ull<<34);
+    initial.value[8]=5;
+    hg::GsDraw draw{};draw.primitive=6;draw.count=2;draw.prim_state=0x116;
+    draw.vertices[1].x=2048;draw.vertices[1].y=1536;
+    draw.vertices[1].uv=2048|(1536u<<16);draw.vertices[1].rgba=0x80808080;
+    const auto texture=page_set({256}); // TBP0 8192 blocks.
+
+    auto cpu=initial,gs=initial;
+    epoch_require(!epochs->tracking_complete(),"trusted before first resident use");
+    cpu.rasterize_sprite(draw);
+    gpu->begin_batch();on_gpu([&]{gs.rasterize_sprite(draw);});
+    epoch_require(epochs->tracking_complete(),"no coherent baseline after first resident draw");
+    const auto written=pending_pages(*epochs);
+    epoch_require(written[0]&&written[1]&&!written[256],"queued sprite output/texture pending set");
+    const auto texture_stamp=epochs->stamp(texture);
+    epoch_require(texture_stamp.has_value(),"unwritten texture page refused a stamp");
+    epoch_require(!epochs->stamp(written),"pending GPU output was stamped");
+    ++cases;
+    gpu->flush(); // Submission plus glFlush only.
+    epoch_require(pending_pages(*epochs)==written,"glFlush submission treated as GPU completion");
+    ++cases;
+    const auto other=page_set({300});
+    const auto other_before=epochs->stamp(other);
+    epoch_require(other_before.has_value(),"idle page refused a stamp");
+    gs.vram[300*2048+5]=0x12345678u;cpu.vram[300*2048+5]=0x12345678u;
+    epoch_require(!epochs->matches(*other_before),"CPU write did not advance its page");
+    epoch_require(epochs->matches(*texture_stamp),"disjoint CPU write invalidated another page");
+    epoch_require(pending_pages(*epochs)==written,"disjoint CPU write completed GPU work");
+    ++cases;
+    {
+        const auto& view=static_cast<const hg::GsLocalMemory&>(gs.vram);
+        const auto* resident=view.read_span(0,2048);
+        const auto* reference=static_cast<const hg::GsLocalMemory&>(cpu.vram).read_span(0,2048);
+        epoch_require(std::equal(resident,resident+2048,reference),"single-page resident readback mismatch");
+        auto remaining=written;remaining.reset(0);
+        epoch_require(pending_pages(*epochs)==remaining,"single-page readback completed the wrong pages");
+        epoch_require(epochs->stamp(page_set({0})).has_value(),"completed page refused a stamp");
+        ++cases;
+    }
+    gpu->end_batch();gpu->finish();
+    epoch_require(pending_pages(*epochs).none(),"finish left pending GPU writes");
+    const auto completed=epochs->stamp(written);
+    epoch_require(completed.has_value(),"finished output refused a stamp");
+    epoch_require(cpu.vram==gs.vram,"VRAM mismatch after finish");
+    ++cases;
+
+    cpu.rasterize_sprite(draw);
+    gpu->begin_batch();on_gpu([&]{gs.rasterize_sprite(draw);});
+    epoch_require(!epochs->matches(*completed),"requeued GPU write kept the old stamp");
+    gpu->end_batch();gpu->finish();
+    epoch_require(!epochs->matches(*completed),"completion revalidated a superseded stamp");
+    epoch_require(epochs->stamp(written).has_value()&&cpu.vram==gs.vram,"requeue completion");
+    ++cases;
+
+    // Masked upload into a submitted, not yet downloaded page.
+    cpu.rasterize_sprite(draw);
+    gpu->begin_batch();on_gpu([&]{gs.rasterize_sprite(draw);});gpu->flush();
+    {
+        const auto before=epochs->sequence();
+        const std::uint32_t indices[2]={7,9},values[2]={0xa1b2c3d4u,0x0badf00du},mask=0x00ff00ffu;
+        epoch_require(gs.vram.try_masked_write(indices,values,2,mask),"resident masked write not accepted");
+        for(unsigned i=0;i<2;++i)cpu.vram[indices[i]]=(cpu.vram[indices[i]]&~mask)|(values[i]&mask);
+        epoch_require(epochs->sequence()>before&&epochs->gpu_pending(page_set({0})),"masked GPU write not tracked");
+    }
+    gpu->end_batch();gpu->finish();
+    epoch_require(pending_pages(*epochs).none()&&cpu.vram==gs.vram,"masked write completion");
+    ++cases;
+
+    // Complete-page replacement discards submitted GPU output for that page.
+    cpu.rasterize_sprite(draw);
+    gpu->begin_batch();on_gpu([&]{gs.rasterize_sprite(draw);});gpu->flush();
+    {
+        auto* replacement=gs.vram.write_discard_span(2048,2048);
+        auto* reference=cpu.vram.write_span(2048,2048);
+        for(unsigned i=0;i<2048;++i)replacement[i]=reference[i]=0x5a5a0000u+i;
+        epoch_require(!epochs->gpu_pending(page_set({1})),"discarded page still pending");
+        epoch_require(epochs->gpu_pending(page_set({0})),"discard completed a neighbouring page");
+        const auto replaced=epochs->stamp(page_set({1}));
+        epoch_require(replaced.has_value(),"discarded page refused a stamp");
+        gpu->end_batch();gpu->finish();
+        epoch_require(epochs->matches(*replaced),"later completion changed the replaced page");
+        epoch_require(pending_pages(*epochs).none()&&cpu.vram==gs.vram,"discard completion");
+        ++cases;
+    }
+
+    // An ordinary CPU primitive orders queued GPU output through a raster scope.
+    {
+        cpu.rasterize_sprite(draw);
+        gpu->begin_batch();on_gpu([&]{gs.rasterize_sprite(draw);});
+        const auto queued=epochs->sequence();
+        hg::GsDraw point{};point.primitive=0;point.count=1;point.prim_state=0;
+        point.vertices[0].x=32;point.vertices[0].y=32;point.vertices[0].rgba=0xf1b29374;
+        cpu.draws.push_back(point);cpu.rasterize_pending_draws();
+        gs.draws.push_back(point);on_gpu([&]{gs.rasterize_pending_draws();});
+        const auto after=epochs->stamp(page_set({0}));
+        epoch_require(epochs->tracking_complete()&&after&&after->generations[0]>queued,"CPU raster scope not tracked");
+        gpu->end_batch();gpu->finish();
+        epoch_require(pending_pages(*epochs).none()&&cpu.vram==gs.vram,"CPU raster scope completion");
+        ++cases;
+    }
+
+    // Untextured GPU triangle with separate depth pages.
+    {
+        cpu.value[0x4e]=gs.value[0x4e]=(1ull<<32)|128;
+        hg::GsDraw triangle{};triangle.primitive=3;triangle.count=3;triangle.prim_state=0;
+        triangle.vertices[0].x=3*16;triangle.vertices[0].y=9*16;
+        triangle.vertices[1].x=120*16;triangle.vertices[1].y=19*16;
+        triangle.vertices[2].x=27*16;triangle.vertices[2].y=90*16;
+        for(unsigned i=0;i<3;++i){triangle.vertices[i].rgba=0x7189d53fu*(i+1);triangle.vertices[i].z=0x10203040u+i;}
+        const auto before=epochs->stamp(written);
+        epoch_require(before.has_value(),"triangle baseline");
+        cpu.draws.push_back(triangle);cpu.rasterize_pending_draws();
+        triangles.accepted=0;gs.draws.push_back(triangle);on_gpu([&]{gs.rasterize_pending_draws();});
+        epoch_require(triangles.accepted==1,"triangle fixture did not reach the GPU");
+        const auto pending=pending_pages(*epochs);
+        epoch_require(pending[0]&&!pending[128]&&!epochs->matches(*before),"queued triangle pages");
+        gpu->finish();
+        epoch_require(pending_pages(*epochs).none()&&cpu.vram==gs.vram,"triangle completion");
+        cpu.value[0x4e]=gs.value[0x4e]=initial.value[0x4e];
+        ++cases;
+    }
+
+    // Owner swap: old stamps never match the new memory's baseline.
+    const auto old_owner=epochs->stamp(written);
+    epoch_require(old_owner.has_value(),"old owner stamp");
+    {
+        auto second_cpu=initial;std::optional<hg::GsRegisterState> second(initial);
+        second_cpu.rasterize_sprite(draw);
+        gpu->begin_batch();on_gpu([&]{second->rasterize_sprite(draw);});
+        epoch_require(epochs->tracking_complete()&&!epochs->matches(*old_owner),"owner swap kept old stamps");
+        epoch_require(pending_pages(*epochs)==written,"new owner pending set");
+        gpu->end_batch();gpu->finish();
+        epoch_require(second_cpu.vram==second->vram&&cpu.vram==gs.vram,"owner swap VRAM");
+        ++cases;
+        second.reset(); // Destroying the resident owner forgets its storage.
+        epoch_require(!epochs->tracking_complete(),"destroyed owner left trust");
+        ++cases;
+    }
+
+    // Explicit GL error after queued work revokes trust and still faults.
+    {
+        auto third_cpu=initial,third=initial;third_cpu.rasterize_sprite(draw);
+        gpu->begin_batch();on_gpu([&]{third.rasterize_sprite(draw);});
+        epoch_require(epochs->tracking_complete(),"new owner baseline after forget");
+        glEnable(0x7fff); // Deliberate GL_INVALID_ENUM.
+        // HG-PERF-115: resident flushes defer the poll; the fault must surface
+        // no later than the next coherence point (here finish), never be lost.
+        bool faulted=false;
+        try{gpu->flush();gpu->finish();}catch(const std::runtime_error&){faulted=true;}
+        gpu->end_batch();
+        epoch_require(faulted&&!epochs->tracking_complete(),"GL error did not fault and revoke trust");
+        epoch_require(third_cpu.vram==third.vram,"VRAM after GL error");
+        ++cases;
+    }
+
+    // Accelerator teardown stops observation.
+    {
+        auto fourth_cpu=initial,fourth=initial;fourth_cpu.rasterize_sprite(draw);
+        gpu->begin_batch();on_gpu([&]{fourth.rasterize_sprite(draw);});gpu->end_batch();
+        epoch_require(epochs->tracking_complete(),"baseline before teardown");
+        gpu.reset();
+        epoch_require(!epochs->tracking_complete(),"accelerator teardown left trust");
+        epoch_require(fourth_cpu.vram==fourth.vram,"teardown VRAM");
+        fourth.vram[0]=7;epoch_require(fourth.vram[0]==7,"post-teardown CPU access");
+        ++cases;
+    }
+    return cases;
+}
+
+// HG-ARCH-010: GPU-resident PSMT8 indices + CT32 palette point samples must
+// equal the first-party GS point sampler exactly. No frame or depth writes.
+unsigned native_texture_gate() {
+    unsigned comparisons=0;
+    hg::GsRegisterState gs;gs.ensure_vram();
+    {
+        std::uint32_t seed=0x76a5d481u;
+        auto* words=gs.vram.write_span(0,gs.vram.size());
+        for(std::size_t i=0;i<gs.vram.size();++i){seed^=seed<<13;seed^=seed>>17;seed^=seed<<5;words[i]=seed;}
+    }
+    for(unsigned i=0;i<256;++i){const auto rgba=0x9e3779b9u*(i+1);
+        gs.clut[i]=std::uint16_t(rgba);gs.clut[i+256]=std::uint16_t(rgba>>16);
+        gs.clut_valid[i]=gs.clut_valid[i+256]=true;}
+    gs.clut_load_count=41;
+    auto palette=hg::native_psmt8_palette_snapshot(gs);
+    epoch_require(palette&&palette->identity,"palette snapshot identity");
+    hg::NativeVramPageEpochs epochs;
+    auto observer=std::make_shared<hg::NativeEpochTestMemoryObserver>(epochs); // Test-only: no GL accelerator here.
+    gs.vram.observe(observer);
+    epoch_require(epochs.begin_after_coherent_fence(),"texture gate baseline");
+    hg::NativePsmt8TextureCache cache(epochs,gs.vram);
+    hg::NativeIndexedGlResidency residency;
+    struct Fixture{unsigned tbp,tbw,tw,th,umode,vmode,umin,umax,vmin,vmax;};
+    const Fixture fixtures[]={
+        {0,2,7,6,0,0,0,0,0,0},{1,3,6,6,1,1,0,0,0,0},{0x3fff,1,7,6,0,1,0,0,0,0},
+        {17,4,8,8,0,0,0,0,0,0},{120,6,6,6,2,2,11,1000,5,70},
+        {133,8,6,6,3,3,0x155,0x2aa,0x066,0x299},{511,3,9,7,1,0,0,0,0,0},
+        {8191,8,10,10,0,0,0,0,0,0},{64,2,5,4,2,3,3,29,0x00f,0x010},{900,5,7,7,3,2,0x07f,0x080,0,127}};
+    const std::int32_t probes[]={-70000,-1025,-129,-65,-1,0,1,7,8,15,31,63,64,127,128,255,511,1000,1023,1024,4097,70001};
+    for(const auto& f:fixtures) {
+        hg::NativeIndexedDraw d;
+        d.tex0=std::uint64_t(f.tbp)|(std::uint64_t(f.tbw)<<14)|(std::uint64_t(0x13)<<20)|
+               (std::uint64_t(f.tw)<<26)|(std::uint64_t(f.th)<<30);
+        d.clamp=std::uint64_t(f.umode)|(std::uint64_t(f.vmode)<<2)|(std::uint64_t(f.umin)<<4)|
+                (std::uint64_t(f.umax)<<14)|(std::uint64_t(f.vmin)<<24)|(std::uint64_t(f.vmax)<<34);
+        gs.value[6]=d.tex0;gs.value[8]=d.clamp; // Context 0, CT32/CSM1/CSA=0 CLUT.
+        const auto* staged=cache.get_or_stage(d,gs.vram);
+        epoch_require(staged&&staged->content_id,"texture gate staging");
+        std::vector<std::int32_t> uv;
+        for(const auto v:probes)for(const auto u:probes){uv.push_back(u);uv.push_back(v);}
+        if(f.tw<=7&&f.th<=7) // Whole nominal envelope for small textures.
+            for(std::int32_t y=0;y<(1<<f.th);++y)for(std::int32_t x=0;x<(1<<f.tw);++x){uv.push_back(x);uv.push_back(y);}
+        const auto uploads=residency.stats().texture_uploads;
+        const auto gpu=residency.point_sample(*staged,*palette,d.clamp,uv);
+        epoch_require(residency.stats().texture_uploads==uploads+1,"new staged content was not uploaded");
+        for(std::size_t i=0;i<gpu.size();++i) {
+            const auto expected=gs.point_sample_tex0(0,uv[i*2],uv[i*2+1]);
+            if(gpu[i]!=expected)
+                throw std::runtime_error("HG-ARCH-010 GPU indexed sample mismatch tbp="+std::to_string(f.tbp)+
+                    " u="+std::to_string(uv[i*2])+" v="+std::to_string(uv[i*2+1]));
+            ++comparisons;
+        }
+        // Same epoch-verified content: cache hit, identical identity, no upload.
+        const auto* again=cache.get_or_stage(d,gs.vram);
+        epoch_require(again&&again->content_id==staged->content_id,"cache hit changed content identity");
+        const auto hits=residency.stats().texture_hits;
+        epoch_require(residency.point_sample(*again,*palette,d.clamp,uv)==gpu&&
+                      residency.stats().texture_uploads==uploads+1&&residency.stats().texture_hits==hits+1,
+                      "resident texture was not reused");
+    }
+    { // A CPU write to a source page restages new content; the GPU follows it.
+        const auto& f=fixtures[0];
+        hg::NativeIndexedDraw d;
+        d.tex0=std::uint64_t(f.tbp)|(std::uint64_t(f.tbw)<<14)|(std::uint64_t(0x13)<<20)|
+               (std::uint64_t(f.tw)<<26)|(std::uint64_t(f.th)<<30);
+        d.clamp=0;gs.value[6]=d.tex0;gs.value[8]=0;
+        const auto* old_content=cache.get_or_stage(d,gs.vram);
+        epoch_require(old_content!=nullptr,"restage fixture staging");
+        const auto old_id=old_content->content_id;
+        const std::vector<std::int32_t> before_uv{5,3};
+        // Make the pre-mutation content resident right before the write, so a
+        // residency keyed by anything weaker than content identity is caught.
+        const auto before=residency.point_sample(*old_content,*palette,0,before_uv);
+        epoch_require(before[0]==gs.point_sample_tex0(0,5,3),"pre-mutation texel parity");
+        const auto word=hg::GsRegisterState::psmt8_word(0,128,5,3);
+        const unsigned lane=((3u&2u)>>1)|((5u&8u)>>2);
+        gs.vram[word]^=0xffu<<(lane*8u); // Flip texel (5,3)'s index byte.
+        const auto* fresh=cache.get_or_stage(d,gs.vram);
+        epoch_require(fresh&&fresh->content_id!=old_id,"source mutation reused stale content");
+        const auto uploads=residency.stats().texture_uploads;
+        const std::vector<std::int32_t> uv{5,3,6,3};
+        const auto gpu=residency.point_sample(*fresh,*palette,0,uv);
+        epoch_require(residency.stats().texture_uploads==uploads+1,"restaged content was not uploaded");
+        epoch_require(gpu[0]==gs.point_sample_tex0(0,5,3)&&gpu[1]==gs.point_sample_tex0(0,6,3)&&gpu[0]!=before[0],
+                      "mutated texel parity");
+        comparisons+=2;
+        // A new palette load mints a new identity and is uploaded once.
+        for(unsigned i=0;i<256;++i){gs.clut[i]^=0x5a5au;gs.clut_valid[i]=true;}
+        ++gs.clut_load_count;
+        const auto reloaded=hg::native_psmt8_palette_snapshot(gs);
+        epoch_require(reloaded&&reloaded->identity!=palette->identity,"palette reload identity");
+        const auto palette_uploads=residency.stats().palette_uploads;
+        const auto again=residency.point_sample(*fresh,*reloaded,0,uv);
+        epoch_require(residency.stats().palette_uploads==palette_uploads+1,"reloaded palette was not uploaded");
+        epoch_require(again[0]==gs.point_sample_tex0(0,5,3)&&again[1]==gs.point_sample_tex0(0,6,3),"reloaded palette parity");
+        comparisons+=2;
+    }
+    gs.vram.observe(nullptr);
+    const auto& stats=residency.stats();
+    std::cout<<"HG-ARCH-010 resident indexed textures: uploads="<<stats.texture_uploads<<" hits="<<stats.texture_hits
+             <<" palette_uploads="<<stats.palette_uploads<<" palette_hits="<<stats.palette_hits
+             <<" bytes="<<stats.uploaded_bytes<<'\n';
+    return comparisons;
+}
+}
 
 int main(int argc,char** argv) {
     GLFWwindow* window=nullptr;
@@ -14,15 +330,31 @@ int main(int argc,char** argv) {
         if(!window)throw std::runtime_error("OpenGL4.3 unavailable");
         glfwMakeContextCurrent(window);
         std::cout<<"Renderer: "<<glGetString(GL_RENDERER)<<" version "<<glGetString(GL_VERSION)<<'\n';
-        bool resident=false,triangles=false;
-        for(int i=1;i<argc;++i){resident|=std::string(argv[i])=="--resident";triangles|=std::string(argv[i])=="--triangles";}
+        bool resident=false,triangles=false,epochs_only=false,texture_only=false;
+        for(int i=1;i<argc;++i){resident|=std::string(argv[i])=="--resident";triangles|=std::string(argv[i])=="--triangles";
+            epochs_only|=std::string(argv[i])=="--native-epochs";texture_only|=std::string(argv[i])=="--native-texture";}
+        {
+            const auto texels=native_texture_gate();
+            std::cout<<texels<<" HG-ARCH-010 GPU indexed texel/palette comparisons passed\n";
+            if(texture_only){glfwDestroyWindow(window);glfwTerminate();return 0;}
+        }
+        if(epochs_only||resident) {
+            const auto gate=native_epoch_gate();
+            std::cout<<gate<<" HG-ARCH-009 resident native page-epoch cases passed\n";
+            if(epochs_only){glfwDestroyWindow(window);glfwTerminate();return 0;}
+        }
         auto gpu=hg::make_gl_sprite_accelerator(resident,triangles);unsigned cases=0;
+        const auto capture=[](hg::GsDraw& draw,const hg::GsDraw::Environment& environment) {
+            draw.environment_captured=true;
+            draw.explicit_environment=std::make_shared<hg::GsDraw::Environment>(environment);
+        };
         struct CountedTriangles final:hg::GsTriangleAccelerator {
-            hg::GsTriangleAccelerator& target;unsigned accepted=0;
+            hg::GsTriangleAccelerator& target;unsigned accepted=0,attempted=0;
             explicit CountedTriangles(hg::GsTriangleAccelerator& backend):target(backend){}
             bool render_triangle(const hg::GsTriangleJob& job,hg::GsLocalMemory& memory) override {
-                const bool result=target.render_triangle(job,memory);accepted+=result;return result;
+                ++attempted;const bool result=target.render_triangle(job,memory);accepted+=result;return result;
             }
+            bool accepts_native_float_stq() const noexcept override {return target.accepts_native_float_stq();}
         } triangle_counter(*dynamic_cast<hg::GsTriangleAccelerator*>(gpu.get()));
         if(triangles)for(unsigned variant=0;variant<192;++variant) {
             const bool untextured=variant>=96;
@@ -31,7 +363,9 @@ int main(int argc,char** argv) {
             const unsigned format=variant%3==0?0:variant%3==1?((variant&64)?0x14:0x13):0x1b,wrap=(variant/3)%4;
             cpu.value[0x4c]=(2ull<<16)|((variant&32)?511:0)|((variant&64)?0x00f00f00ull<<32:0);
             cpu.value[0x4e]=32|((variant&1)?1ull<<24:0)|((variant&8)?1ull<<32:0);
-            cpu.value[0x47]=0x10000|((1ull+(variant%3))<<17)|((variant&4)?15:0);
+            // HG-PERF-116: cover every ATST mode and varied AREF with AFAIL KEEP.
+            cpu.value[0x47]=0x10000|((1ull+(variant%3))<<17)|
+                ((variant&4)?(1ull|(std::uint64_t((variant>>3)&7)<<1)|(std::uint64_t((variant*37u)&255u)<<4)):0);
             cpu.value[0x40]=(127ull<<16)|(95ull<<48);
             cpu.value[6]=8192ull|(2ull<<14)|(std::uint64_t(format)<<20)|(7ull<<26)|(7ull<<30)|
                 ((variant&16)?0:1ull<<34)|(std::uint64_t(variant%4)<<35)|(format==0x14?std::uint64_t(variant&15)<<56:0);
@@ -83,12 +417,13 @@ int main(int argc,char** argv) {
                 // a CPU primitive, and a fault. Observe pending resident writes
                 // through the ordinary memory owner and copy boundaries.
                 auto mixed=cpu;mixed.draws.clear();mixed.retired_draw_count=0;mixed.rasterized_draw_count=0;
-                auto first=cpu.draws.front();first.environment_captured=true;first.environment=cpu.value;
+                auto first=cpu.draws.front();capture(first,cpu.value);
                 mixed.draws.push_back(first);
-                auto second=first;second.environment[6]=(2ull<<14)|(7ull<<26)|(7ull<<30)|(1ull<<34);
-                second.environment[0x4c]=(2ull<<16)|96;second.environment[0x4e]=128;
+                auto second=first;second.explicit_environment=std::make_shared<hg::GsDraw::Environment>(*first.explicit_environment);
+                (*second.explicit_environment)[6]=(2ull<<14)|(7ull<<26)|(7ull<<30)|(1ull<<34);
+                (*second.explicit_environment)[0x4c]=(2ull<<16)|96;(*second.explicit_environment)[0x4e]=128;
                 mixed.draws.push_back(second);
-                hg::GsDraw point{};point.primitive=0;point.count=1;point.prim_state=0;point.environment_captured=true;point.environment=second.environment;
+                hg::GsDraw point{};point.primitive=0;point.count=1;point.prim_state=0;capture(point,*second.explicit_environment);
                 point.vertices[0].x=32;point.vertices[0].y=32;point.vertices[0].rgba=0xf1b29374;point.vertices[0].z=0xffffffff;
                 mixed.draws.push_back(point);
                 if(variant&1){auto invalid=first;invalid.prim_state|=128;mixed.draws.push_back(invalid);}
@@ -250,6 +585,83 @@ int main(int argc,char** argv) {
                 ++cases;
             }
         }
+        if(triangles) { // HG-PERF-106: product-overflow STQ must reach only native-relaxed triangles.
+            auto relaxed_gpu=hg::make_gl_sprite_accelerator(resident,true,true);
+            CountedTriangles counted(*dynamic_cast<hg::GsTriangleAccelerator*>(relaxed_gpu.get()));
+            hg::GsRegisterState initial;initial.ensure_vram();
+            for(unsigned i=0;i<initial.vram.size();++i)initial.vram[i]=i*0x97a54321u+(i>>9);
+            initial.value[0x4c]=2ull<<16;initial.value[0x4e]=32ull|(1ull<<32);initial.value[0x47]=0x30000;
+            initial.value[0x40]=(127ull<<16)|(95ull<<48);
+            initial.value[6]=8192ull|(2ull<<14)|(7ull<<26)|(7ull<<30)|(1ull<<34);
+            initial.value[8]=5;initial.value[0x42]=0x44ull|(193ull<<32);
+            hg::GsDraw draw{};draw.primitive=3;draw.count=3;draw.prim_state=0x10;
+            draw.vertices[0].x=3;draw.vertices[0].y=9;
+            draw.vertices[1].x=2013;draw.vertices[1].y=19;
+            draw.vertices[2].x=27;draw.vertices[2].y=1517;
+            const std::uint32_t s[3]={0x30800000u,0x3f800000u,0x3f000000u};
+            const std::uint32_t t[3]={0x3e800000u,0x3f000000u,0x3f400000u};
+            for(unsigned i=0;i<3;++i){draw.vertices[i].rgba=0x80808080u;draw.vertices[i].z=0x10203040u+i;
+                draw.vertices[i].q=0x3f800000u;draw.vertices[i].st=std::uint64_t(s[i])|(std::uint64_t(t[i])<<32);}
+            auto cpu=initial,accelerated=initial;cpu.draws.push_back(draw);accelerated.draws.push_back(draw);
+            hg::gs_sprite_accelerator=nullptr;hg::gs_triangle_accelerator=nullptr;cpu.rasterize_pending_draws();
+            counted.accepted=0;hg::gs_sprite_accelerator=relaxed_gpu.get();hg::gs_triangle_accelerator=&counted;
+            accelerated.rasterize_pending_draws();hg::gs_triangle_accelerator=nullptr;hg::gs_sprite_accelerator=nullptr;
+            // HG-PERF-106/HG-FAIL-063 left native-float STQ disabled in the
+            // backend; then this product-overflow draw must stay on the CPU.
+            if(counted.accepts_native_float_stq()) {
+                if(!counted.attempted)throw std::runtime_error("wide STQ fixture was not submitted to native-relaxed triangle backend");
+                if(!counted.accepted)throw std::runtime_error("wide STQ fixture was rejected by native-relaxed triangle backend");
+            } else if(counted.attempted)throw std::runtime_error("wide STQ fixture reached a backend without native-float STQ");
+            if(cpu.vram!=accelerated.vram)throw std::runtime_error("wide STQ native-relaxed differential mismatch");
+            ++cases;
+            auto invalid=draw;invalid.vertices[2].st=(invalid.vertices[2].st&0xffffffffull)|(std::uint64_t(0x7fc00000u)<<32);
+            auto reference=initial,fallback=initial;reference.draws.push_back(invalid);fallback.draws.push_back(invalid);
+            bool reference_fault=false,fallback_fault=false;
+            try {reference.rasterize_pending_draws();} catch(const std::runtime_error&) {reference_fault=true;}
+            counted.accepted=0;hg::gs_sprite_accelerator=relaxed_gpu.get();hg::gs_triangle_accelerator=&counted;
+            try {fallback.rasterize_pending_draws();} catch(const std::runtime_error&) {fallback_fault=true;}
+            hg::gs_triangle_accelerator=nullptr;hg::gs_sprite_accelerator=nullptr;
+            if(reference_fault!=fallback_fault||counted.accepted)
+                throw std::runtime_error("wide STQ invalid-coordinate fallback mismatch");
+            ++cases;
+        }
+        if(triangles)for(unsigned variant=0;variant<16;++variant) {
+            // HG-PERF-120: own-pixel PSMT8H feedback (texture base == frame base,
+            // identity UV, q=1). Overlapping triangles must read each pixel's frame
+            // alpha after earlier triangles wrote it, exactly like the scalar path.
+            hg::GsRegisterState cpu;cpu.ensure_vram();
+            for(unsigned i=0;i<cpu.vram.size();++i)cpu.vram[i]=i*0x6d2b79f5u+(i>>7)*0x1000193u;
+            cpu.value[0x4c]=(2ull<<16)|((variant&4)?(0x00ff0000ull<<32):0); // FBP 0, 128 wide, optional FBMSK.
+            cpu.value[0x4e]=128ull|(1ull<<32);cpu.value[0x47]=0x30000;
+            cpu.value[0x40]=(127ull<<16)|(95ull<<48);
+            cpu.value[6]=0ull|(2ull<<14)|(0x1bull<<20)|(7ull<<26)|(7ull<<30)|((variant&1)?1ull<<34:0)|(std::uint64_t((variant>>1)&3)<<35);
+            cpu.value[8]=1|(1ull<<2); // CLAMP both axes.
+            cpu.value[0x42]=0x44ull|(97ull<<32);
+            for(unsigned i=0;i<256;++i){const auto rgba=0x2545f491u*(i+3);
+                cpu.clut[i]=std::uint16_t(rgba);cpu.clut[i+256]=std::uint16_t(rgba>>16);
+                cpu.clut_valid[i]=cpu.clut_valid[i+256]=true;}
+            const auto st=[](unsigned pixel){
+                const float value=float(pixel*16+8)/float(128*16);std::uint32_t bits;std::memcpy(&bits,&value,4);return bits;};
+            const unsigned shapes[3][6]={{2,3,120,10,30,90},{10,80,118,4,64,92},{0,0,127,0,0,95}};
+            for(unsigned n=0;n<3;++n){
+                hg::GsDraw draw{};draw.primitive=3;draw.count=3;draw.prim_state=0x10|((variant&8)?0x48:0);
+                for(unsigned i=0;i<3;++i){
+                    const unsigned x=shapes[n][i*2],y=shapes[n][i*2+1];
+                    draw.vertices[i].x=x*16;draw.vertices[i].y=y*16;draw.vertices[i].q=0x3f800000u;
+                    draw.vertices[i].st=std::uint64_t(st(x))|(std::uint64_t(st(y))<<32);
+                    draw.vertices[i].rgba=0x80604020u+0x01020304u*(i+n);draw.vertices[i].z=0x100+n;
+                }
+                cpu.draws.push_back(draw);
+            }
+            auto accelerated=cpu;
+            hg::gs_sprite_accelerator=nullptr;hg::gs_triangle_accelerator=nullptr;cpu.rasterize_pending_draws();
+            triangle_counter.accepted=0;
+            hg::gs_sprite_accelerator=gpu.get();hg::gs_triangle_accelerator=&triangle_counter;
+            accelerated.rasterize_pending_draws();hg::gs_triangle_accelerator=nullptr;hg::gs_sprite_accelerator=nullptr;
+            if(cpu.vram!=accelerated.vram)throw std::runtime_error("HG-PERF-120 self-feedback mismatch "+std::to_string(variant));
+            if(!triangle_counter.accepted)throw std::runtime_error("HG-PERF-120 self-feedback did not reach the GPU "+std::to_string(variant));
+            ++cases;
+        }
         for(unsigned variant=0;variant<192;++variant) {
             hg::GsRegisterState cpu;cpu.ensure_vram();
             for(unsigned i=0;i<cpu.vram.size();++i)cpu.vram[i]=i*0x97a54321u+(i>>9);
@@ -293,16 +705,18 @@ int main(int argc,char** argv) {
                 // Consecutive dispatches read earlier GPU results, then a CPU
                 // point and an aliased sprite force visibility before fallback.
                 auto batch=cpu;
-                auto queued=draw;queued.environment_captured=true;queued.environment=batch.value;
+                auto queued=draw;capture(queued,batch.value);
                 batch.draws.push_back(queued);
-                queued.environment[6]&=~16383ull;
-                queued.environment[0x4c]|=256;
+                queued.explicit_environment=std::make_shared<hg::GsDraw::Environment>(*queued.explicit_environment);
+                (*queued.explicit_environment)[6]&=~16383ull;
+                (*queued.explicit_environment)[0x4c]|=256;
                 batch.draws.push_back(queued);
                 hg::GsDraw point{};point.primitive=0;point.count=1;point.prim_state=0;
                 point.vertices[0].x=32;point.vertices[0].y=32;point.vertices[0].rgba=0xf1b29374;
-                point.environment_captured=true;point.environment=batch.value;
+                capture(point,batch.value);
                 batch.draws.push_back(point);
-                queued.environment[6]=(queued.environment[6]&~16383ull)|8192ull;
+                queued.explicit_environment=std::make_shared<hg::GsDraw::Environment>(*queued.explicit_environment);
+                (*queued.explicit_environment)[6]=((*queued.explicit_environment)[6]&~16383ull)|8192ull;
                 batch.draws.push_back(queued); // Source and frame now overlap: CPU fallback.
                 auto reference=batch;reference.rasterize_pending_draws();
                 hg::gs_sprite_accelerator=gpu.get();batch.rasterize_pending_draws();hg::gs_sprite_accelerator=nullptr;
@@ -310,7 +724,7 @@ int main(int argc,char** argv) {
                     throw std::runtime_error("GPU batch ordering mismatch "+std::to_string(variant));
                 ++cases;
                 auto fault=cpu;fault.draws.clear();
-                queued.environment=cpu.value;fault.draws.push_back(queued);
+                capture(queued,cpu.value);fault.draws.push_back(queued);
                 hg::GsDraw invalid{};invalid.primitive=7;fault.draws.push_back(invalid);
                 auto fault_reference=fault;bool cpu_failed=false,gpu_failed=false;
                 try{fault_reference.rasterize_pending_draws();}catch(const std::runtime_error&){cpu_failed=true;}
@@ -481,6 +895,21 @@ int main(int argc,char** argv) {
                 }
             };
             transfer(cpu);transfer(accelerated);
+            if(variant==0) {
+                std::vector<hg::GifTransfer> image(520);
+                for(std::size_t n=0;n<image.size();++n)image[n]={hg::GifTransferKind::Image,0,
+                    0x718293a4b5c6d7e8ull+n*0x0101010101010101ull,
+                    0x192a3b4c5d6e7f80ull+n*0x0303030303030303ull,n==0};
+                const auto configure=[](hg::GsRegisterState& state) {
+                    state.value[0x50]=(4ull<<32)|(8ull<<48)|(0x13ull<<56);
+                    state.value[0x52]=256ull|(32ull<<32);state.transfer_x=2032;state.transfer_y=2046;
+                    state.transfer_width=256;state.transfer_remaining=8192;
+                    state.gif_to_vram_active=true;state.host_transfer_completed=false;
+                };
+                configure(cpu);configure(accelerated);
+                for(const auto& qword:image)cpu.write_image_qword(qword.low,qword.high);
+                accelerated.write_image_transfers(image.data(),image.size());
+            }
             if(cpu.transfer_remaining!=accelerated.transfer_remaining||cpu.gif_to_vram_active!=accelerated.gif_to_vram_active||
                cpu.host_transfer_completed!=accelerated.host_transfer_completed)throw std::runtime_error("masked transfer progress mismatch");
             if(variant&8){

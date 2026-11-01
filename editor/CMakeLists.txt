@@ -1,0 +1,16 @@
+# Standalone world editor (docs/WORLD_EDITOR.md). Independent of the game runtime:
+# it links only GLFW and OpenGL and reads the user's disc image read-only.
+add_executable(hg_world_editor src/main.cpp)
+target_compile_features(hg_world_editor PRIVATE cxx_std_20)
+target_link_libraries(hg_world_editor PRIVATE glfw OpenGL::GL)
+if(WIN32)
+  set_target_properties(hg_world_editor PROPERTIES WIN32_EXECUTABLE TRUE)
+  if(MSVC)
+    target_link_options(hg_world_editor PRIVATE /ENTRY:mainCRTStartup)
+  endif()
+endif()
+if(BUILD_TESTING)
+  add_executable(editor_nav_tests tests/nav_tests.cpp)
+  target_compile_features(editor_nav_tests PRIVATE cxx_std_20)
+  add_test(NAME editor_nav_tests COMMAND editor_nav_tests)
+endif()

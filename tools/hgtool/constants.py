@@ -38,7 +38,7 @@ def update(regs,i):
         # A memory value is unknown, but only the load destination changes.
         # Preserve independently proven callback pointers in other registers.
         dest=i.rt
-    elif name in ('sb','sh','sw','sd','sq','swc1','sync'):
+    elif name in ('sb','sh','sw','sd','sq','swc1','sync','pref','cache_dxin'):
         pass
     else:
         # Unknown effects never leave a stale candidate constant behind.

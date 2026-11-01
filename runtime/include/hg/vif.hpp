@@ -7,6 +7,7 @@
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -67,6 +68,9 @@ struct Vu1AccessLog {
     // Both masks: bit vector*4+lane (lane0=X ... lane3=W).
     std::array<std::uint64_t,64> reads{};
     std::array<std::uint64_t,64> writes{};
+    // Optional first-write undo image for a speculative activation. Null on the
+    // synchronous path and on exact re-execution.
+    Vu1MemoryWriteTracker* undo=nullptr;
     // lanes: bit0=X ... bit3=W. A lane this activation already wrote is not an input.
     void read(std::size_t vector,unsigned lanes) {
         const auto shift=(vector&15)*4;
@@ -77,6 +81,13 @@ struct Vu1AccessLog {
         std::uint64_t lanes=0;
         for(unsigned lane=0;lane<4;++lane)if(dest&(8u>>lane))lanes|=std::uint64_t(1)<<lane;
         writes[vector>>4]|=lanes<<((vector&15)*4);
+    }
+    void write(const std::array<std::uint32_t,4096>& memory,
+               const std::array<std::uint8_t,1024>& defined,
+               std::size_t vector,unsigned dest) {
+        if(undo)for(unsigned lane=0;lane<4;++lane)if(dest&(8u>>lane))
+            undo->before_write(memory,defined,vector*4+lane,vector);
+        write(vector,dest);
     }
 };
 // VIF1 UNPACK lanes since a dispatch: value written, or definedness changed.
@@ -475,7 +486,7 @@ struct Vu1State {
         if(fs>=vf.size()||is>=vi.size())throw std::runtime_error("VU1 SQ register index exceeds register file");
         const auto vector=std::int32_t(read_vi(is))+immediate;
         if(vector<0||vector>=1024)throw std::runtime_error("VU1 SQ exceeds VU1 data memory");
-        if(access_log)access_log->write(std::size_t(vector),dest);
+        if(access_log)access_log->write(memory,memory_defined,std::size_t(vector),dest);
         for(unsigned lane=0;lane!=4;++lane)if(dest&(8u>>lane)) {
             const auto bit=std::uint8_t(1u<<lane);
             const auto index=std::size_t(vector)*4+lane;
@@ -496,7 +507,7 @@ struct Vu1State {
         if(it>=vi.size()||is>=vi.size())throw std::runtime_error("VU1 ISW register index exceeds VI file");
         const auto vector=std::int32_t(read_vi(is))+immediate;
         if(vector<0||vector>=1024)throw std::runtime_error("VU1 ISW exceeds VU1 data memory");
-        if(access_log)access_log->write(std::size_t(vector),dest);
+        if(access_log)access_log->write(memory,memory_defined,std::size_t(vector),dest);
         for(unsigned lane=0;lane!=4;++lane)if(dest&(8u>>lane)) {
             const auto index=std::size_t(vector)*4+lane;
             memory[index]=read_vi(it);
@@ -633,6 +644,16 @@ struct Vif1Path {
     bool dbf=false;
     bool path3_masked=false;
     bool mark_detected=false;
+    // HG-DIAG-116: opt-in (HG_VIF_TRACE=1) ring of decoded VIFcodes with the
+    // state they used; printed with EE faults. Observation only.
+    struct VifTraceEntry {std::uint32_t code=0,destination=0,cycle=0,mode=0,mask=0,tops=0,top=0,base=0,offset=0;bool dbf=false;};
+    static inline const bool trace_vifcodes=[]{const char* v=std::getenv("HG_VIF_TRACE");return v&&v[0]=='1';}();
+    std::array<VifTraceEntry,256> vif_trace{};
+    std::size_t vif_trace_cursor=0;
+    void record_vifcode(std::uint32_t code,std::uint32_t destination) {
+        auto& entry=vif_trace[vif_trace_cursor++%vif_trace.size()];
+        entry={code,destination,cycle,mode,mask,tops,top,base,offset,dbf};
+    }
     static constexpr std::size_t max_pending=1024*1024+16;
     std::uint32_t error_mask=0;
     Vif1Path() {vu_mem_defined.fill(0x0fu);}
@@ -808,7 +829,8 @@ struct Vif1Path {
             }
         }
         flush(vector-first);
-        throw std::runtime_error("VU1 XGKICK packet exceeds VU1 data memory");
+        throw std::runtime_error("VU1 XGKICK packet exceeds VU1 data memory; start="+std::to_string(first)+
+            " format="+std::to_string(format)+" entries_remaining="+std::to_string(entries_remaining)+" eop="+std::to_string(eop));
     }
     void submit_qword(std::uint64_t low,std::uint64_t high,GifPath& gif,GsRegisterState& gs) {
         begin_pending_source(0);

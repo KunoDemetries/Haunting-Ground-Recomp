@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -17,6 +18,15 @@ int failures=0;
 #define CHECK(condition) do{if(!(condition)){++failures;std::cerr<<"Failed line "<<__LINE__<<": "#condition"\n";}}while(0)
 
 constexpr std::uint32_t source=0x00100000u;
+
+void set_test_environment(const char* name,const char* value) {
+#ifdef _WIN32
+    const auto result=_putenv_s(name,value?value:"");
+#else
+    const auto result=value?setenv(name,value,1):unsetenv(name);
+#endif
+    if(result!=0)throw std::runtime_error("failed to update test environment");
+}
 
 struct Pair {
     std::unique_ptr<hg::State> sync=std::make_unique<hg::State>();
@@ -328,14 +338,14 @@ std::vector<std::uint32_t> spec_stream(bool faulting) {
 }
 void speculative_vu1() {
     for(const bool faulting:{false,true})for(const char* workers:{"1","2","3"}) {
-        setenv("HG_VU_WORKERS",workers,1);
+        set_test_environment("HG_VU_WORKERS",workers);
         const auto saved=hg::vu1_spec_info_query;
         hg::vu1_spec_info_query=&spec_info;
         Pair p;
         p.both([&](hg::State& s){s.vif1.vu1_executor=&spec_executor;});
         // The device thread captured the executor at start; restart it with the synthetic one.
         p.link->stop();p.link=hg::start_device_thread(p.dev->vif1,p.dev->gif,p.dev->gs,{});p.dev->device=p.link.get();
-        unsetenv("HG_VU_WORKERS");
+        set_test_environment("HG_VU_WORKERS",nullptr);
         const auto words=spec_stream(faulting);
         p.both([&](hg::State& s){put_words(s,source,words);start(s,1,std::uint32_t(words.size()/4));});
         const auto expected=fault_text([&]{while(p.sync->pump_vif1()){}});
@@ -385,13 +395,13 @@ hg::Vu1SpecInfo spec_lane_info(const hg::Vif1Path&,std::uint16_t entry) {
 }
 void speculative_vu1_partial_lanes() {
     for(const char* workers:{"1","2","3"}) {
-        setenv("HG_VU_WORKERS",workers,1);
+        set_test_environment("HG_VU_WORKERS",workers);
         const auto saved=hg::vu1_spec_info_query;
         hg::vu1_spec_info_query=&spec_lane_info;
         Pair p;
         p.both([&](hg::State& s){s.vif1.vu1_executor=&spec_lane_executor;});
         p.link->stop();p.link=hg::start_device_thread(p.dev->vif1,p.dev->gif,p.dev->gs,{});p.dev->device=p.link.get();
-        unsetenv("HG_VU_WORKERS");
+        set_test_environment("HG_VU_WORKERS",nullptr);
         std::vector<std::uint32_t> w{0x01000404u,0x03000020u,0x02000040u};
         for(unsigned k=0;k<64;++k) {
             w.push_back(0x6c018000u);w.insert(w.end(),{k,k,k*3u,0x3f800000u});

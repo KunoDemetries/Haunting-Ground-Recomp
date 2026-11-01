@@ -16,6 +16,24 @@ static void require(bool value,const char* message) {
 }
 int main() {
     try {
+        using FrameLimiter=hg::HostFrameLimiter30;
+        FrameLimiter frame_limiter;
+        const auto frame_start=FrameLimiter::Clock::time_point{};
+        require(frame_limiter.due(frame_start),"first locked frame should be due");
+        frame_limiter.presented(frame_start);
+        require(!frame_limiter.due(frame_start+std::chrono::milliseconds(1)),"frame became due before 30 Hz deadline");
+        require(frame_limiter.due(frame_start+FrameLimiter::period),"second locked frame missed 30 Hz deadline");
+        frame_limiter.presented(frame_start+FrameLimiter::period+std::chrono::milliseconds(1));
+        require(!frame_limiter.due(frame_start+FrameLimiter::period*2-std::chrono::nanoseconds(1)),
+                "presentation jitter moved the absolute cadence");
+        const auto stalled=frame_start+std::chrono::seconds(1);
+        require(frame_limiter.due(stalled),"long-stalled frame was not due");
+        frame_limiter.presented(stalled);
+        require(frame_limiter.rebases()==1&&!frame_limiter.due(stalled+std::chrono::milliseconds(1)),
+                "long frame stall created a catch-up burst");
+        frame_limiter.reset();
+        require(frame_limiter.due(stalled+std::chrono::milliseconds(1)),"toggle reset retained an old deadline");
+
         Pacer p(at(0));
         require(!p.due(9999) && p.due(10000),"pacing check boundary incorrect");
         require(p.deadline(10000,at(2500))==at(10000),"fast work must wait for modeled time");
@@ -79,6 +97,6 @@ int main() {
                      <<(elapsed[15]+elapsed[16])/2<<" max_us="<<elapsed.back()
                      <<" mean_us="<<std::accumulate(elapsed.begin(),elapsed.end(),0.0)/elapsed.size()<<'\n';
         }
-        std::cout<<"Host pacing: deadlines, jitter, stall recovery and 12000 modeled steps passed\n";
+        std::cout<<"Host pacing: 30 Hz frame lock, deadlines, jitter, stall recovery and 12000 modeled steps passed\n";
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }

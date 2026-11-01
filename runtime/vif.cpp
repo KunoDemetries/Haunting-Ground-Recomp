@@ -65,6 +65,7 @@ void Vif1Path::process_pending(GifPath& gif,GsRegisterState& gs) {
             if(code&0x80000000u)throw std::runtime_error("VIF1 interrupt-control VIFcode requires interrupt delivery");
             const auto command=std::uint8_t(code>>24)&0x7f;
             const auto immediate=std::uint16_t(code);
+            if(trace_vifcodes)record_vifcode(code,command>=0x60?(immediate&0x8000?tops:0)+(immediate&0x3ff):0xffffffffu);
             if(command==0x20) { // STMASK: one following word.
                 if(pending.size()-cursor<8){need=cursor+8;break;}
                 mask=word(pending,cursor+4);cursor+=8;continue;

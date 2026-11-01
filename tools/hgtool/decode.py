@@ -104,6 +104,8 @@ def decode(pc, word):
             name = 'cache_dxltg'
         elif rt == 20:
             name = 'cache_dxwbin'
+        elif rt == 22:
+            name = 'cache_dxin'
     elif op == 62:
         name = 'sqc2'
     elif op == 17:
@@ -207,7 +209,7 @@ def decode(pc, word):
     else:
         name = {8:'addi', 9:'addiu', 10:'slti', 11:'sltiu', 12:'andi', 13:'ori', 14:'xori',
                 15:'lui', 25:'daddiu', 26:'ldl', 27:'ldr', 30:'lq', 31:'sq', 32:'lb', 33:'lh', 34:'lwl', 35:'lw', 36:'lbu',
-                37:'lhu', 38:'lwr', 39:'lwu', 40:'sb', 41:'sh', 42:'swl', 43:'sw', 44:'sdl', 45:'sdr', 46:'swr', 49:'lwc1', 54:'lqc2', 55:'ld', 57:'swc1', 63:'sd'}.get(op, name)
+                37:'lhu', 38:'lwr', 39:'lwu', 40:'sb', 41:'sh', 42:'swl', 43:'sw', 44:'sdl', 45:'sdr', 46:'swr', 49:'lwc1', 51:'pref', 54:'lqc2', 55:'ld', 57:'swc1', 63:'sd'}.get(op, name)
     # Reserved fields must not turn arbitrary data into plausible instructions.
     if op == 0:
         # Original movie-copy mask word executes as DSRA32. Exact encoding

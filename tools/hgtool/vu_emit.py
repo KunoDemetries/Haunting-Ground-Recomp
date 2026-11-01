@@ -300,13 +300,15 @@ def _pair_lines(pair,readiness=None):
     if not pair.lower_is_immediate and pair.lower_name=='waitp':
         lines.append('v.vu1.wait_p();')
     lower_snapshot=None
-    if (not pair.lower_is_immediate and pair.lower_name=='sq' and
+    if (not pair.lower_is_immediate and pair.lower_name in {'sq','sqi'} and
             writes.get(pair.lower_fields['is'],0)&pair.lower_fields['dest']):
         # Upper/lower VU pipelines issue concurrently. SQ reads its VF/VI
         # operands before same-pair upper writeback, so preserve the pair-start
         # register state for the lower store while committing the upper normally.
         # Disjoint VF lanes need no snapshot: upper operations do not write VI,
-        # and SQ observes neither ACC nor arithmetic flags.
+        # and SQ observes neither ACC nor arithmetic flags. SQI stores the same
+        # pair-start VF value; its VI post-increment then applies to live state
+        # (2026-10-11: an ITOF12/SQI pair stored the new upper result as a GIF tag).
         suffix=f'{pair.address:04x}'
         lower_snapshot=f'lower_vu1_snapshot_{suffix}'
         lines.append(f'const auto {lower_snapshot}=v.vu1;')
@@ -318,7 +320,11 @@ def _pair_lines(pair,readiness=None):
         lines.append(f'v.vu1.i=0x{pair.lower_fields["value"]:08x}u;')
     elif lower_snapshot is not None:
         fields=pair.lower_fields
-        lines.append(f'{lower_snapshot}.store_qword(v.vu_mem,v.vu_mem_defined,{fields["is"]},{fields["it"]},{fields["imm11"]},{fields["dest"]});')
+        if pair.lower_name=='sqi':
+            lines.append(f'{lower_snapshot}.store_qword(v.vu_mem,v.vu_mem_defined,{fields["is"]},{fields["it"]},0,{fields["dest"]});')
+            lines.append(f'v.vu1.write_vi({fields["it"]},std::uint16_t(v.vu1.read_vi({fields["it"]})+1));')
+        else:
+            lines.append(f'{lower_snapshot}.store_qword(v.vu_mem,v.vu_mem_defined,{fields["is"]},{fields["it"]},{fields["imm11"]},{fields["dest"]});')
     else:
         lines+=_lower(pair)
     lines += [f'v.vu1.produced_vf({reg},{mask});' for reg,mask in sorted(writes.items())]
@@ -647,25 +653,55 @@ def _written_lines(by_address,pc,leaders):
     return lines
 
 
+def _entry_ranges(pairs,entry):
+    """MicroMem pairs one activation at `entry` can execute: every pair reachable
+    from it (relative branches only; JR/JALR are rejected) plus branch/END delay
+    pairs. Returned as contiguous (first byte address, pair count) runs."""
+    by_address={pair.address:pair for pair in pairs}
+    covered=set()
+    for pc in _reachable(pairs,[entry]):
+        covered.update(_node(by_address,pc))
+    runs=[]
+    for address in sorted(covered):
+        if runs and runs[-1][0]+runs[-1][1]*8==address:
+            runs[-1][1]+=1
+        else:
+            runs.append([address,1])
+    return [tuple(run) for run in runs]
+
+
 def emit_vu1(image,programs):
     if not programs:
         return []
     out=[]
     dispatch=[]
+    by_entry={}
     for number,program in enumerate(programs):
         micro_base,data=_program_bytes(image,program)
         count=len(data)//8
         pairs=decode_program(data,micro_base)
         expected=[int.from_bytes(data[n:n+8],'little') for n in range(0,len(data),8)]
         symbol=f'vu1_program_{number}'
-        out.append(f'static bool {symbol}_matches(const hg::Vif1Path& v) {{')
-        out.append(f'    static constexpr std::array<std::uint64_t,{count}> expected={{')
-        out.append('        '+','.join(f'0x{word:016x}ull' for word in expected))
-        out.append('    };')
-        out.append(f'    constexpr std::size_t base=0x{micro_base//8:x}u;')
-        out.append('    for(std::size_t n=0;n<expected.size();++n)if(v.vu_micro_mem[base+n]!=expected[n])return false;')
-        out.append('    return true;')
-        out.append('}')
+        # HG: identity is per activation entry and covers exactly the MicroMem
+        # pairs that activation can execute. A later upload elsewhere in
+        # MicroMem (a new area's composite) leaves an already-proven program
+        # valid; any changed reachable pair still fails explicitly.
+        for entry in program['entries']:
+            checks=[]
+            for first,pair_count in _entry_ranges(pairs,entry):
+                start=(first-micro_base)//8
+                words=expected[start:start+pair_count]
+                name=f'{symbol}_e{entry:04x}_{first:04x}'
+                out.append(f'static constexpr std::array<std::uint64_t,{pair_count}> {name}={{')
+                out.append('    '+','.join(f'0x{word:016x}ull' for word in words))
+                out.append('};')
+                checks.append((first//8,name))
+            out.append(f'static bool {symbol}_e{entry:04x}_matches(const hg::Vif1Path& v) {{')
+            for base,name in checks:
+                out.append(f'    for(std::size_t n=0;n<{name}.size();++n)if(v.vu_micro_mem[0x{base:x}u+n]!={name}[n])return false;')
+            out.append('    return true;')
+            out.append('}')
+            by_entry.setdefault(entry,[]).append((f'{symbol}_e{entry:04x}_matches',symbol,program['name']))
         fn=f'{symbol}_run'
         out.append(f'static void {fn}(hg::Vif1Path& v,std::uint16_t entry,hg::GifPath& gif,hg::GsRegisterState& gs) {{')
         out.append('    bool vu_ready_clock_safe=true;')
@@ -685,14 +721,26 @@ def emit_vu1(image,programs):
         out.append('    return {};')
         out.append('}')
     out.append('void run_vu1_aot(hg::Vif1Path& v,std::uint16_t entry,hg::GifPath& gif,hg::GsRegisterState& gs) {')
-    for symbol,fn,name in dispatch:
-        out.append(f'    if({symbol}_matches(v)) {{{fn}(v,entry,gif,gs);return;}} // {name}')
+    out.append('    switch(entry) {')
+    for entry in sorted(by_entry):
+        out.append(f'    case 0x{entry:04x}u:')
+        for matches,symbol,name in by_entry[entry]:
+            out.append(f'        if({matches}(v)) {{{symbol}_run(v,entry,gif,gs);return;}} // {name}')
+        out.append('        break;')
+    out.append('    default:break;')
+    out.append('    }')
     out.append('    throw std::runtime_error("VU1 AOT entry/program identity has no static translation; entry="+std::to_string(entry));')
     out.append('}')
     # Static live-in set of an activation; known=false for unknown programs/entries.
     out.append('hg::Vu1SpecInfo vu1_aot_spec_info(const hg::Vif1Path& v,std::uint16_t entry) {')
-    for symbol,fn,name in dispatch:
-        out.append(f'    if({symbol}_matches(v))return {symbol}_spec_info(entry);')
+    out.append('    switch(entry) {')
+    for entry in sorted(by_entry):
+        out.append(f'    case 0x{entry:04x}u:')
+        for matches,symbol,name in by_entry[entry]:
+            out.append(f'        if({matches}(v))return {symbol}_spec_info(entry);')
+        out.append('        break;')
+    out.append('    default:break;')
+    out.append('    }')
     out.append('    return {};')
     out.append('}')
     return out

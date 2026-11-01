@@ -149,6 +149,16 @@ int main() {
     CHECK(f.divide(0xbf800000,0x40400000)==0xbeaaaaaa); // Toward zero for negatives too.
     CHECK(f.divide(0x40000000,0x40400000)==0x3f2aaaaa); // Other normalization branch.
     CHECK(f.divide(0x7f800000,0x3f800000)==0x7f800000); // EE exponent 255 is finite.
+    // HG-DIAG-126 oracle profile: PCSX2's VU0 add (exact sum, chop) vs the console's add.
+    CHECK(f.add(0xc57f9101,0x3b800200)==0xc57f90f1 && f.add_exact_chop(0xc57f9101,0x3b800200)==0xc57f90f0);
+    CHECK(f.add(0xc680a61c,0x4a000000)==0x49fdfd68 && f.add_exact_chop(0xc680a61c,0x4a000000)==0x49fdfd67);
+    CHECK(f.add_exact_chop(0x3f800000,0xbf800000)==0 && f.add_exact_chop(0x3f800000,0x33800000)==0x3f800000);
+    CHECK(f.add_exact_chop(0x3f800000,0xa0000000)==0x3f7fffff); // tiny borrow crosses the binade.
+    // COP1 DIV.S rounds to nearest (closest available model; docs/SOURCES.md 2026-10-25).
+    CHECK(f.divide(0x3f800000,0x40400000,true)==0x3eaaaaab);
+    CHECK(f.divide(0x40000000,0x40400000,true)==0x3f2aaaab);
+    CHECK(f.divide(0x3f800000,0x3fa00000,true)==0x3f4ccccd); // 1/1.25, as on the console and PCSX2.
+    CHECK(f.divide(0x3f800000,0x3f000000,true)==0x40000000); // exact quotients stay exact.
     f.write_control(0);
     CHECK(f.divide(0x3f800000,0x80000001)==0xffffffff && (f.control&0x3c078)==0x10020);
     CHECK(f.divide(0x80000000,0x80000100)==0x7fffffff && (f.control&0x3c078)==0x20060);
@@ -158,7 +168,13 @@ int main() {
     CHECK(f.divide(0x3f800000,0x3f800000)==0x3f800000 && (f.control&0x3c078)==0x78);
     CHECK(f.sqrt_exact(0x41100000)==0x40400000); // sqrt(9) = 3.
     CHECK(f.sqrt_exact(0x40800000)==0x40000000); // odd unbiased exponent: sqrt(4) = 2.
-    CHECK(f.sqrt_exact(0x80000001)==0x80000000); // exponent-zero signed zero.
+    CHECK(f.sqrt_exact(0x80000001)==0); // exponent-zero input: +0 (hardware sqrt(-0) = +0, ps2autotests).
+    // COP1 add keeps one guard bit: results captured on a real PS2 (tools/hwtest, 2026-10-24).
+    CHECK(f.add(0x3c80938cu,0xb97fd4feu)==0x3c7d27c5u);
+    CHECK(f.add(0xc172efb2u,0x35ffffffu)==0xc172efb0u);
+    CHECK(f.add(0x386fbcb4u,0xac0631e5u)==0x386fbcb3u);
+    CHECK(f.add(0xbec710d7u,0x3a7ffffbu)==0xbec690d7u);
+    CHECK(f.add(0x38800080u,0xb1006b41u)==0x387ffeffu);
     CHECK(f.sqrt_exact(0x40000000)==0x3fb504f3); // Measured original startup input2.
     CHECK(f.sqrt_exact(0x3f000000)==0x3f3504f3); // Same significand, negative odd exponent.
     f.write_control(0x3c078);CHECK(f.sqrt_exact(0x40000000)==0x3fb504f3);
@@ -167,7 +183,11 @@ int main() {
     CHECK(f.sqrt_exact(0x3f800001)==0x3f800000);
     CHECK(f.sqrt_exact(0x00800000)==0x20000000);
     CHECK(f.sqrt_exact(0x7f7fffff)==0x5f7fffff);
-    bool sqrt_fault=false;try {f.sqrt_exact(0xbf800000);}catch(const std::runtime_error&){sqrt_fault=true;}CHECK(sqrt_fault);
+    // EE Core User's Manual Table 8-4: negative -> sqrt(|x|) with I and SI set.
+    f.write_control(0x8010);CHECK(f.sqrt_exact(0xc1100000)==0x40400000); // sqrt(-9) = 3.
+    CHECK((f.control&0x30040u)==0x20040u && (f.control&0x8010u)==0x8010u);
+    CHECK(f.sqrt_exact(0x40800000)==0x40000000 && (f.control&0x30000u)==0 && (f.control&0x40u)); // I clears, SI sticks.
+    CHECK(f.sqrt_exact(0x7f800000)==0x5f800000); // Exponent 255 is a normal value on the EE.
     CHECK(f.cvt_s_w_exact(123)==0x42f60000 && f.cvt_s_w_exact(0xffffff85)==0xc2f60000);
     bool convert_fault=false;try {f.cvt_s_w_exact(0x01000001);}catch(const std::runtime_error&){convert_fault=true;}CHECK(convert_fault);
     CHECK(f.cvt_w_s(0x40200000)==2 && f.cvt_w_s(0xc0200000)==0xfffffffe && f.cvt_w_s(0x4f000000)==0x7fffffff);

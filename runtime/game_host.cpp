@@ -2,6 +2,7 @@
 #include "hg/native_host.hpp"
 #include "hg/keyboard_input.hpp"
 #include "hg/controls_panel.hpp"
+#include "hg/host_pacing.hpp"
 #include "gl_gs.hpp"
 #include "hg/gs_triangle_acceleration.hpp"
 #include <atomic>
@@ -12,7 +13,7 @@
 namespace {
 struct Frame {unsigned width=0,height=0;std::vector<std::uint32_t> pixels;};
 struct Session {
-    std::atomic<bool> closing{false},done{false};
+    std::atomic<bool> closing{false},done{false},limit_30{false};
     std::mutex mutex;
     Frame pending;
     hg::HostInput input;
@@ -20,17 +21,22 @@ struct Session {
     std::string status;
     int result=0;
     bool refresh_requested=true; // UI-thread only; repaint even without a new game frame.
+    std::atomic<unsigned> checkpoint_requests{0}; // F5 presses not yet taken by the game thread.
+    std::string notice; // Guarded by mutex; shown in the title until notice_until.
+    std::chrono::steady_clock::time_point notice_until{};
 };
 hg::HostInput read_input(GLFWwindow* window) {
     const bool focused=glfwGetWindowAttrib(window,GLFW_FOCUSED)!=0;
     hg::KeyboardKeys keys{};
     if(focused) {
-        // Matches KeyboardKey order; retain every existing keyboard binding.
+        // Matches KeyboardKey order. Physical keys: the D-pad slots (up/right/down/left)
+        // are I/L/K/J and the right-stick slots (left/right/up/down) are the arrow keys
+        // (user request 2026-10-16: arrows drive the camera stick).
         constexpr std::array<int,hg::keyboard_key_count> codes{{
             GLFW_KEY_BACKSPACE,GLFW_KEY_LEFT_SHIFT,GLFW_KEY_RIGHT_SHIFT,GLFW_KEY_ENTER,
-            GLFW_KEY_UP,GLFW_KEY_RIGHT,GLFW_KEY_DOWN,GLFW_KEY_LEFT,
+            GLFW_KEY_I,GLFW_KEY_L,GLFW_KEY_K,GLFW_KEY_J,
             GLFW_KEY_1,GLFW_KEY_3,GLFW_KEY_Q,GLFW_KEY_E,GLFW_KEY_V,GLFW_KEY_X,GLFW_KEY_SPACE,GLFW_KEY_C,
-            GLFW_KEY_A,GLFW_KEY_D,GLFW_KEY_W,GLFW_KEY_S,GLFW_KEY_J,GLFW_KEY_L,GLFW_KEY_I,GLFW_KEY_K
+            GLFW_KEY_A,GLFW_KEY_D,GLFW_KEY_W,GLFW_KEY_S,GLFW_KEY_LEFT,GLFW_KEY_RIGHT,GLFW_KEY_UP,GLFW_KEY_DOWN
         }};
         static_assert(codes[static_cast<std::size_t>(hg::KeyboardKey::backspace)]==GLFW_KEY_BACKSPACE);
         static_assert(codes[static_cast<std::size_t>(hg::KeyboardKey::q)]==GLFW_KEY_Q);
@@ -90,6 +96,9 @@ int main(int argc,char** argv) {
     if(!have_clock){arguments.push_back("--clock-profile");arguments.push_back("issue-slots");}
     if(!have_slices){arguments.push_back("--slices");arguments.push_back("3000000000");}
     if(!unlimited&&!have_realtime)arguments.push_back("--realtime");
+    // Interactive playback defaults to the game's 30 Hz frame cadence. Hidden
+    // correctness/performance runs and explicit unlimited runs remain untouched.
+    session.limit_30=!hidden_host&&!unlimited;
     std::vector<char*> native_args;for(auto& arg:arguments)native_args.push_back(arg.data());
 #ifdef _WIN32
         SetCurrentProcessExplicitAppUserModelID(L"HauntingGround.StaticRecomp.Viewer");
@@ -128,6 +137,7 @@ int main(int argc,char** argv) {
         glGenTextures(1,&texture);glBindTexture(GL_TEXTURE_2D,texture);
         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
         hg::NativeHost host;
+        hg::HostFrameLimiter30 frame_limiter;
         host.closing=[&]{return session.closing.load();};
         host.input=[&](hg::HostInput& value) {
             std::lock_guard<std::mutex> lock(session.mutex);
@@ -143,6 +153,12 @@ int main(int argc,char** argv) {
         };
         host.stopped=[&](const std::string& text) {
             {std::lock_guard<std::mutex> lock(session.mutex);session.status=text;}
+            glfwPostEmptyEvent();
+        };
+        host.checkpoint_requested=[&]{return session.checkpoint_requests.exchange(0)!=0;};
+        host.notice=[&](const std::string& text) {
+            {std::lock_guard<std::mutex> lock(session.mutex);
+             session.notice=text;session.notice_until=std::chrono::steady_clock::now()+std::chrono::seconds(5);}
             glfwPostEmptyEvent();
         };
         if(gpu_sprites) {
@@ -164,6 +180,7 @@ int main(int argc,char** argv) {
             session.done=true;glfwPostEmptyEvent();
         });
         unsigned width=0,height=0,presented=0;bool verified=false;
+        bool previous_frame_lock_key=false,previous_checkpoint_key=false;
         int last_framebuffer_width=-1,last_framebuffer_height=-1;
         std::uint64_t last_produced=0;unsigned last_presented=0;
         Frame previous_video;unsigned changed_presented=0,last_changed=0;
@@ -175,14 +192,28 @@ int main(int argc,char** argv) {
                 const bool focused=glfwGetWindowAttrib(window,GLFW_FOCUSED)!=0;
                 if(controls.update(focused&&!no_input&&glfwGetKey(window,GLFW_KEY_F1)==GLFW_PRESS,
                                    focused&&glfwGetKey(window,GLFW_KEY_ESCAPE)==GLFW_PRESS))break;
+                const bool frame_lock_key=focused&&glfwGetKey(window,GLFW_KEY_F2)==GLFW_PRESS;
+                if(frame_lock_key&&!previous_frame_lock_key) {
+                    session.limit_30=!session.limit_30.load();
+                    frame_limiter.reset();
+                    session.refresh_requested=true;
+                }
+                previous_frame_lock_key=frame_lock_key;
+                // F5: request an input-replay checkpoint (written by the game thread).
+                const bool checkpoint_key=focused&&glfwGetKey(window,GLFW_KEY_F5)==GLFW_PRESS;
+                if(checkpoint_key&&!previous_checkpoint_key)++session.checkpoint_requests;
+                previous_checkpoint_key=checkpoint_key;
             }
             if(was_open!=controls.open)session.refresh_requested=true;
             Frame incoming;std::uint64_t produced;std::string status;
             const auto input=(no_input||controls.open)?hg::HostInput{}:read_input(window);
+            const bool accept_frame=!session.limit_30.load()||
+                frame_limiter.due(hg::HostFrameLimiter30::Clock::now());
             {
                 std::lock_guard<std::mutex> lock(session.mutex);
                 if(!(input==session.input)){session.input=input;++session.input_version;}
-                incoming=std::move(session.pending);session.pending={};produced=session.produced;status=session.status;
+                if(accept_frame){incoming=std::move(session.pending);session.pending={};}
+                produced=session.produced;status=session.status;
             }
             const bool fresh=!incoming.pixels.empty();
             if(video_rate_log&&fresh&&(incoming.width!=previous_video.width||incoming.height!=previous_video.height||
@@ -233,7 +264,10 @@ int main(int argc,char** argv) {
                 gl.use_program(program);glBindTexture(GL_TEXTURE_2D,controls_texture);
                 gl.bind_vertex_array(vao);gl.draw_arrays(GL_TRIANGLES,0,6);
             }
-            glfwSwapBuffers(window);if(fresh)++presented;
+            glfwSwapBuffers(window);if(fresh) {
+                ++presented;
+                if(session.limit_30.load())frame_limiter.presented(hg::HostFrameLimiter30::Clock::now());
+            }
             last_framebuffer_width=w;last_framebuffer_height=h;
             }
             if(video_rate_log&&fresh)previous_video=std::move(incoming);
@@ -244,8 +278,10 @@ int main(int argc,char** argv) {
                     <<" presented="<<(presented-last_presented)<<" changed="<<(changed_presented-last_changed)<<'\n';
                 std::ostringstream title;title<<"Haunting Ground | ";
                 if(session.done)title<<(status.empty()?"Stopped":status);
-                else title<<std::fixed<<std::setprecision(1)<<double(produced-last_produced)/seconds<<" video updates/s | WASD / IJKL | Space / X / C / V";
-                title<<" | F1: Controls";
+                else title<<std::fixed<<std::setprecision(1)<<double(produced-last_produced)/seconds<<" video updates/s | WASD / Arrows | Space / X / C / V";
+                title<<" | F1: Controls | F2: 30 FPS Lock "<<(session.limit_30.load()?"On":"Off")<<" | F5: Save checkpoint";
+                {std::lock_guard<std::mutex> lock(session.mutex);
+                 if(!session.notice.empty()&&now<session.notice_until)title<<" | "<<session.notice;}
                 glfwSetWindowTitle(window,title.str().c_str());last_produced=produced;last_presented=presented;
                 last_changed=changed_presented;report=now;
             }

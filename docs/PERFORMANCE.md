@@ -1,3 +1,43 @@
+## 2026-10-11 HG-PERF-116/118/119 â€” heavy gameplay at 30 FPS (paced) / ~42 updates/s (unlimited)
+
+Same contract (`gameplay180m_threaded`, heavy window 150Mâ€“179M, 839 writers, byte-identical captures). HG-PERF-116: all GS ATST modes on GPU triangles, aggregate 31.90 vs 26â€“31 controls. HG-PERF-118: `--preview-file` encode/write moved off stage C, aggregate 42.5 vs 36.6, p10 41â€“42 vs 28.5â€“29.9. HG-PERF-119: speculative VU1 workers on by default (3 on â‰¥8 threads). Final production EXE `e053f17bâ€¦` with no overrides: unlimited **42.22 / 42.52** (0 of 28 intervals below 29.9); `--realtime` **29.96** aggregate, 27 of 28 intervals at 29.91â€“30.08 (one 29.01). Without workers the same build gives 24.7 / 23.6. Host: Ryzen 7 9800X3D / RTX 5070 / NVIDIA 617.42 / Balanced power plan. Other scenes and hosts are unmeasured.
+
+## 2026-10-11 HG-PERF-114/115 normal-threaded benchmark and deferred resident GL error polling
+
+New benchmark contract `gameplay180m_threaded`: the pinned `gameplay180m_authentic` inputs without `--profile`, plus `--frame-rate-probe` (HG-DIAG-114). The metric is the 30-writer checkpoint rate over 150Mâ€“179M (839 writers). On a Ryzen 7 9800X3D / RTX 5070 / NVIDIA 617.42: `--profile` 13.28; threaded 24.30; threaded + `HG_VU_WORKERS=3` 27.0â€“27.6. Stage C (GIF/GS/GL) is saturated (HG-DIAG-091). HG-DIAG-115 sampling showed the resident post-`glFlush` `glGetError` was 14.5% of stage C. HG-PERF-115 defers it to coherence points: heavy-window mean 28.10 vs 27.09 (+3.7%), median +5.0%, five interleaved pairs, byte-identical captures. Provisionally retained.
+
+## 2026-10-11 HG-PERF-112 doubled GPU triangle capacity ï¿½ verified activation, rejected throughput
+
+On the same authentic 180M recorded-input route the candidate increased the triangle job payload flush cap from 1024 to 2048; 21,985,289 triangles stayed the same while triangle batches fell 36,047 to 25,670 (-28.79%) and overall GPU flushes 58,247 to 47,869 (-17.82%). Both candidate and fresh restored control reached 5,270 qualified original frame writers, zero unexpected writers/caller faults, with exact final frame, EE/GS VRAM/GS state, VU1, console and input captures; IOP raw RTC bytes differed. Final 30-writer interval candidate **14.0522** versus adjacent control **14.8173** updates/s (-5.16%). Host time 282.100 versus 270.743 seconds. Large run-to-run variation prohibits claiming a stable causal regression, but no >=5% speed gain is established. Candidate rejected and production restored; don't chase cap-count as synonymous with GPU bottleneck. Evidence Project Link `961182539b3e4d23bf35f6501f22aa94` and `5abc546a528c4592badf45b5a2fcf6b1`. HG-FAIL-068.
+
+## 2026-10-10/11 HG-PERF-111 ï¿½ exact 180M candidate/control replay, rejected
+
+Same `gameplay180m_authentic` fixed 180,000,000-slice recorded input on RTX 5070/NVIDIA 617.42, exact original writer 5,270 with zero writer/caller/fault violations: first restored control 13.3947, candidate 11.7817, subsequent restored control 14.8537 qualified 30-writer updates/s at 180M; 175M checkpoint respectively 11.8604, 12.0715, 14.4079. Both controls exceed candidate's final interval; candidate misses >=5% retention gate. Whole-run host time 299.194/316.639/320.857 s emphasizes host variability and prevents assigning the entire candidate deficit causally. Candidate's earlier ~22% resident synthetic flush improvement therefore did **not** demonstrate authentic gameplay throughput improvement. All three match final frame, EE RAM, GS VRAM/state, VU1, metadata, console, recorded input and 5,270 writer sequence; raw IOP RAM differs in the previously documented RTC byte region, and complete masked IOP equivalence remains separately unproved. The original source was byte-restored to `5354e22bd...` and game rebuilt as EXE `99509686...`. Replay jobs control/candidate/restored-control: `7272e41e`, `d4fb425c`, `71886911`. HG-FAIL-067; no HG-PERF-111 production retention. Next: independently rank removable cost at the current triangle batch-size ceiling before considering another change.
+
+## 2026-10-09 HG-PERF-107 exact first-covered edge stepping rejected flat
+
+Replacing repeated first-covered edge determinants with exact signed-64 edge stepping
+preserved every retained artifact and passed build/runtime/translation/VU plus 1,159
+resident GPU/CPU cases. Authentic 180M candidate/control both reached 5,270 qualified
+original writers with no writer/caller/fault violations. The candidate measured
+12.0187 vs 11.9157 updates/s at 175M (+0.86%) and 12.0512 vs 11.9113 in the final
+175M--180M interval (+1.17%). The change is correct and measurably cheaper but misses
+the >=5% retention gate, so `gs.cpp` is restored exactly and the temporary replay
+harness removed. HG-FAIL-064.
+
+## 2026-10-09 HG-PERF-106 wide-STQ fallback rejected flat
+
+A native-relaxed-only widened STQ fallback safely moved all 6,195 product-overflow
+perspective triangles in the exact 180M route onto the GPU. The candidate reached
+5,270 qualified original writers with zero writer/caller/fault violations; display,
+EE RAM, GS VRAM/state, VU1 captures/state and console are byte-identical to the
+adjacent disabled control. The focused GPU differential passes 1,159 cases and the
+runtime/translation/VU suites pass. Despite complete activation, adjacent tail
+measurements are effectively flat: 175M candidate/control 11.9849/11.9479 (+0.31%)
+and final 180M 11.9595/11.9406 (+0.16%). The 6,195 recovered triangles are only
+~0.028% of ~21.99M triangle draws, so the candidate fails the material-gain gate.
+Capability remains disabled; temporary CMake replay plumbing is removed. HG-FAIL-063.
+
 ## 2026-10-05 Linux: speculative parallel VU1 + device-path batching, 6.2 -> ~9.3 FPS (exact)
 
 Linux, 8 logical CPUs (2 P-cores with HT, 4 E-cores), `CPUS=0-7`, gameplay33m qualified replay, all digests identical to `st-base3`. `HG_VU_WORKERS` unset: 6.09-6.68 FPS. Lane-granular speculative VU1 (`HG_VU_WORKERS=3`, exe e3ad3499...): 8.35-9.06; 2 workers 7.6-8.2; 1 worker no gain; 4-5 workers 7.2-7.4. VU1 re-executions 103356 -> 439 of 155375 jobs after lane-granular reads. Subsequent exact host-path changes (incremental UNPACK-union validation, GIF boundary tracking/block submission, VIF incomplete-command skip; exe 01204282...): 8.7-9.5. Rejected: B never stealing jobs (HG-FAIL-057), `stream_gif_packets=true` again (9.48/9.03 vs 9.51/9.26). Steady-window CPU: stage C ~95%+ busy (GS raster, GIF decode, GPU observer), stage B ~half VU work from stealing, EE thread ~80% with ~16-20% waiting in transport-read joins that drain in-flight VU jobs.
@@ -1552,7 +1592,7 @@ notmajorFPSgain. Only872XYZcalls andonegeneratedincludechanged;295168arithmetic
 cases,15emittertests,910GPUbothmodes and4originalstates equalRTC-only. Helperfallbacks
 preserve invalid/undefined faultorder,partialwrites,aliases,inactiveW andstickyflags.
 
-## 2026-09-20 — three bounded candidates rejected after warmed comparisons
+## 2026-09-20 ï¿½ three bounded candidates rejected after warmed comparisons
 
 Every measured replay stopped at native-iop-budget and matched original images,
 EE RAM, GS VRAM/registers and VU data/state/micro/defined; IOP differed only at
@@ -1578,7 +1618,7 @@ in download/flush/cpu_access. This is not a full unwind and does not establish
 ignored guest functions, allocation overhead or one definitive largest fix.
 
 
-## 2026-09-20 — selective MSVC /GL and /LTCG rejected
+## 2026-09-20 ï¿½ selective MSVC /GL and /LTCG rejected
 
 Generated main and own VU helpers compiled to IR, large EE shards retained /O1.
 Focused runtime/arithmetic/memory and910 GPU tests both modes passed. Four original
@@ -1588,7 +1628,7 @@ but whole30.1276809->31.18553915s worsened. Reverted. No game logic, clocks or
 arithmetic changes. Evidence vu-ltcg-pair-times.json and vultcg-* equivalence files.
 
 
-## 2026-09-20 — bounded raster write ownership retained
+## 2026-09-20 ï¿½ bounded raster write ownership retained
 
 1920 per-pixel footprint cases plus memory/observer/fault, arithmetic/runtime and
 910 GPU cases both modes pass. Four originals match all images/EE/GS/VU, IOP RTC
@@ -1599,7 +1639,7 @@ Evidence raster-write-pages-baseline, raster-write-pages-pair-times.json,
 rasterpages-* equivalence files. Source gs_raster_pages.hpp and scoped memory.
 
 
-## 2026-09-20 — bounded input reads and deferred fallback flush rejected
+## 2026-09-20 ï¿½ bounded input reads and deferred fallback flush rejected
 
 Read narrowing: controls8.8914/8.8404s, candidates8.9223/8.8808s (+0.40% mean).
 Combined with resident hazard-driven fallback flush: controls8.8726/8.8403s,
@@ -1614,7 +1654,7 @@ controls8.993/9.354; sampled cadence varies, not internal game FPS. Use matched
 fixed-work scene time for the small retained write-only gain.
 
 
-## 2026-09-20 — exact packed VU full-lane addition retained
+## 2026-09-20 ï¿½ exact packed VU full-lane addition retained
 
 AVX2 isolated unit and CPU/OS feature guard; scalar fallback remains. Integer
 alignment/add/subtract/flags reproduce scalar Fpu::add. After carry shift m<=2^24-1,
@@ -1629,7 +1669,7 @@ Artifacts vu-add4-baseline, vu-add4-general-rejected, vu-add4-exact-pair-times.j
 vuadd4exact-* equivalence files. No timing or rendering changes in this candidate.
 
 
-## 2026-09-20 — XYZ packed-add extension rejected
+## 2026-09-20 ï¿½ XYZ packed-add extension rejected
 
 Original XYZ validity guards/scalar products with zero-padded add4 preserved all
 VU reference checks and4original image/state captures, IOP RTC-only. Warmed scene

@@ -538,6 +538,11 @@ int main() {
     record[12]=0xa7;read_dvd.complete_cdvd_dma(record);
     CHECK(!read_dvd.cdvd_dma_ready() && read_dvd.load(0x200c,1,false)==0xa7);
     CHECK(read_dvd.cdvd_irq_pending && read_dvd.cdvd_error==0);
+    // The real single-layer TOC path selects x4 CAV (0x80 | speed 3).
+    read_dvd.cdvd_irq_pending=false;
+    read_dvd.cdvd_n_parameters={16,0,0,0,1,0,0,0,16,0x83,0};
+    read_dvd.submit_cdvd_n_command(8);
+    CHECK(read_dvd.cdvd_lba==16 && read_dvd.cdvd_sectors==1 && read_dvd.cdvd_read_pending);
     CHECK(test_multi_record_dvd()==0);
     std::array<std::uint8_t,2064> toc_record{};toc_record[3]=0xf2;toc_record[1023]=0x5a;dvd.complete_cdvd_toc_dma(toc_record);
     CHECK(!(dvd.dmac.completed_channels&(1u<<3)));

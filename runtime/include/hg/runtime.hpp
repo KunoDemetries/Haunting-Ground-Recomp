@@ -7,6 +7,7 @@
 #include <atomic>
 #include <memory>
 #include <limits>
+#include <cstdlib>
 #include "hg/fpu.hpp"
 #include "hg/timers.hpp"
 #include "hg/intc.hpp"
@@ -116,6 +117,16 @@ inline std::uint64_t sra32(std::uint32_t v, unsigned n) {
 inline std::uint64_t sra64(std::uint64_t v, unsigned n) {
     n &= 63;
     return n==0 ? v : (v>>n) | ((v & (1ull<<63)) ? (~0ull << (64-n)) : 0);
+}
+// HG-DIAG-126: HG_PCSX2_VU0_ADD=1 swaps the VU0 macro adder for the PCSX2 oracle's
+// (exact sum, then chop) so oracle comparisons can see past that known emulator
+// difference. Off by default; the console's adder is Fpu::add (docs/DIAGNOSTICS.md).
+inline bool pcsx2_vu0_add_profile() {
+    static const bool enabled=[]{const char* v=std::getenv("HG_PCSX2_VU0_ADD");return v&&v[0]=='1';}();
+    return enabled;
+}
+inline std::uint32_t vu0_add(Fpu& unit,std::uint32_t a,std::uint32_t b) {
+    return pcsx2_vu0_add_profile()?unit.add_exact_chop(a,b):unit.add(a,b);
 }
 struct State {
     std::array<Register, 32> gpr{};
@@ -949,7 +960,7 @@ struct State {
             const auto a=read(source,lane);
             auto b=broadcast==4?vu0.q:read(other,broadcast>=8?broadcast-8:(multiply || broadcast==5 || broadcast==6)?lane:broadcast);
             if(!multiply && (broadcast==5 || subtract_broadcast))b^=0x80000000u;
-            const auto bits=multiply?arithmetic.multiply(a,b):arithmetic.add(a,b);
+            const auto bits=multiply?arithmetic.multiply(a,b):vu0_add(arithmetic,a,b);
             results[lane]=bits;
             const unsigned bit=3-lane;
             if(!(bits&0x7fffffffu))mac|=1u<<bit;
@@ -985,22 +996,34 @@ struct State {
             auto bits=product.bits;
             bool overflow=product.overflow,underflow=product.underflow;
             if(operation!=VuBroadcastProduct::multiply_accumulator) {
-                const auto acc_exponent=(vu0.acc[n]>>23)&255u;
-                if(underflow && acc_exponent>0 && acc_exponent<255) {
-                    // Sony VU6.0 p42: product UDF with normal ACC sets US,
-                    // while current U/O clear and Z/S describe the final sum.
-                    // Adding flushed signed zero leaves nonzero normal ACC
-                    // exact. Zero/exceptional ACC still uses the checked stop.
-                    bits=vu0.acc[n];underflow=false;sticky|=4u;
+                const bool acc_max=(vu0.acc[n]&0x7fffffffu)==0x7fffffffu;
+                const unsigned product_flags=unsigned(!(bits&0x7fffffffu))
+                    |((bits&0x80000000u)&&(bits&0x7fffffffu)?2u:0u)
+                    |(underflow?4u:0u)|(overflow?8u:0u);
+                // VU6.0 pp40,42: multiplication flags from MADD contribute
+                // only to sticky fields; current flags describe the final sum.
+                sticky|=product_flags;
+                if(acc_max) {
+                    // Sony VU6.0 p42: canonical +/-MAX ACC is already an
+                    // overflow result.  A normal or underflowed product keeps
+                    // that ACC value; an overflowing product supplies its own
+                    // saturated sign.  Product flags contribute only to the
+                    // sticky fields, while the final +/-MAX sets current O/S.
+                    if(!overflow)bits=vu0.acc[n];
+                    underflow=false;overflow=true;
+                } else if(overflow) {
+                    // Product overflow supplies its clamped result directly;
+                    // the following addition cannot recover discarded range.
+                    underflow=false;
                 } else {
-                    if(overflow || underflow || acc_exponent==255)
-                        throw Fault(pc,"VU broadcast product exceptional accumulator path is unimplemented");
+                    // VU6.0 pp26,29: exponent 255 is finite 1.F*2^128, not
+                    // IEEE infinity/NaN.  The exact integer adder therefore
+                    // handles every nonsaturated ACC encoding, including that
+                    // full exponent-255 class and final add overflow/underflow.
                     Fpu arithmetic;
-                    bits=arithmetic.add(vu0.acc[n],bits);
-                    // Other exceptional product/ACC/addition combinations
-                    // require independent validation, not EE COP1 policy.
-                    if(arithmetic.control&0xc000u)
-                        throw Fault(pc,"VU broadcast product exceptional addition path is unimplemented");
+                    bits=vu0_add(arithmetic,vu0.acc[n],bits);
+                    underflow=bool(arithmetic.control&0x4000u);
+                    overflow=bool(arithmetic.control&0x8000u);
                 }
             }
             results[n]=bits;
@@ -1036,10 +1059,24 @@ struct State {
             const auto product=Fpu::product(lane(a,(n+1)%3),lane(b,(n+2)%3));
             unsigned current=flags(product.bits,product.overflow,product.underflow);sticky|=current;
             if(subtract) {
-                if(product.overflow || product.underflow || ((vu0.acc[n]>>23)&255)==255)
-                    throw Fault(pc,"VU outer product exceptional accumulator path is unimplemented");
-                Fpu arithmetic;result[n]=arithmetic.add(vu0.acc[n],product.bits^0x80000000u);
-                current=flags(result[n],arithmetic.control&0x8000,arithmetic.control&0x4000);sticky|=current;
+                // OPMSUB = ACC - product, with the same exceptional rules as the MADD/MSUB
+                // family (vu_broadcast_product; Sony VU6.0 pp26-29,40-42): a canonical
+                // +/-MAX ACC stays unless the product overflows, an overflowing product
+                // supplies its own (negated) saturated value, and every other encoding,
+                // including the exponent-255 class and an underflowed (zero) product, goes
+                // through the exact integer adder. Product flags only reach the sticky bits.
+                const auto negated=product.bits^0x80000000u;
+                if((vu0.acc[n]&0x7fffffffu)==0x7fffffffu) {
+                    result[n]=product.overflow?negated:vu0.acc[n];
+                    current=flags(result[n],true,false);
+                } else if(product.overflow) {
+                    result[n]=negated;
+                    current=flags(result[n],true,false);
+                } else {
+                    Fpu arithmetic;result[n]=vu0_add(arithmetic,vu0.acc[n],negated);
+                    current=flags(result[n],arithmetic.control&0x8000,arithmetic.control&0x4000);
+                }
+                sticky|=current;
             } else result[n]=product.bits;
             for(unsigned group=0;group<4;++group)if(current&(1u<<group))mac|=1u<<(group*4+3-n);
         }
@@ -1158,7 +1195,7 @@ struct State {
         catch (const std::runtime_error& e) { throw Fault(pc,e.what()); }
     }
     void div_float(unsigned fs,unsigned ft,unsigned fd) {
-        try { fpr.at(fd)=fpu.divide(fpr.at(fs),fpr.at(ft)); }
+        try { fpr.at(fd)=fpu.divide(fpr.at(fs),fpr.at(ft),true); }
         catch (const std::runtime_error& e) { throw Fault(pc,e.what()); }
     }
     void sqrt_float(unsigned ft,unsigned fd) {
@@ -1197,6 +1234,15 @@ struct State {
         // Unsupported tag-store operations cannot create a hidden valid line.
         if(physical_address(address)>=ram.size())throw Fault(pc,"cache tag lookup outside implemented RAM");
         cp0_tag_lo=0;
+    }
+    void cache_index_invalidate(std::uint32_t address) {
+        // DXIN (EE Core Instruction Set Manual v6.0 p301) selects the data-cache
+        // index from vAddr[11:6] and the way from vAddr[0], then clears Lock,
+        // Valid and Dirty while preserving LRF. Native RAM is coherent and this
+        // runtime models every cache line as already invalid/clean/unlocked, so
+        // the exact architectural transition leaves the modeled state unchanged.
+        // This is an index operation: do not translate or access guest memory.
+        (void)address;
     }
     void cache_writeback(std::uint32_t address) {
         // CACHE DHWBIN (EE instruction manual p299). Native RAM is coherent;
